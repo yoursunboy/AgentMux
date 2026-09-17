@@ -86,12 +86,40 @@ type ManagerOptions struct {
 	HistoryChunks int
 	HistoryBytes  int
 
+	// Agent resolves the coding agent a runtime can host. Nil means this build
+	// hosts none, and every agent call answers that plainly rather than
+	// pretending there is nothing to run.
+	Agent AgentProvider
+
+	// AgentPoll is how often a running agent is looked for, and how often a
+	// stop waits for one to go. Zero means AgentDefaultPoll.
+	AgentPoll time.Duration
+
+	// AgentStartTimeout bounds the wait for a started agent to appear. Zero
+	// means AgentDefaultStartTimeout.
+	AgentStartTimeout time.Duration
+
+	// AgentStopGrace bounds the wait for an interrupted agent to end. Zero
+	// means AgentDefaultStopGrace.
+	AgentStopGrace time.Duration
+
 	// Logger receives runtime lifecycle events. Nil means slog.Default.
 	Logger *slog.Logger
 
 	// Now supplies the current time. Nil means time.Now.
 	Now func() time.Time
 }
+
+// Agent timing defaults.
+//
+// The poll is short enough that a click on Stop feels immediate and long enough
+// that watching five projects costs nothing worth measuring: each poll reads
+// the process table, which is one directory listing.
+const (
+	AgentDefaultPoll         = 500 * time.Millisecond
+	AgentDefaultStartTimeout = 15 * time.Second
+	AgentDefaultStopGrace    = 5 * time.Second
+)
 
 // Manager owns every project's terminal runtime.
 type Manager struct {
@@ -107,6 +135,13 @@ type Manager struct {
 	bytes       int
 	log         *slog.Logger
 	now         func() time.Time
+
+	// agent resolves the coding agent a runtime hosts, and the timings that
+	// decide how often one is looked for and how long a start or a stop waits.
+	agent             AgentProvider
+	agentPoll         time.Duration
+	agentStartTimeout time.Duration
+	agentStopGrace    time.Duration
 
 	// ctx is the lifetime of every subscription this manager opens. It is
 	// deliberately not a request's context: a subscription that died with the
@@ -145,23 +180,27 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		newBackend:  o.Backends,
-		backendName: o.Backends.BackendName(),
-		sockets:     o.Sockets,
-		projects:    o.Projects,
-		store:       o.Store,
-		shell:       o.Shell,
-		cols:        o.Cols,
-		rows:        o.Rows,
-		chunks:      o.HistoryChunks,
-		bytes:       o.HistoryBytes,
-		log:         o.Logger,
-		now:         o.Now,
-		ctx:         ctx,
-		cancel:      cancel,
-		runs:        make(map[string]*runtime),
-		backends:    make(map[string]Backend),
-		orphans:     make(map[string]Orphan),
+		newBackend:        o.Backends,
+		backendName:       o.Backends.BackendName(),
+		sockets:           o.Sockets,
+		projects:          o.Projects,
+		store:             o.Store,
+		shell:             o.Shell,
+		cols:              o.Cols,
+		rows:              o.Rows,
+		chunks:            o.HistoryChunks,
+		bytes:             o.HistoryBytes,
+		log:               o.Logger,
+		now:               o.Now,
+		agent:             o.Agent,
+		agentPoll:         o.AgentPoll,
+		agentStartTimeout: o.AgentStartTimeout,
+		agentStopGrace:    o.AgentStopGrace,
+		ctx:               ctx,
+		cancel:            cancel,
+		runs:              make(map[string]*runtime),
+		backends:          make(map[string]Backend),
+		orphans:           make(map[string]Orphan),
 	}
 	if m.cols <= 0 {
 		m.cols = DefaultCols
@@ -174,6 +213,15 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 	}
 	if m.now == nil {
 		m.now = time.Now
+	}
+	if m.agentPoll <= 0 {
+		m.agentPoll = AgentDefaultPoll
+	}
+	if m.agentStartTimeout <= 0 {
+		m.agentStartTimeout = AgentDefaultStartTimeout
+	}
+	if m.agentStopGrace <= 0 {
+		m.agentStopGrace = AgentDefaultStopGrace
 	}
 	return m, nil
 }
@@ -440,6 +488,12 @@ type runtime struct {
 	pump    context.CancelFunc
 	watched map[int]chan Chunk
 	nextID  int
+
+	// agent is what AgentMux last decided about the coding agent in this
+	// runtime. The process table is the authority on whether it is running;
+	// this is the record of how it got there, and of what to say about it.
+	// Guarded by mu, like everything else here.
+	agent agentState
 }
 
 // stateSnapshot is a consistent read of a runtime's mutable state.
@@ -483,6 +537,151 @@ func (r *runtime) setState(state State, message string, at time.Time) {
 	r.state = state
 	r.message = message
 	r.updated = at
+}
+
+// The rest of this section is the agent half of a runtime's state. Every
+// method takes the same lock as the runtime's own state, so a reader never sees
+// a runtime that is RUNNING with an agent record that belongs to the runtime
+// that came before it.
+
+// setAgentLaunching records that a start was requested and nothing has been
+// observed yet.
+func (r *runtime) setAgentLaunching(spec AgentSpec, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent = agentState{spec: spec, state: AgentStarting, since: at}
+}
+
+// failAgent records an agent that could not be started, or that started
+// somewhere it must not run.
+func (r *runtime) failAgent(reason string, at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent.state = AgentFailed
+	r.agent.reason = reason
+	r.agent.pid = 0
+	r.agent.dir = ""
+	r.agent.ended = at
+	r.agent.watched = false
+}
+
+// noteAgentStopRequested records that an operation asked the agent to stop.
+//
+// It is what makes the difference between an agent that was interrupted and one
+// that ended on its own: the exit itself looks the same either way, and only
+// the request distinguishes them.
+func (r *runtime) noteAgentStopRequested(at time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch r.agent.state {
+	case AgentRunning, AgentStarting:
+		r.agent.state = AgentStopping
+		r.agent.asked = true
+		r.agent.reason = ""
+		r.agent.ended = at
+		return true
+	}
+	return false
+}
+
+// noteAgentStopped records that the agent ended because AgentMux asked it to.
+func (r *runtime) noteAgentStopped(at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent.state = AgentStopped
+	r.agent.asked = true
+	r.agent.reason = ""
+	r.agent.pid = 0
+	r.agent.dir = ""
+	r.agent.ended = at
+	r.agent.watched = false
+}
+
+// noteAgentInterruptIgnored records that the interrupt was delivered and the
+// agent was still there afterwards.
+func (r *runtime) noteAgentInterruptIgnored(at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent.state = AgentRunning
+	r.agent.asked = true
+	r.agent.ended = time.Time{}
+	r.agent.reason = "the interrupt was delivered and the agent is still running; " +
+		"it may need a second one, or it may be waiting for a decision of its own"
+}
+
+// noteAgentEnded records that the agent's process is gone.
+//
+// Whether that is reported as a stop or as an unexplained exit is decided by
+// the record of whether anything asked it to stop. The two are
+// indistinguishable from the process table, and guessing "crash" for a Ctrl-C
+// somebody typed into the terminal would be inventing a cause.
+func (r *runtime) noteAgentEnded(at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	requested := r.agent.asked
+	if requested {
+		r.agent.state = AgentStopped
+		r.agent.reason = ""
+	} else {
+		r.agent.state = AgentExited
+		r.agent.reason = "the agent exited and AgentMux did not ask it to"
+	}
+	r.agent.pid = 0
+	r.agent.dir = ""
+	r.agent.ended = at
+	r.agent.watched = false
+}
+
+// noteAgentGone records that a stop was requested for an agent that had already
+// ended on its own.
+func (r *runtime) noteAgentGone(at time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.agent.state == AgentRunning || r.agent.state == AgentStarting {
+		r.agent.state = AgentExited
+		r.agent.asked = false
+		r.agent.reason = "the agent exited and AgentMux did not ask it to"
+		r.agent.ended = at
+	}
+	r.agent.pid = 0
+	r.agent.dir = ""
+	r.agent.watched = false
+}
+
+// noteAgentSeen refreshes a running agent's observed details.
+//
+// It keeps the start time from the first observation, because the process
+// cannot have started later than the moment it was first seen running.
+func (r *runtime) noteAgentSeen(ref processRef) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.agent.state = AgentRunning
+	r.agent.pid = ref.PID
+	r.agent.dir = ref.Dir
+	r.agent.reason = ""
+	if !ref.Started.IsZero() {
+		r.agent.since = ref.Started
+	}
+}
+
+// agentSnapshot reads a runtime's agent record atomically.
+//
+// It reports only what the runtime remembers, which is not the same as what is
+// true: a runtime that has never hosted an agent remembers nothing, and one
+// adopted from a previous server process remembers an agent that may have ended
+// while nothing was watching. Whether an agent can be started here is the
+// provider's answer, and whether one is running is the process table's; both are
+// asked elsewhere.
+func (r *runtime) agentSnapshot() (spec AgentSpec, state AgentState, pid int, dir string,
+	since, ended time.Time, reason string, asked bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a := r.agent
+	if a.state == "" {
+		a.state = AgentStopped
+	}
+	return a.spec, a.state, a.pid, a.dir, a.since, a.ended, a.reason, a.asked
 }
 
 // ProjectStatus implements project.RuntimeState.
@@ -926,6 +1125,10 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 	}
 
 	rt.setState(StateStopping, "", m.now())
+	// The runtime's stop interrupts the foreground process, which is the agent
+	// when one is running. Recording that a stop was asked for is what lets the
+	// agent's exit be reported as a stop rather than as a crash.
+	rt.noteAgentStopRequested(m.now())
 	if err := backend.Stop(ctx, rt.session); err != nil && !errors.Is(err, ErrNoSuchSession) {
 		rt.setState(StateError, err.Error(), m.now())
 		return nil, err
@@ -974,6 +1177,11 @@ func (m *Manager) Destroy(ctx context.Context, projectID string) error {
 	if ok {
 		rt.opMu.Lock()
 		defer rt.opMu.Unlock()
+
+		// The agent goes with the session, so its watcher is stopped first:
+		// otherwise it would spend its next tick discovering the destruction
+		// AgentMux just performed and reporting it as an unexplained exit.
+		m.untrackAgent(rt)
 
 		rt.mu.Lock()
 		cancel, sub := rt.pump, rt.sub
@@ -1735,7 +1943,23 @@ func (m *Manager) describe(ctx context.Context, rt *runtime) *Runtime {
 		StartedAt:    snap.started,
 		UpdatedAt:    snap.updated,
 		Message:      snap.message,
+		Agent:        m.agentFor(ctx, rt),
 	}
+}
+
+// agentFor builds a runtime's agent view, or nil when this server has no agent
+// to report.
+//
+// The nil case is a server that hosts terminals and no coding agent, which is a
+// legitimate configuration: the field is absent from the response rather than
+// present and empty, so a client can tell "there is no agent here" from "the
+// agent is not running".
+func (m *Manager) agentFor(ctx context.Context, rt *runtime) *AgentStatus {
+	if m.agent == nil {
+		return nil
+	}
+	status := m.agentStatus(ctx, rt)
+	return &status
 }
 
 // describeAbsent builds the API view of a project that has no runtime yet.
@@ -1767,7 +1991,21 @@ func (m *Manager) describeAbsent(ctx context.Context, projectID string) (*Runtim
 		Cols:         cols,
 		Rows:         rows,
 		UpdatedAt:    m.now(),
+		Agent:        m.absentAgentFor(ctx),
 	}, nil
+}
+
+// absentAgentFor describes a project whose runtime does not exist.
+//
+// It reports the agent installation rather than nothing, because "Claude Code
+// is installed and available, and no agent is running" is what the client needs
+// to decide whether to offer Start.
+func (m *Manager) absentAgentFor(ctx context.Context) *AgentStatus {
+	if m.agent == nil {
+		return nil
+	}
+	status := m.absentAgentStatus(ctx)
+	return &status
 }
 
 // persistState writes a runtime's settled state.

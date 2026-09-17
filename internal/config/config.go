@@ -42,6 +42,7 @@ const (
 	EnvTmuxSocket    = EnvPrefix + "TMUX_SOCKET"
 	EnvTmuxBinary    = EnvPrefix + "TMUX_BINARY"
 	EnvTmuxSocketDir = EnvPrefix + "TMUX_SOCKET_DIR"
+	EnvClaudeBinary  = EnvPrefix + "CLAUDE_BINARY"
 	EnvDebugAPI      = EnvPrefix + "DEBUG_API"
 )
 
@@ -210,6 +211,17 @@ type TerminalConfig struct {
 	// the one platform-dependent value here.
 	Shell string `json:"shell"`
 
+	// ClaudeBinary is the Claude Code CLI AgentMux starts inside a project's
+	// runtime. A bare name is resolved on PATH; an absolute path is used as
+	// given.
+	//
+	// It is configurable for the same reason the tmux binary is: a machine can
+	// have more than one Claude Code - a native install, a package manager's, a
+	// Node install - and a runtime that reported one version while launching
+	// another would be describing a program that never ran. Empty means the
+	// bare name "claude" on PATH.
+	ClaudeBinary string `json:"claudeBinary"`
+
 	// Cols and Rows are the canonical terminal geometry. Zero means the
 	// runtime's default.
 	//
@@ -274,7 +286,12 @@ type Overrides struct {
 	TmuxSocket    string
 	TmuxBinary    string
 	TmuxSocketDir string
-	DebugAPI      bool
+
+	// ClaudeBinary is the Claude Code CLI a project's runtime starts. Empty
+	// means the bare name "claude" on PATH.
+	ClaudeBinary string
+
+	DebugAPI bool
 }
 
 // LoadOptions controls Load. The function hooks are injectable so the loader
@@ -452,6 +469,9 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	if v, ok := env(EnvTmuxSocketDir); ok && strings.TrimSpace(v) != "" {
 		cfg.Terminal.SocketDir = strings.TrimSpace(v)
 	}
+	if v, ok := env(EnvClaudeBinary); ok && strings.TrimSpace(v) != "" {
+		cfg.Terminal.ClaudeBinary = strings.TrimSpace(v)
+	}
 	if v, ok := env(EnvDebugAPI); ok {
 		cfg.Server.DebugAPI = parseBool(v)
 	}
@@ -495,6 +515,9 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 	if v := strings.TrimSpace(o.TmuxSocketDir); v != "" {
 		cfg.Terminal.SocketDir = v
+	}
+	if v := strings.TrimSpace(o.ClaudeBinary); v != "" {
+		cfg.Terminal.ClaudeBinary = v
 	}
 	// A boolean flag can only turn the diagnostic endpoints on, never off: they
 	// are off unless something asks for them, so there is nothing to override.
@@ -701,6 +724,16 @@ func (c *Config) TmuxSocketDir() string {
 // can fail.
 func (c *Config) TmuxBinary() string {
 	return strings.TrimSpace(c.Terminal.Binary)
+}
+
+// ClaudeBinary returns the Claude Code CLI a project's runtime starts.
+//
+// Empty means a bare "claude", resolved on PATH by the agent package. Like
+// TmuxBinary, it is not resolved here: resolving is a filesystem lookup, and a
+// configuration accessor that touched the filesystem would make reading the
+// configuration a thing that can fail.
+func (c *Config) ClaudeBinary() string {
+	return strings.TrimSpace(c.Terminal.ClaudeBinary)
 }
 
 // ResolvedWebDir returns the absolute path of the built frontend directory.

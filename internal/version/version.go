@@ -13,11 +13,14 @@ const Version = "0.1.0"
 
 // Phase names the roadmap phase this build implements.
 //
-// Phase 0 (foundation), Phase 1 (project model and server foundation), and
-// Phase 2 (persistent session runtime) are implemented. There is still no Web
-// Terminal: sessions are real and persistent, and the UI can start and stop
-// them, but nothing streams their output to a browser yet.
-const Phase = "Phase 2 - Persistent session runtime"
+// Phase 0 (foundation), Phase 1 (project model and server foundation), Phase 2
+// (persistent session runtime) and Phase 3 (real Claude Code runtime) are
+// implemented. A project's runtime can host the real Claude Code CLI: it is
+// resolved, launched in the project's own directory, observed through the
+// process table, and survives a server restart. There is still no Web Terminal:
+// nothing streams a session's output to a browser yet, so a Claude session is
+// visible through the diagnostic endpoints and its own tmux terminal.
+const Phase = "Phase 3 - Real Claude Code runtime"
 
 // TerminalRuntimeImplemented reports whether this build can run persistent
 // terminal sessions.

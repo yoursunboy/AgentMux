@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
@@ -33,6 +34,16 @@ import (
 // objects; anything larger is a mistake or an attack.
 const maxRequestBodyBytes = 64 << 10
 
+// AgentResolver reports the coding agent this server would launch.
+//
+// It is an interface so that this package never resolves a binary to answer a
+// request, and so that the capability report can be tested on a machine with no
+// Claude Code, one with an old version, and one with several - the three cases
+// the report exists to distinguish.
+type AgentResolver interface {
+	Resolve(ctx context.Context) claude.Installation
+}
+
 // Server is the AgentMux HTTP API.
 type Server struct {
 	cfg        *config.Config
@@ -40,6 +51,7 @@ type Server struct {
 	projects   *project.Service
 	discoverer *project.Discoverer
 	runtime    *session.Manager
+	agent      AgentResolver
 	log        *slog.Logger
 
 	startedAt time.Time
@@ -63,6 +75,11 @@ type Options struct {
 	// one cannot answer a single runtime request, and a nil field would turn
 	// that into a panic in a handler instead of an explanation.
 	Runtime *session.Manager
+
+	// Agent resolves the coding agent this server would launch, for the
+	// capability report. It is optional: a server with no agent configured
+	// reports that it has none, which is a legitimate configuration.
+	Agent AgentResolver
 
 	// Logger receives request and error records. Nil means slog.Default.
 	Logger *slog.Logger
@@ -99,6 +116,7 @@ func New(o Options) (*Server, error) {
 		projects:   o.Projects,
 		discoverer: o.Discoverer,
 		runtime:    o.Runtime,
+		agent:      o.Agent,
 		log:        o.Logger,
 		startedAt:  o.StartedAt,
 		webDir:     o.WebDir,
@@ -138,6 +156,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/projects/{id}/runtime/start", s.handleStartRuntime)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/stop", s.handleStopRuntime)
 	mux.HandleFunc("DELETE /api/projects/{id}/runtime", s.handleDestroyRuntime)
+
+	// The coding agent inside a project's runtime. It is nested under the
+	// runtime because that is what it lives in: there is no agent without a
+	// terminal for it to run in, and starting one where there is none is
+	// refused rather than queued.
+	mux.HandleFunc("GET /api/projects/{id}/runtime/agent", s.handleGetAgent)
+	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/start", s.handleStartAgent)
+	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/stop", s.handleStopAgent)
 
 	s.registerDebugRoutes(mux)
 

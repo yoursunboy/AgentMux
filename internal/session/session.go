@@ -104,6 +104,13 @@ type Runtime struct {
 	// Message explains a state that needs explaining, for example why a start
 	// failed. Empty when there is nothing to say.
 	Message string `json:"message,omitempty"`
+
+	// Agent is the coding agent inside this runtime, when this build can host
+	// one. It is absent on a server that has no agent configured, and its
+	// state is independent of State: an agent that has exited leaves the
+	// runtime RUNNING, because the terminal is still there and that is the
+	// point of hosting the agent in one.
+	Agent *AgentStatus `json:"agent,omitempty"`
 }
 
 // Chunk is one piece of terminal output.
@@ -225,6 +232,27 @@ const (
 	// CodeProjectNotFound means the project the runtime was requested for does
 	// not exist.
 	CodeProjectNotFound = "project_not_found"
+
+	// CodeAgentUnavailable means no coding agent can be hosted here: none is
+	// installed, none could be resolved, or the backend cannot report the
+	// process a session runs.
+	CodeAgentUnavailable = "agent_unavailable"
+
+	// CodeAgentLaunchFailed means the agent was started and did not come up.
+	CodeAgentLaunchFailed = "agent_launch_failed"
+
+	// CodeAgentStopFailed means the agent could not be interrupted.
+	CodeAgentStopFailed = "agent_stop_failed"
+
+	// CodeAgentWrongDirectory means the terminal, or the agent in it, is not in
+	// the project's own directory. It is a refusal, not a warning: an agent
+	// running in a directory nobody chose is the failure this whole design
+	// exists to prevent.
+	CodeAgentWrongDirectory = "agent_wrong_directory"
+
+	// CodeAgentTerminalBusy means the terminal's foreground process is not the
+	// shell, so a command typed at it would be delivered to another program.
+	CodeAgentTerminalBusy = "agent_terminal_busy"
 )
 
 // Error is a runtime failure carrying a stable code.

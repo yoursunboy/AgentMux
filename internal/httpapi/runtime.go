@@ -25,6 +25,12 @@ const (
 	runtimeStopTimeout    = 20 * time.Second
 	runtimeDestroyTimeout = 20 * time.Second
 	runtimeReadTimeout    = 10 * time.Second
+
+	// Starting an agent waits for its process to appear, and stopping one waits
+	// for it to go. Both waits are the runtime's, and both are bounded there;
+	// these only have to be wider than the bounds they wrap.
+	agentStartTimeout = 40 * time.Second
+	agentStopTimeout  = 30 * time.Second
 )
 
 // runtimeResponse is the body of the endpoints that return a runtime.
@@ -122,8 +128,77 @@ func (s *Server) handleDestroyRuntime(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.log, http.StatusOK, runtimeResponse{Runtime: rt})
 }
 
-// requireRuntime refuses a runtime request on a host that cannot execute one.
+// agentResponse is the body of the endpoints that return an agent's state.
 //
+// It is wrapped like the runtime is, and for the same reason.
+type agentResponse struct {
+	Agent session.AgentStatus `json:"agent"`
+}
+
+// handleGetAgent implements GET /api/projects/{id}/runtime/agent.
+//
+// The agent is also reported inside the runtime itself, under `runtime.agent`.
+// This endpoint exists so that a client polling only the agent - a panel that
+// shows whether Claude is up without re-reading the whole runtime - has one
+// small thing to poll instead of a whole terminal description.
+func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRuntime(w, r) {
+		return
+	}
+	ctx, cancel := s.contextWithTimeout(r, runtimeReadTimeout)
+	defer cancel()
+
+	agent, err := s.runtime.Agent(ctx, r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, s.log, err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
+}
+
+// handleStartAgent implements POST /api/projects/{id}/runtime/agent/start.
+//
+// A project's runtime has to be running first. An agent with no terminal is a
+// process nobody can see, interrupt, or read, and this product's whole premise
+// is that a coding agent runs where its work can be watched.
+func (s *Server) handleStartAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRuntime(w, r) {
+		return
+	}
+	// The budget is wider than a runtime start's because it covers one too: an
+	// agent can be asked for on a project whose runtime has never been up.
+	ctx, cancel := s.contextWithTimeout(r, agentStartTimeout)
+	defer cancel()
+
+	agent, err := s.runtime.StartAgent(ctx, r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, s.log, err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
+}
+
+// handleStopAgent implements POST /api/projects/{id}/runtime/agent/stop.
+//
+// It interrupts the agent and leaves the runtime alone, which is what Ctrl-C
+// does at the terminal. Ending the runtime as well is the runtime's own stop,
+// and destroying the terminal is DELETE on the runtime.
+func (s *Server) handleStopAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.requireRuntime(w, r) {
+		return
+	}
+	ctx, cancel := s.contextWithTimeout(r, agentStopTimeout)
+	defer cancel()
+
+	agent, err := s.runtime.StopAgent(ctx, r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, s.log, err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
+}
+
+// requireRuntime refuses a runtime request on a host that cannot execute one.//
 // The reason is the host adapter's, not this package's, because it is the part
 // of AgentMux that knows the difference between "tmux is not installed" and
 // "this server is running on the wrong side of the WSL boundary". The second

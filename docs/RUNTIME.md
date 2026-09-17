@@ -315,6 +315,9 @@ claim about a process that has already moved on.
 `ORPHAN` means a session exists that no registered project claims. AgentMux reports it and does not
 touch it.
 
+Since Phase 3 a runtime may also host an agent, which has its own six states and does not share these.
+An agent that exits leaves its runtime `RUNNING`; see §15.
+
 ## 6. Persistence
 
 **The server is not the runtime.** Killing the server, closing the browser, or losing the network does
@@ -615,7 +618,7 @@ Stated rather than hidden.
 
 Explicitly out of scope, and not stubbed or faked anywhere in the code:
 
-Claude Code launch · Claude Session Resume · xterm.js or any real terminal view · WebSocket terminal
+Claude Session Resume · xterm.js or any real terminal view · WebSocket terminal
 streaming · Prompt Bar · Controller/Viewer roles · Claude Hooks · Waiting/Completed states · CC Switch
 · provider switching · push notifications · Codex, Gemini, OpenCode.
 
@@ -623,6 +626,10 @@ Phase 2.5 added no runtime feature. What it changed is where a runtime lives (on
 project, §12), how one is watched (a single server-owned Control Monitor, §13), and what is known
 about which tmux versions do this reliably (§14). A browser still cannot create, address, or destroy
 anything in this document.
+
+Phase 3 added one thing to this document's subject: a runtime can host the real Claude Code CLI. That
+is §15, and it is a section about the runtime rather than a rewrite of it — the runtime's own model,
+states, persistence and reconciliation are unchanged.
 
 `GET /api/server` reports `features.terminal` as true only when the build has the runtime, the server
 is on the right side of the WSL boundary, **and** tmux is installed where sessions run. The UI offers
@@ -828,3 +835,32 @@ directory" was a claim this document made and the evidence did not support for t
 reproduced.** Under that directive's own rule against overstating a clean run, and §10's historical
 note, the result is reported as `0 failures observed in 21,000 rounds` and nothing stronger — not
 "fixed", not "stable".
+
+## 15. The agent inside a runtime
+
+Phase 3 put a coding agent in the runtime. `docs/CLAUDE_RUNTIME.md` is the document for it; what
+belongs here is how it relates to everything above.
+
+**The runtime outlives the agent, and the two have separate state machines.** Runtime states are
+§5's six. Agent states are `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `EXITED`, `FAILED`. An agent
+that exits — asked to or not — leaves its runtime `RUNNING`, with its terminal, its shell and its
+scrollback exactly where they were. Only the runtime's own stop ends the session, and only `DELETE`
+destroys it.
+
+**The agent is not the server's child.** It is typed into the pane's shell, so its parent is the
+pane leader inside tmux. That is the same property that makes a runtime outlive a restart (§6), and
+it is what makes an agent outlive one too: a restarted server adopts the agent it finds rather than
+restoring anything.
+
+**Liveness is read, not recorded.** `internal/session/agentproc.go` reads `/proc`: a descendant of
+the pane leader whose `/proc/<pid>/exe` is the binary the launcher resolved. The terminal's text is
+never parsed, and `pane_current_command` is never used as identity — measured on this machine, it
+reports `2.1.274` for the command AgentMux types, because it is the kernel's `comm` and therefore a
+fact about how the command was typed rather than about what is running.
+
+**No schema change.** `project_runtime` is unchanged, and there is no `agent` table. A stored answer
+to "is this process running" is a stale answer waiting to happen, and §6's rule — the database holds
+only what a restart cannot recompute — applies to the agent as much as to the session.
+
+**No path for a browser to reach the agent's state.** §11's constraint is intact: the agent endpoints
+are REST and the agent's actual terminal is the pane it runs in. Phase 4 is what connects the two.

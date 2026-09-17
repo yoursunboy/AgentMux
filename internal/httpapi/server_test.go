@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
@@ -77,6 +78,32 @@ type harnessOptions struct {
 	// factory cannot, which is the case the server has to survive: an absent
 	// diagnostic field is honest and an invented one is not.
 	tmuxStatus *session.TmuxStatus
+
+	// agent, when set, is the coding agent a runtime may host. Left nil this
+	// server cannot host one, which is a legitimate way to run AgentMux and the
+	// state every other test in this package is in.
+	agent session.AgentProvider
+
+	// pane is what the backend reports about a session's terminal. It is only
+	// consulted by the agent endpoints, because only they ask.
+	pane session.PaneProcess
+
+	// claude is what the capability report says about the installed CLI. Left
+	// nil the report leaves the field out, which is what a server with no agent
+	// configured does.
+	claude *claude.Installation
+
+	// agentTiming overrides the manager's agent timings. A test that watches a
+	// spec be refused does not need to wait the production fifteen seconds to
+	// find out, and a suite that did would be a suite people stop running.
+	agentStartTimeout time.Duration
+	agentStopGrace    time.Duration
+	agentPoll         time.Duration
+
+	// shell is the shell a runtime's terminal runs. The agent endpoints compare
+	// the pane's foreground process against it before typing a command, so a
+	// test about a busy terminal has to say which program it is busy with.
+	shell string
 }
 
 func newHarness(t *testing.T) *harness {
@@ -162,6 +189,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	}
 
 	backend := newFakeBackend()
+	backend.pane = o.pane
 	plain := &fakeFactory{backend: backend}
 	var factory session.BackendFactory = plain
 	if o.tmuxStatus != nil {
@@ -173,6 +201,12 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Projects: service,
 		Store:    store.Runtimes(),
 		Logger:   discardLogger(),
+		Agent:    o.agent,
+
+		AgentPoll:         o.agentPoll,
+		AgentStartTimeout: o.agentStartTimeout,
+		AgentStopGrace:    o.agentStopGrace,
+		Shell:             o.shell,
 	})
 	if err != nil {
 		t.Fatalf("session.NewManager returned an error: %v", err)
@@ -183,6 +217,14 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		}
 	})
 
+	// A server with no agent configured must keep leaving the capability field
+	// out, which is what an installation with no Claude Code does. Handing it a
+	// resolver that reports nothing would put a `claude` object in the response
+	// that says less than its absence does.
+	var resolver AgentResolver
+	if o.claude != nil {
+		resolver = pinnedClaude{*o.claude}
+	}
 	server, err := New(Options{
 		Config:     cfg,
 		Host:       adapter,
@@ -193,6 +235,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
 		WebDir:     "",
 		Now:        func() time.Time { return time.Date(2026, time.September, 17, 12, 0, 30, 0, time.UTC) },
+		Agent:      resolver,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.New returned an error: %v", err)

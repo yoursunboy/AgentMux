@@ -10,14 +10,18 @@ As of version 0.1.0:
 | Phase 1 — Project model and server foundation | **Done** | Config, SQLite, HostAdapter, discovery, register/create API, server status, Phase 1 UI. |
 | Phase 2 — Persistent session runtime | **Done** | `SessionBackend` + `TmuxBackend`, runtime manager, persistence and reconciliation, runtime API, Phase 2 UI. No WebSocket, no real terminal view. |
 | Phase 2.5 — tmux stability validation and runtime isolation | **Partial** | One tmux server and socket per project; Control Monitor lifecycle; a four-environment tmux compatibility matrix. Complete except for re-running the pure-Linux columns, which need interactive authentication on the test host. See below. |
-| Phase 3 and later | Not started | No Claude Code launch, no xterm.js, no provider integration. |
+| Phase 3 — Real Claude Code runtime | **Partial** | `internal/claude` launcher, agent lifecycle in `internal/session`, agent API, real-CLI integration tests. Runtime integration is complete and verified against the real CLI; the one outstanding item is that the WSL Claude Code is not signed in, so E2E conversation is not yet possible on this host. See below. |
+| Phase 4 — Web terminal | Not started | No WebSocket, no xterm.js, no terminal stream. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
 is actually installed there. `GET /api/server` also reports which tmux it found
-(`tmux.available`, `tmux.version`, `tmux.binary`). The UI offers Start/Stop runtime and says plainly
-that the terminal view arrives in Phase 4. The provider still reports `integrated: false`. Nothing in
-the running product claims to do more than the table above.
+(`tmux.available`, `tmux.version`, `tmux.binary`), and which Claude Code it would launch
+(`claude.path`, `claude.version`, `claude.command`), with `features.claudeRuntime` saying whether one
+can be started here at all. The UI offers Start/Stop runtime and says plainly that the terminal view
+arrives in Phase 4; starting Claude is available through the API and has no UI yet. The provider still
+reports `integrated: false`, because Phase 8's provider switching is what that field describes.
+Nothing in the running product claims to do more than the table above.
 
 ## Phase 0 — Foundation and documentation
 
@@ -142,17 +146,26 @@ What was built:
   the historical record of it is preserved in `docs/RUNTIME.md` §10, with the earlier explanation
   explicitly withdrawn rather than quietly edited out.
 
-What this phase deliberately did **not** do, and Phase 3 must not assume: launch Claude Code as a
-project runtime, resume a Claude session, render a terminal, carry WebSocket traffic, add a prompt bar,
-add controller/viewer roles, or integrate CC Switch. It also did not restore the shared tmux server —
-per-project isolation is an architectural fault boundary, not a workaround for a bug.
+What this phase deliberately did **not** do, and Phase 4 must not assume: render a terminal, carry
+WebSocket traffic, add a prompt bar, add controller/viewer roles, or integrate CC Switch. It also did
+not restore the shared tmux server — per-project isolation is an architectural fault boundary, not a
+workaround for a bug.
 
 Not yet verified: the two pure-Linux matrix columns were measured earlier in the phase and were not
 re-run for the final report, because the test host requires interactive authentication this
 environment cannot provide. They are carried as recorded. That single item is why this phase is
 Partial rather than Done; nothing was simulated or fabricated in its place.
 
-## Phase 3 — Claude runtime
+## Phase 3 — Real Claude Code runtime
+
+Status: **partial**. See `docs/CLAUDE_RUNTIME.md` for the design, the measurements, and the
+limitations.
+
+Goal:
+
+Run the real Claude Code CLI inside the persistent runtime a project already has, and prove it can be
+started, typed at, observed, stopped, and reconnected to — without the runtime being the thing that
+holds it.
 
 Deliver:
 
@@ -161,6 +174,42 @@ Deliver:
 - receive real TUI output;
 - disconnect leaves Claude alive;
 - reconnect to existing session.
+
+What was built:
+
+- **`internal/claude`** — resolves which Claude Code is installed: the configured binary or `claude`
+  on `PATH`, symlinks followed, `--version` probed, and the command line rendered as one shell-quoted
+  word. It reads no credential, dumps no environment, and reports no authentication state.
+- **Agent lifecycle in `internal/session`** — start, adopt, observe, interrupt. One project → one
+  runtime → one interactive Claude. The agent is typed into the runtime's shell rather than executed
+  by the server, which is what makes it visible, interruptible, part of the scrollback, and a
+  survivor of a server restart.
+- **`internal/session/agentproc.go`** — the agent's liveness is read from `/proc`: a descendant of the
+  pane leader whose `/proc/<pid>/exe` is the resolved binary. The terminal's text is never parsed, and
+  `pane_current_command` is never used as identity (measured: it reports `2.1.274` for the command
+  AgentMux types). `StartedAt` comes from the kernel, so it survives a restart.
+- **No schema change.** Agent liveness is read live from the process table. `project_runtime` still
+  holds only what a restart cannot recompute.
+- **Agent API** — `GET`/`POST start`/`POST stop` under `/api/projects/{id}/runtime/agent`, plus
+  `claude` and `features.claudeRuntime` in `GET /api/server`.
+- **Real-CLI integration tests** in `cmd/server/claude_e2e_test.go`, behind two opt-in environment
+  gates so that a normal `go test ./...` starts no Claude and spends nothing.
+- **A defect found and fixed by the tests**: a stop the CLI declined was reported as a stop nobody had
+  asked for, because the observed-running branch cleared the request that had been recorded. A
+  declined interrupt is now reported as running-and-asked, with the reason.
+
+Interactivity is preserved: AgentMux adds no `--dangerously-skip-permissions`, no `--permission-mode`,
+no `--allowedTools`, no `--model` and no `-p`, and there is a test that asserts none of them appears in
+the rendered command. Claude asks the user, on a terminal the user owns.
+
+Not built, deliberately: any WebSocket, any terminal view, a prompt bar, controller/viewer roles,
+Claude Hooks, Waiting/Completed state detection, and any CC Switch adapter. The exit code is
+unobtainable and is reported as unobtainable rather than guessed — see `docs/CLAUDE_RUNTIME.md` §6.
+
+Outstanding: on this development host the WSL Claude Code resolves and launches but is **not signed
+in**, so an agent reaches Claude's authentication screen rather than a conversation. That is a
+Claude-side configuration and not an AgentMux defect, and nothing was copied, faked or worked around
+to hide it. It is the single reason this phase is Partial rather than Done.
 
 ## Phase 4 — Web terminal
 

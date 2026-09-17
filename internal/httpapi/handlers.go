@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -103,6 +104,17 @@ type serverInfoResponse struct {
 	// tmux installations is the only one of the two that predicts behaviour.
 	Tmux *session.TmuxStatus `json:"tmux,omitempty"`
 
+	// Claude describes the coding agent this server would start inside a
+	// project's runtime, and it is the answer from the code that will actually
+	// launch it: the resolved binary, its version, and the command line.
+	//
+	// It carries no credential and no authentication state. Whether the CLI is
+	// signed in is Claude's own business, is decided when it starts, and is
+	// said on Claude's own terminal; this server does not look, so it does not
+	// claim. Absent when no agent is configured, which is a legitimate way to
+	// run AgentMux.
+	Claude *claude.Installation `json:"claude,omitempty"`
+
 	// Features lets the UI disable what this server cannot do yet, instead of
 	// inferring capability from a version string.
 	Features map[string]bool `json:"features"`
@@ -128,6 +140,18 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		tmuxAvailable = dep.Available
 	}
 	terminalReady := info.RuntimeAvailable && tmuxAvailable && version.TerminalRuntimeImplemented
+
+	// The agent is resolved here rather than reported from a cached capability,
+	// because the answer is a property of the machine and not of the build: the
+	// same binary on a laptop with Claude Code and on a server without one has
+	// to say different things.
+	var agentInstallation *claude.Installation
+	agentReady := false
+	if s.agent != nil {
+		resolved := s.agent.Resolve(ctx)
+		agentInstallation = &resolved
+		agentReady = resolved.Available && terminalReady
+	}
 
 	now := s.now()
 	response := serverInfoResponse{
@@ -178,10 +202,16 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 			// do not is reported as a warning rather than left to be guessed.
 			"terminal": terminalReady,
 
+			// A coding agent needs the terminal it runs in. Reporting this true
+			// on a machine where the runtime cannot execute would offer a user
+			// a Start button for a process that has nowhere to run.
+			"claudeRuntime": agentReady,
+
 			"providerSwitch":     false,
 			"claudeHooks":        false,
 			"controllerTransfer": false,
 		},
+		Claude:   agentInstallation,
 		Warnings: append([]string(nil), s.cfg.Warnings...),
 	}
 

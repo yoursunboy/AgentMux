@@ -379,7 +379,7 @@ var serverProbes = []Dependency{
 var runtimeProbes = []Dependency{
 	{
 		Name: "claude",
-		Note: "Claude Code CLI. Required from Phase 3; this build never starts it.",
+		Note: "Claude Code CLI, started inside a project's runtime on request. Optional: without it a runtime still runs, it just cannot host an agent. This probe is a bare lookup on PATH; the launcher resolves the real binary and version.",
 	},
 }
 

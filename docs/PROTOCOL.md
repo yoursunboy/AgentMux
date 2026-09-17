@@ -35,9 +35,13 @@ project in the UI, starting a session, and starting the program inside it. `POST
 implemented and is not planned as an endpoint; opening a project is a client-side view change, not a
 server-side event, and giving it a route would make the server own something it has no state for.
 
+Phase 3 added the third level of that nesting:
+`GET /api/projects/:id/runtime/agent` and `POST .../agent/start` and `.../agent/stop`. An agent's
+identity is the runtime it is in, so it is addressed through it rather than as an object of its own.
+
 Sections 4 to 13 describe the WebSocket protocol, none of which is implemented yet — the server opens
-no WebSocket in this build, and the Phase 2 endpoints listed above are REST. The controller endpoints
-are Phase 5. A request to any unimplemented route returns `404 not_found`.
+no WebSocket in this build, and the endpoints listed above are REST. The controller endpoints are
+Phase 6. A request to any unimplemented route returns `404 not_found`.
 
 ## 3. Project registration payload
 

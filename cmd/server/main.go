@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/httpapi"
@@ -170,6 +171,22 @@ func run(args []string) error {
 	}
 	logger.Info("project runtimes", "tmuxBinary", backends.Status(ctx).Binary, "socketDir", backends.Sockets().Dir())
 
+	// The coding agent a runtime hosts. Resolving it is a probe, not a
+	// requirement: a machine with no Claude Code still runs AgentMux, still
+	// manages projects, and still hosts terminals - it just has no agent to put
+	// in one, and says so in the API rather than failing to start.
+	agents := claude.New(claude.Options{Binary: cfg.ClaudeBinary(), Logger: logger})
+	installation := agents.Resolve(ctx)
+	if installation.Available {
+		logger.Info("coding agent ready",
+			"agent", installation.Type,
+			"version", installation.Version,
+			"binary", installation.Path)
+	} else {
+		logger.Warn("no coding agent is available; runtimes will host terminals only",
+			"agent", installation.Type, "reason", installation.Message)
+	}
+
 	runtimes, err := session.NewManager(session.ManagerOptions{
 		Backends:      backends,
 		Sockets:       backends.Sockets(),
@@ -180,6 +197,7 @@ func run(args []string) error {
 		Rows:          cfg.Terminal.Rows,
 		HistoryChunks: cfg.Terminal.HistoryChunks,
 		HistoryBytes:  cfg.Terminal.HistoryBytes,
+		Agent:         agentSpecs{agents},
 		Logger:        logger,
 	})
 	if err != nil {
@@ -222,6 +240,7 @@ func run(args []string) error {
 		Projects:   projectService,
 		Discoverer: discoverer,
 		Runtime:    runtimes,
+		Agent:      agents,
 		Logger:     logger,
 		WebDir:     webDir,
 	})
@@ -302,6 +321,7 @@ func loadConfig(args []string) (*config.Config, error) {
 		tmuxSocket    = flags.String("tmux-socket", "", "deprecated: the shared tmux socket name used before Phase 2.5; each project now has its own tmux server and this setting has no effect")
 		tmuxBinary    = flags.String("tmux-binary", "", "tmux executable every project's runtime runs (default: tmux on PATH)")
 		tmuxSocketDir = flags.String("tmux-socket-dir", "", "directory holding one tmux socket per project (default: <data-dir>/tmux)")
+		claudeBinary  = flags.String("claude-binary", "", "Claude Code CLI a project's runtime starts (default: claude on PATH)")
 		debugAPI      = flags.Bool("debug-api", false,
 			"enable the diagnostic runtime API under /api/debug; it exposes raw terminal input and output")
 		showVersion = flags.Bool("version", false, "print the version and exit")
@@ -343,6 +363,7 @@ func loadConfig(args []string) (*config.Config, error) {
 			TmuxSocket:    *tmuxSocket,
 			TmuxBinary:    *tmuxBinary,
 			TmuxSocketDir: *tmuxSocketDir,
+			ClaudeBinary:  *claudeBinary,
 			DebugAPI:      *debugAPI,
 		},
 	})
@@ -359,6 +380,31 @@ func loadConfig(args []string) (*config.Config, error) {
 // read before the manager exists answers "nothing to say" rather than panicking.
 type runtimeBridge struct {
 	manager *session.Manager
+}
+
+// agentSpecs adapts the Claude Code launcher to the runtime's view of an agent.
+//
+// The runtime is handed a command line and the executable that command starts,
+// and nothing else: which program that is, what version, and whether it is
+// authenticated are the launcher's business. This is the one place the two
+// vocabularies meet, and keeping the translation here is what stops the runtime
+// package from depending on any particular agent - or on any particular vendor.
+type agentSpecs struct {
+	launcher *claude.Launcher
+}
+
+// Spec implements session.AgentProvider.
+func (a agentSpecs) Spec(ctx context.Context) (session.AgentSpec, error) {
+	installation := a.launcher.Resolve(ctx)
+	if !installation.Available {
+		return session.AgentSpec{}, errors.New(installation.Message)
+	}
+	return session.AgentSpec{
+		Type:       installation.Type,
+		Version:    installation.Version,
+		Command:    installation.Command,
+		Executable: installation.Path,
+	}, nil
 }
 
 // ProjectStatus implements project.RuntimeState.

@@ -6,28 +6,33 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 2.5**. The project model, the server foundation,
-and the persistent session runtime exist and work. The terminal view does not exist yet.
+This repository is at **version 0.1.0, end of Phase 3**. The project model, the server foundation, the
+persistent session runtime, and the real Claude Code runtime exist and work. The terminal view does
+not exist yet.
 
 | Works today | Does not exist yet |
 | --- | --- |
 | Server status and capability reporting | Any terminal view in the browser |
 | Projects Root configuration, Windows/WSL and Linux path mapping | WebSocket traffic of any kind |
-| Bounded discovery of project candidates | Claude Code launch, prompts, Hooks |
-| Register an existing project | CC Switch / provider switching |
-| Create a project, optionally with `git init` | Controller / viewer roles |
-| SQLite metadata store with migrations | Codex, Gemini, OpenCode |
-| Persistent tmux sessions that outlive the server | |
+| Bounded discovery of project candidates | Prompts typed at Claude from the UI |
+| Register an existing project | Hooks, Waiting/Completed state detection |
+| Create a project, optionally with `git init` | CC Switch / provider switching |
+| SQLite metadata store with migrations | Controller / viewer roles |
+| Persistent tmux sessions that outlive the server | Codex, Gemini, OpenCode |
 | Runtime start / stop / destroy, with reconciliation on restart | |
 | **One tmux server and socket per project**, so one project's runtime cannot take another's down | |
 | Raw byte-accurate input, real PTY resize, sequenced output | |
 | Phase 1 workspace UI (global bar, project panel, project manager) | |
 | Phase 2 runtime controls: running/stopped, start, stop | |
+| **The real Claude Code CLI, started in a project's own directory and observed from the process table** | |
+| **Claude survives a server restart; one project, one runtime, one Claude** | |
 
 The product is not described here as if it were finished. There is no terminal view — the runtime is
 real, and the panel says plainly that the terminal UI arrives in Phase 4 rather than drawing an empty
-rectangle. `provider.integrated` is false and the provider switch is a disabled control that says
-"Coming later". See `docs/ROADMAP.md` for the phase table and `docs/RUNTIME.md` for how the runtime
+rectangle. A project's runtime can host the real Claude Code CLI, but nothing streams its output to a
+browser yet, so starting one is an API call and its terminal is its own tmux pane. `provider.integrated`
+is false and the provider switch is a disabled control that says "Coming later". See
+`docs/ROADMAP.md` for the phase table, `docs/RUNTIME.md` for how the runtime
 works and what it does not do.
 
 ## Requirements
@@ -328,6 +333,7 @@ wsl -d Ubuntu-24.04 -- /tmp/session.test -test.v
 6. `docs/ROADMAP.md`
 7. `docs/RUNTIME.md` — how sessions actually run, and what is known to be fragile
 8. `docs/API.md` — what this build actually serves
+9. `docs/CLAUDE_RUNTIME.md` — how the real Claude Code CLI is resolved, launched, observed and stopped
 9. `CLAUDE.md`
 10. `.claude/rules/`
 
@@ -349,6 +355,10 @@ with reliable reconnect behavior and safe multi-device control. Phase 1 proved t
 store, and the management API first, because a terminal attached to the wrong directory is worse than
 no terminal. Phase 2 proved the persistent runtime — sessions that outlive the server, byte-accurate
 input, a real PTY — without putting a terminal in the browser yet, because a terminal view over a
-runtime that loses output is worse than no terminal view.
+runtime that loses output is worse than no terminal view. Phase 3 proved the real Claude Code CLI
+inside that runtime: resolved by the code that launches it, started in the project's own directory
+with no auto-approval flags added, observed from the process table rather than from the screen, and
+still running after the server it was started under has gone. See `docs/CLAUDE_RUNTIME.md`.
 
-CC Switch integration, Claude Hooks, state detection, notifications, and additional AI tools are later milestones.
+Phase 4 is the WebSocket and the terminal view. Claude Hooks, state detection, notifications,
+provider switching, and additional AI tools are later milestones.

@@ -1,17 +1,18 @@
-# AgentMux HTTP API — Phase 2
+# AgentMux HTTP API
 
-This is the surface the Phase 2 server actually serves, with the shapes it actually returns. Every
-example below was produced by running the server and calling it; none of it is aspirational. The
-target for later phases is in `docs/PROTOCOL.md`.
+This is the surface the server actually serves, with the shapes it actually returns. Every example
+below was produced by running the server and calling it; none of it is aspirational. The target for
+later phases is in `docs/PROTOCOL.md`.
 
 Base path: `/api`. The server binds `127.0.0.1:8787` by default and serves the built frontend from
 the same origin, so the browser only ever talks to one host.
 
-Two facts about Phase 2 shape the whole document. The first is that **the server runs where the
-sessions run**: on Windows that means inside WSL, and `/api/server` says which side it is on. The
-second is that **there is no terminal stream yet**. Sessions are real, input and output are real, but
-the endpoints that carry raw terminal bytes are diagnostics under `/api/debug`, off by default, and
-the browser does not call them. Phase 4 replaces them with a WebSocket.
+Two facts shape the whole document. The first is that **the server runs where the sessions run**: on
+Windows that means inside WSL, and `/api/server` says which side it is on. The second is that **there
+is still no terminal stream**. Sessions are real, input and output are real, and since Phase 3 a
+project's runtime can host the real Claude Code CLI — but the endpoints that carry raw terminal bytes
+are diagnostics under `/api/debug`, off by default, and the browser does not call them. Phase 4
+replaces them with a WebSocket.
 
 ## GET /api/server
 
@@ -24,7 +25,7 @@ This is a server running inside WSL, where the runtime works:
 {
   "appName": "AgentMux",
   "version": "0.1.0",
-  "phase": "Phase 2 - Persistent session runtime",
+  "phase": "Phase 3 - Real Claude Code runtime",
   "status": "online",
   "startedAt": "2026-09-17T13:31:14Z",
   "uptimeSeconds": 0,
@@ -63,10 +64,10 @@ This is a server running inside WSL, where the runtime works:
     {
       "name": "claude",
       "available": true,
-      "path": "/mnt/c/Users/you/AppData/Roaming/npm/claude",
+      "path": "/home/you/.local/bin/claude",
       "required": false,
       "probedIn": "wsl",
-      "note": "Claude Code CLI. Required from Phase 3; this build never starts it."
+      "note": "Claude Code CLI, started inside a project's runtime on request. Optional: without it a runtime still runs, it just cannot host an agent. This probe is a bare lookup on PATH; the launcher resolves the real binary and version."
     },
     {
       "name": "/bin/bash",
@@ -84,9 +85,18 @@ This is a server running inside WSL, where the runtime works:
     "projectDiscovery": true,
     "gitInit": true,
     "terminal": true,
+    "claudeRuntime": true,
     "providerSwitch": false,
     "claudeHooks": false,
     "controllerTransfer": false
+  },
+  "claude": {
+    "type": "claude",
+    "available": true,
+    "version": "2.1.274",
+    "binary": "claude",
+    "path": "/home/you/.local/share/claude/versions/2.1.274",
+    "command": "'/home/you/.local/share/claude/versions/2.1.274'"
   },
   "warnings": []
 }
@@ -109,6 +119,17 @@ will offer something the server cannot do:
 - `features.terminal` is the single answer a client should act on. It is true only when the build has
   the runtime, the server is on the right side of the WSL boundary, **and** tmux is installed where
   sessions would run.
+- `features.claudeRuntime` is whether a coding agent can be **started** here. It needs the terminal
+  as well as a resolved Claude Code, because an agent with no terminal is a process nobody can see,
+  interrupt or read. A client offers "Start Claude" on this flag and on nothing else.
+- `claude` is the answer from the code that will actually launch the agent: which binary the setting
+  resolved to, its version, and the exact command line. It is reported beside the `claude` dependency
+  probe rather than instead of it, and the two answer different questions — the probe says whether a
+  program called `claude` is on some PATH, and this says which binary AgentMux will execute. On a
+  machine with two Claude Code installations, only the second predicts behaviour.
+- There is **no field anywhere in this response that says whether Claude is authenticated.** That is
+  Claude's own business, it is decided when the program starts, and it says so on its own terminal.
+  This server does not look, so it does not claim.
 - `terminalBlocker` is why a terminal cannot be offered here, in one field, empty when it can be. It
   is the same sentence that appears in `warnings`, promoted so a client does not reconstruct the
   diagnosis by searching a list — the machine with two problems at once is where that goes wrong.
@@ -143,7 +164,7 @@ The same endpoint on a Windows-native server, where the runtime is deliberately 
       "note": "The persistent terminal runtime. Sessions outlive the AgentMux server."
     }
   ],
-  "features": { "terminal": false },
+  "features": { "terminal": false, "claudeRuntime": false },
   "warnings": [
     "The terminal runtime needs the AgentMux server to run inside WSL, because tmux and the coding agent it hosts are Linux processes. Start the server from inside your distribution instead, for example: wsl -d <distribution> -- ./agentmux-server. Project management and diagnostics work either way."
   ]
@@ -450,6 +471,131 @@ The session is really gone, and the endpoint is idempotent: destroying a runtime
 succeeds. The response is the runtime as it now is, so a client has one shape to render after every
 one of the four calls rather than four.
 
+## The agent inside a runtime
+
+A runtime can host one coding agent — today, the Claude Code CLI. It lives at
+`/api/projects/{id}/runtime/agent`, nested under the runtime for the same reason the runtime is
+nested under the project: an agent's identity is the runtime it is in, and one project → one runtime
+→ one interactive Claude is the model, not a limitation to be worked around.
+
+| Call | Effect |
+| --- | --- |
+| `GET /api/projects/{id}/runtime/agent` | The agent's current state. Never starts anything. |
+| `POST /api/projects/{id}/runtime/agent/start` | Starts it, or adopts the one already in the pane. Idempotent. |
+| `POST /api/projects/{id}/runtime/agent/stop` | Interrupts it and **leaves the runtime alone**. |
+
+**Stop is not Destroy**, and it is also not "the agent is gone". `stop` sends the same interrupt a
+user would send with `Ctrl-C`, and Claude is free to take it or not: a terminal in raw mode delivers
+that keystroke to the program, and the program decides. When it declines, the response says so
+rather than pretending — see `requested` and `message` below and §6 of `docs/CLAUDE_RUNTIME.md`.
+
+Starting requires the runtime to be running. An agent with no terminal is a process nobody can see,
+interrupt or read, so `agent/start` on a stopped runtime fails with `runtime_not_running` rather than
+creating a terminal behind the caller's back.
+
+### GET /api/projects/{id}/runtime/agent
+
+```json
+{
+  "agent": {
+    "type": "claude",
+    "available": true,
+    "state": "RUNNING",
+    "running": true,
+    "version": "2.1.274",
+    "executable": "/home/you/.local/share/claude/versions/2.1.274",
+    "pid": 843814,
+    "dir": "/home/you/AgentMux-Projects/checkout-service",
+    "startedAt": "2026-09-18T09:12:44.312+08:00"
+  }
+}
+```
+
+The agent is also reported inside the runtime, under `runtime.agent`. This endpoint exists so a panel
+that shows whether Claude is up has one small thing to poll instead of a whole terminal description.
+
+What the fields mean, and which of them are evidence rather than assertion:
+
+- `state` is `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `EXITED` or `FAILED`.
+- `running` is the boolean a client switches on, and it is read **live from the process table** every
+  time it is asked for. Nothing about liveness is stored, because a stored answer to "is it running"
+  is a stale answer waiting to happen.
+- `dir` is the working directory the agent process is **actually in**, read from `/proc/<pid>/cwd`,
+  not assumed from the request. It is how "the agent runs in the project's directory" is checked
+  rather than claimed.
+- `pid` and `startedAt` come from the kernel too, so they survive a server restart: an adopted
+  runtime reports the agent's real process id and real start time, not the moment the new server
+  noticed it.
+- `requested` is present only when true. It says AgentMux asked the agent to stop, which is what
+  distinguishes a stop that was asked for from an agent that went away on its own (`EXITED`).
+- `exitedAt` is when the agent was last observed to be gone.
+- `message` explains a state that needs explaining, and is empty when there is nothing to say.
+
+**There is no exit code.** The shell inside the terminal is the process that reaps the agent, so its
+exit status is known to that shell and to nothing else, and reading it would mean reading the
+terminal's text — which this product does not do. `requested` and `exitedAt` are what can be known
+honestly.
+
+**There is no field describing authentication.** See `docs/CLAUDE_RUNTIME.md` §2.
+
+### POST /api/projects/{id}/runtime/agent/start
+
+```json
+{
+  "agent": {
+    "type": "claude",
+    "available": true,
+    "state": "RUNNING",
+    "running": true,
+    "version": "2.1.274",
+    "executable": "/home/you/.local/share/claude/versions/2.1.274",
+    "pid": 843814,
+    "dir": "/home/you/AgentMux-Projects/checkout-service",
+    "startedAt": "2026-09-18T09:12:44.312+08:00"
+  }
+}
+```
+
+Idempotent: if an agent is already in the pane it is adopted and returned, not started twice. That is
+also how a runtime inherited from a previous server process is picked up — the agent was never this
+process's child, so nothing has to be restored, only recognised.
+
+The command line is the resolved Claude Code path and nothing else. AgentMux does not add
+`--dangerously-skip-permissions`, `--permission-mode`, `--allowedTools`, `--model`, or `-p`. Claude's
+interactive permission model is preserved exactly as it is, and answering Claude's prompts is the
+user's job on a terminal the user owns.
+
+### POST /api/projects/{id}/runtime/agent/stop
+
+The agent declined the interrupt — a real, observed response, verbatim:
+
+```json
+{
+  "agent": {
+    "type": "claude",
+    "available": true,
+    "state": "RUNNING",
+    "running": true,
+    "version": "2.1.274",
+    "executable": "/home/you/.local/share/claude/versions/2.1.274",
+    "pid": 843814,
+    "dir": "/home/you/AgentMux-Projects/checkout-service",
+    "startedAt": "2026-09-18T09:12:44.312+08:00",
+    "requested": true,
+    "message": "the interrupt was delivered and the agent is still running; it may need a second one, or it may be waiting for a decision of its own"
+  }
+}
+```
+
+An honest non-stop, and the shape a client should render as "Claude is still running, and you asked
+it to stop." AgentMux does not escalate to `SIGTERM` or `SIGKILL`: that would destroy the terminal
+and the scrollback that the whole runtime model exists to preserve. A second `stop` is allowed and
+behaves the same way.
+
+`running`, `requested` and `message` are all in the same response on purpose. A client that reads
+only `running` sees the truth, a client that reads both sees the whole truth, and neither is told a
+stop succeeded when it did not.
+
 ## Diagnostic endpoints (`/api/debug`)
 
 **These are not a product API.** They exist because Phase 2 has no terminal stream, and the runtime
@@ -629,15 +775,29 @@ Every failure has the same shape:
 | `runtime_input_failed` | 500 | Input could not be delivered. |
 | `runtime_resize_failed` | 500 | The terminal could not be resized. |
 | `runtime_backend_failure` | 500 | The backend failed in a way it did not classify. |
+| `agent_unavailable` | 503 | No coding agent can be hosted here: none is installed, none could be resolved, or the terminal backend cannot report the process a session runs. |
+| `agent_launch_failed` | 500 | The agent was started and never appeared as a process. |
+| `agent_stop_failed` | 500 | The agent could not be interrupted. |
+| `agent_wrong_directory` | 422 | The agent is not where the project is, or started somewhere else. Refused, not warned about. |
+| `agent_terminal_busy` | 409 | The terminal's foreground process is not the shell, so a command typed at it would go to another program. |
 | `storage_failure` | 500 | The metadata store could not complete the request. |
 
 `runtime_not_running` is a `409` and not a `404`: the runtime exists, and it is in a state that makes
 the call meaningless. The two are different bugs to a client, and only one of them is worth retrying.
 
+`agent_unavailable` is a `503` for the same reason `runtime_unavailable` is: it is a statement about
+this machine rather than about anything the caller sent, and the message says what to do about it. A
+client that saw `500` there would report a bug where the honest answer is "not on this machine".
+
 ## Not implemented
 
 There is no WebSocket, no terminal stream, no xterm.js, no prompt bar, and no provider switching.
-Starting Claude Code, resuming a Claude session, Hooks, controller leases, and Waiting/Completed
-state detection are all Phase 3 or later; `docs/PROTOCOL.md` sections 4 to 13 describe the agreed
-design for them, and none of them answers today. Phase 3 must not be started from this document:
-what exists here is what Phase 2 built, and `docs/ROADMAP.md` is where the next phase is defined.
+Resuming a Claude session, Hooks, controller leases, and Waiting/Completed state detection are all
+later phases; `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for them, and none of
+them answers today.
+
+What this build does serve, beyond Phase 2, is the agent endpoints above and the `claude` field of
+`GET /api/server`: a project's runtime can host the real Claude Code CLI, started by the server, and
+the server reports honestly whether it is running. What it cannot do is show it to you — that is
+Phase 4, and `docs/ROADMAP.md` is where the next phase is defined. `docs/CLAUDE_RUNTIME.md` describes
+how the agent is resolved, launched, and observed.

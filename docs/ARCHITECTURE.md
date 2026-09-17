@@ -5,7 +5,7 @@
 ```text
 iPad / Phone / PC
         │
-        │ HTTPS + WebSocket      (WebSocket is Phase 4; Phase 2 is REST only)
+        │ HTTPS + WebSocket      (WebSocket is Phase 4; this build is REST only)
         ▼
 ┌─────────────────────────────┐
 │       AgentMux Server       │   runs inside WSL on Windows (see §7)
@@ -13,6 +13,8 @@ iPad / Phone / PC
 │ Project Manager             │   internal/project        — built
 │ Session Manager             │   internal/session        — built in Phase 2
 │ Terminal Manager            │   part of session.Manager — sequence, history
+│ Agent Manager               │   part of session.Manager — built in Phase 3
+│ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Controller Manager          │   Phase 6, not stubbed
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
@@ -27,12 +29,19 @@ iPad / Phone / PC
        ┌───────┼───────┐
        ▼       ▼       ▼
    Project A Project B Project C
-    (shell)   (shell)   (shell)     Claude Code arrives in Phase 3
+    (shell)   (shell)   (shell)
+      └─ claude   └─ claude   └─ claude    one agent per runtime, since Phase 3
 ```
 
 The server's own process is the one that owns tmux, which is why the box above is inside the runtime
 environment rather than beside it. Everything above `SessionBackend` is transport-agnostic; everything
 below it is tmux's.
+
+The agent is the one thing in this diagram that is **not** the server's child. It is typed into the
+runtime's shell, so its parent is the pane leader inside tmux; the server recognises it by reading the
+process table and never by parsing the terminal. That is what lets it outlive a restart, and it is
+why the arrow above runs `shell → claude` rather than `server → claude`. See
+`docs/CLAUDE_RUNTIME.md` §1 and §6.
 
 ## 2. Project vs Collection
 
@@ -356,11 +365,12 @@ provider.changed
 
 Batch high-volume output.
 
-**Not implemented in Phase 2.** No WebSocket endpoint exists and nothing streams to a browser. What
-Phase 2 does provide is the data model that makes it possible: every output chunk carries a
-monotonic `sequence` per runtime, and a bounded history is kept, so a reconnecting client can be given
-what it missed rather than a redraw of the current screen. Introducing the sequence after the fact is
-much harder than starting with it.
+**Not implemented yet; this is Phase 4.** No WebSocket endpoint exists and nothing streams to a
+browser. What the phases so far provide is the data model that makes it possible: every output chunk
+carries a monotonic `sequence` per runtime, and a bounded history is kept, so a reconnecting client can
+be given what it missed rather than a redraw of the current screen. Introducing the sequence after the
+fact is much harder than starting with it — and Phase 3 made the thing behind it worth streaming, by
+putting a real Claude Code session inside the runtime.
 
 ## 12. Reconnection
 

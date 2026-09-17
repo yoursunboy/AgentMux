@@ -176,10 +176,21 @@ func statusForCode(code string) int {
 		// conflict with the current state, not a bad request and not a missing
 		// resource.
 		session.CodeAlreadyRunning,
-		session.CodeNotRunning:
+		session.CodeNotRunning,
+		// An agent cannot be typed into a terminal whose foreground process is
+		// another program. The runtime is fine and the request is fine; the
+		// session is busy, which is a state, and states change.
+		session.CodeAgentTerminalBusy:
 		return http.StatusConflict
 
-	case project.CodeRuntimePathMappingFailed:
+	case project.CodeRuntimePathMappingFailed,
+		// The agent started, and not where the project is. Nothing the caller
+		// sends would change that, and nothing about the server is broken: the
+		// project's runtime path and the directory the process ended up in are
+		// two strings that have to name the same place, and on this machine
+		// they do not. That is the same shape of failure as a host path with no
+		// runtime equivalent, so it gets the same answer.
+		session.CodeAgentWrongDirectory:
 		return http.StatusUnprocessableEntity
 
 	case project.CodeGitUnavailable,
@@ -188,7 +199,13 @@ func statusForCode(code string) int {
 		// than 500 because the service is genuinely unavailable rather than
 		// broken, and because the message says how to fix it.
 		session.CodeUnavailable,
-		session.CodeBackendUnavailable:
+		session.CodeBackendUnavailable,
+		// agent_unavailable is the same case one level up: there is no coding
+		// agent to host here. Either none is installed, or one is installed and
+		// could not be resolved, or the server is on the wrong side of the WSL
+		// boundary, and the message says which. Offering 500 would tell a client
+		// to report a bug where the honest answer is "not on this machine".
+		session.CodeAgentUnavailable:
 		return http.StatusServiceUnavailable
 
 	case project.CodeGitInitFailed,
@@ -198,7 +215,13 @@ func statusForCode(code string) int {
 		session.CodeDestroyFailed,
 		session.CodeInputFailed,
 		session.CodeResizeFailed,
-		session.CodeBackendFailure:
+		session.CodeBackendFailure,
+		// The agent was started and did not appear, or was asked to stop and the
+		// request could not be delivered. Both are the server failing to do
+		// something it said it would do, which is a 500 and not the caller's
+		// problem to solve.
+		session.CodeAgentLaunchFailed,
+		session.CodeAgentStopFailed:
 		return http.StatusInternalServerError
 
 	default:

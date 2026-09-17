@@ -943,6 +943,56 @@ func (b *TmuxBackend) Snapshot(ctx context.Context, name string) ([]byte, error)
 	return []byte(out), nil
 }
 
+// PaneProcess implements ProcessInspector.
+//
+// It reports the process the pane's terminal is running, which is how the
+// runtime finds and watches a coding agent without reading a byte of what the
+// terminal displays.
+//
+// The three fields are read in one call, and the path is last. That ordering is
+// what makes the parse safe: a process id cannot contain the separator, and a
+// mis-split caused by an unusual process name can only corrupt the final field.
+// The failure mode is therefore a directory comparison that does not match,
+// which refuses an agent start - it never lets one run in a directory nobody
+// chose.
+func (b *TmuxBackend) PaneProcess(ctx context.Context, name string) (PaneProcess, error) {
+	if err := b.validateName(name); err != nil {
+		return PaneProcess{}, err
+	}
+	if !b.sessionExists(ctx, name) {
+		return PaneProcess{}, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
+	}
+
+	format := "#{pane_pid}" + sessionFieldSeparator +
+		"#{pane_current_command}" + sessionFieldSeparator +
+		"#{pane_current_path}"
+	out, err := b.run(ctx, "list-panes", "-t", name, "-F", format)
+	if err != nil {
+		if isMissingTarget(out) {
+			return PaneProcess{}, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
+		}
+		return PaneProcess{}, wrapError(err, CodeBackendFailure,
+			"could not read the process of session %q", name)
+	}
+
+	line := firstLine(out)
+	parts := strings.SplitN(line, sessionFieldSeparator, 3)
+	if len(parts) < 3 {
+		return PaneProcess{}, newError(CodeBackendFailure,
+			"unexpected pane description for %q: %q", name, line)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return PaneProcess{}, newError(CodeBackendFailure,
+			"unexpected process id in the pane description for %q: %q", name, parts[0])
+	}
+	return PaneProcess{
+		PID:     pid,
+		Command: strings.TrimSpace(parts[1]),
+		Dir:     strings.TrimSpace(parts[2]),
+	}, nil
+}
+
 // Attach implements Backend.
 //
 // Each caller gets its own control client. Sharing one stream between callers

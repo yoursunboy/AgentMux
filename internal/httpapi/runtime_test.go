@@ -218,6 +218,13 @@ type fakeBackend struct {
 	destroyed []string
 	subs      map[string][]*fakeSubscription
 	closed    bool
+
+	// pane is what the backend reports about a session's terminal, and
+	// paneErr what it reports when it cannot say. Both exist for the agent
+	// endpoints: they are the only callers that ask, and the answer they get
+	// decides whether a launch is refused before it is attempted.
+	pane    session.PaneProcess
+	paneErr error
 }
 
 func newFakeBackend() *fakeBackend {
@@ -372,6 +379,41 @@ func (b *fakeBackend) Close() error {
 	defer b.mu.Unlock()
 	b.closed = true
 	return nil
+}
+
+// PaneProcess implements session.ProcessInspector.
+//
+// It answers with what the test chose rather than with a process table, because
+// what the agent endpoints do with the answer is the thing under test here. The
+// real question - does the runtime recognise a running Claude, and does it
+// report a cwd it read from the kernel - is answered in the session package
+// against real tmux and in cmd/server against the real CLI.
+func (b *fakeBackend) PaneProcess(_ context.Context, name string) (session.PaneProcess, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.sessions[name]; !ok {
+		return session.PaneProcess{}, session.ErrNoSuchSession
+	}
+	if b.paneErr != nil {
+		return session.PaneProcess{}, b.paneErr
+	}
+	return b.pane, nil
+}
+
+// setPane makes the backend report this as the terminal's foreground process.
+func (b *fakeBackend) setPane(pane session.PaneProcess) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pane = pane
+}
+
+// failPane makes the backend report that it cannot describe the terminal, which
+// is the "I cannot see" case the runtime must not confuse with "nothing is
+// there".
+func (b *fakeBackend) failPane(err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.paneErr = err
 }
 
 // deliver pushes output to every live stream of a session, as the runtime

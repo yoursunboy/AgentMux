@@ -9,6 +9,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -90,6 +91,17 @@ type serverInfoResponse struct {
 
 	Dependencies []host.Dependency `json:"dependencies"`
 	Provider     providerStatus    `json:"provider"`
+
+	// Tmux describes the terminal runtime installation, and it is the answer
+	// from the code that will actually run it: the version, the resolved path
+	// of the binary, and where the per-project sockets live.
+	//
+	// It is reported beside the dependency probe rather than instead of it,
+	// because the two answer different questions. The probe says whether a
+	// program called tmux is on some PATH; this says which binary AgentMux will
+	// execute and what version that binary is, which on a machine with two
+	// tmux installations is the only one of the two that predicts behaviour.
+	Tmux *session.TmuxStatus `json:"tmux,omitempty"`
 
 	// Features lets the UI disable what this server cannot do yet, instead of
 	// inferring capability from a version string.
@@ -181,6 +193,13 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	response.TerminalBlocker = blocker
 	if blocker != "" {
 		response.Warnings = append(response.Warnings, blocker)
+	}
+
+	// Which tmux this server will run, asked of the runtime itself. A backend
+	// that cannot describe its installation leaves the field out rather than
+	// filling it with a guess.
+	if status, ok := s.runtime.RuntimeStatus(ctx); ok {
+		response.Tmux = &status
 	}
 	if response.ProjectsRoots == nil {
 		response.ProjectsRoots = []string{}

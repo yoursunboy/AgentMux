@@ -91,6 +91,29 @@ const (
 	controlBackoffFactor  = 2
 )
 
+// controlFallbackKills counts how many times a control client had to be killed
+// because it did not leave within controlDetachGrace.
+//
+// The number matters more than it looks. "tmux lost a server after AgentMux
+// detached" and "AgentMux shot its own client and tmux lost a server" are
+// different findings with different owners, and the difference cannot be seen
+// from outside this function: a detach that takes 600ms and a detach that was
+// killed at 500ms look the same to a caller. Timing is a proxy; this is the
+// fact, so the stability harness reads this rather than inferring.
+var controlFallbackKills atomic.Int64
+
+// controlReconnects counts how many times a control stream ended while its
+// session was still there and had to be re-established.
+//
+// It is counted here rather than in the manager because this is where the
+// reconnection happens. A subscription outlives its streams on purpose - that
+// is what makes a dropped client invisible to everything above - and the price
+// of that is that the manager never sees the event. A monitor whose client is
+// being killed by something every few seconds looks perfectly healthy from
+// above, with a working subscription and a live session, and this is the only
+// number that says otherwise.
+var controlReconnects atomic.Int64
+
 // controlDetachGrace bounds how long a control client is given to hang up after
 // its stdin is closed, before it is killed instead.
 //
@@ -130,6 +153,7 @@ func startControlStream(ctx context.Context, bin string, args []string, session 
 		session: session,
 		output:  make(chan []byte, controlChannelDepth),
 		done:    make(chan struct{}),
+		abort:   make(chan struct{}),
 		proc:    cmd,
 		stdin:   stdin,
 		stderr:  &stderr,
@@ -143,6 +167,25 @@ type controlStream struct {
 	session string
 	output  chan []byte
 	done    chan struct{}
+
+	// abort is closed by close(), and it exists for exactly one reason: the
+	// reader can block handing a chunk to a consumer that has stopped
+	// draining, and a reader that is blocked in a channel send never reaches
+	// the process wait that close() is waiting on.
+	//
+	// Without it this is a deadlock, not a slow path. The reader blocks on
+	// `s.output <- chunk`; close() closes stdin, the client exits, but the
+	// reader is not reading any more, so it never calls Wait and never closes
+	// done; close() waits out its grace, kills a process that is already dead,
+	// and then waits on done forever. Measured before the fix: a subscription
+	// closed while its consumer had stopped reading hung indefinitely.
+	//
+	// The window is narrow - the manager's forward loop drains continuously,
+	// so it needs a cancellation racing a full channel to open at all - but a
+	// hang is the worst failure mode available here, and the Control Monitor
+	// work makes closing a stream a routine event rather than an exceptional
+	// one.
+	abort chan struct{}
 
 	proc   *exec.Cmd
 	stdin  io.WriteCloser
@@ -161,9 +204,12 @@ func (s *controlStream) read(stdout io.Reader, log *slog.Logger) {
 	reader := bufio.NewReaderSize(stdout, controlReadBuffer)
 	var pending []byte
 
-	flush := func() {
+	// flush hands the accumulated output over, reporting false when the stream
+	// is being torn down and the reader should stop. It must not block
+	// indefinitely: see abort.
+	flush := func() bool {
 		if len(pending) == 0 {
-			return
+			return true
 		}
 		// The slice is handed over, so the next round must start from a new
 		// one; reusing the backing array would let tmux's next write race a
@@ -171,10 +217,16 @@ func (s *controlStream) read(stdout io.Reader, log *slog.Logger) {
 		chunk := make([]byte, len(pending))
 		copy(chunk, pending)
 		pending = pending[:0]
-		s.output <- chunk
+		select {
+		case s.output <- chunk:
+			return true
+		case <-s.abort:
+			return false
+		}
 	}
 
-	for {
+	aborted := false
+	for !aborted {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			s.handleLine(bytes.TrimRight(line, "\n"), &pending, log)
@@ -184,7 +236,9 @@ func (s *controlStream) read(stdout io.Reader, log *slog.Logger) {
 		// means a burst of output becomes one chunk and a single keystroke
 		// echo is not held back.
 		if reader.Buffered() == 0 || len(pending) >= maxCoalescedOutput {
-			flush()
+			if !flush() {
+				aborted = true
+			}
 		}
 		if err != nil {
 			if err != io.EOF && !s.isClosing() {
@@ -194,9 +248,15 @@ func (s *controlStream) read(stdout io.Reader, log *slog.Logger) {
 		}
 	}
 
-	flush()
+	if !aborted {
+		flush()
+	}
 
 	// The process is gone; collect why. A clean detach is not an error.
+	//
+	// This runs even when the reader was aborted, because reaping the child is
+	// not optional: a client left unreaped is a zombie for the life of the
+	// server.
 	_ = s.stdin.Close()
 	waitErr := s.proc.Wait()
 	if s.isClosing() {
@@ -406,15 +466,21 @@ func (s *controlStream) close() {
 	if already {
 		return
 	}
+	// Released before the grace period rather than after it. The reader may be
+	// blocked handing over a chunk nobody is collecting, and closing stdin
+	// does not reach it; see abort. Doing this first is what makes the wait
+	// below a wait on a client that is actually leaving.
+	close(s.abort)
 	_ = s.stdin.Close()
 	select {
 	case <-s.done:
 	case <-time.After(controlDetachGrace):
 		if s.proc.Process != nil {
+			controlFallbackKills.Add(1)
 			_ = s.proc.Process.Kill()
 		}
+		<-s.done
 	}
-	<-s.done
 }
 
 // tmuxSubscription keeps one control stream alive for a session, re-attaching
@@ -503,8 +569,33 @@ func (s *tmuxSubscription) pump() {
 			return
 		}
 
+		// Whether there is anything to stream is asked before a stream is
+		// opened, and the order is the point of this loop.
+		//
+		// `tmux -C attach-session` starts a server when there is none:
+		// measured on tmux 3.4 and 3.7c, it prints "no sessions", exits, and
+		// leaves the socket file behind. Attaching first and asking afterwards -
+		// which is what this used to do - therefore meant that a control
+		// monitor whose session had ended created a tmux server on the
+		// project's socket in order to discover there was nothing on it. Two
+		// things follow, and both were observed rather than reasoned about: a
+		// socket file appears on a project whose server had just been confirmed
+		// absent, and a probe of that socket running at that moment reaches the
+		// newborn server and is told "server exited unexpectedly" - a state
+		// that is neither live nor provably stale, so nothing cleans it and a
+		// reconciliation reports it as unreadable.
+		//
+		// A reader of a terminal must not be able to bring a server into
+		// existence. The session, not the client, decides whether there is
+		// still something to stream.
+		if !s.backend.sessionExists(s.ctx, s.name) {
+			s.setErr(fmt.Errorf("control: session %q ended: %w", s.name, ErrSessionExited))
+			return
+		}
+
 		stream, err := s.backend.startControl(s.ctx, s.name)
-		if err == nil {
+		established := err == nil
+		if established {
 			backoff = controlInitialBackoff
 			s.connected.Store(true)
 			err = s.forward(stream)
@@ -517,14 +608,6 @@ func (s *tmuxSubscription) pump() {
 		if s.ctx.Err() != nil {
 			return
 		}
-		// The session, not the client, decides whether there is still
-		// something to stream.
-		if !s.backend.sessionExists(s.ctx, s.name) {
-			if err != nil {
-				s.setErr(fmt.Errorf("control: session %q ended: %w", s.name, ErrSessionExited))
-			}
-			return
-		}
 		if err != nil {
 			s.log.Warn("tmux control: stream dropped, re-attaching",
 				"session", s.name, "retryIn", backoff, "error", err)
@@ -533,6 +616,12 @@ func (s *tmuxSubscription) pump() {
 			return
 		}
 		backoff = min(backoff*controlBackoffFactor, controlMaxBackoff)
+		if established {
+			// A stream existed and ended while the session did not. Whatever
+			// the loop does next is a reconnection, and this is the only place
+			// that knows it happened: see controlReconnects.
+			controlReconnects.Add(1)
+		}
 	}
 }
 

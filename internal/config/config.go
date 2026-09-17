@@ -40,6 +40,8 @@ const (
 	EnvWebDir        = EnvPrefix + "WEB_DIR"
 	EnvTerminalShell = EnvPrefix + "TERMINAL_SHELL"
 	EnvTmuxSocket    = EnvPrefix + "TMUX_SOCKET"
+	EnvTmuxBinary    = EnvPrefix + "TMUX_BINARY"
+	EnvTmuxSocketDir = EnvPrefix + "TMUX_SOCKET_DIR"
 	EnvDebugAPI      = EnvPrefix + "DEBUG_API"
 )
 
@@ -168,14 +170,40 @@ type RuntimeConfig struct {
 //
 // Every field is optional. An empty or zero value means the runtime's own
 // default, which is applied by the session package rather than duplicated here:
-// a socket name or a canonical size written down twice is a socket name or a
-// canonical size that will eventually disagree with itself.
+// a socket directory or a canonical size written down twice is a socket
+// directory or a canonical size that will eventually disagree with itself.
 type TerminalConfig struct {
-	// Socket is the tmux socket name sessions are created on. A dedicated
-	// socket is what keeps AgentMux's sessions out of a user's own tmux, and
-	// what makes them enumerable without guessing which of somebody's windows
-	// belong to an agent.
+	// Socket is the tmux socket *name* sessions were created on, on one shared
+	// tmux server.
+	//
+	// Deprecated, and retained only so that an existing configuration file
+	// keeps loading. Since Phase 2.5 every project has its own server and its
+	// own socket, addressed by SocketDir and the project id; a single shared
+	// socket name no longer describes anything AgentMux creates. Setting it
+	// produces a warning and has no effect - see the note in docs/RUNTIME.md.
+	//
+	// It is not silently reinterpreted as a path or as a socket directory
+	// because both readings would be wrong in a way the user could not see:
+	// a socket name is not a path, and a name that used to hold every project
+	// is not the directory that now holds one socket per project.
 	Socket string `json:"socket"`
+
+	// Binary is the tmux executable every project's runtime runs. A bare name
+	// is resolved on PATH; an absolute path is used as given.
+	//
+	// It is configurable because a machine can have more than one tmux, and a
+	// runtime that measures one and drives another is worse than one that
+	// measures nothing: the version report would describe a binary that never
+	// ran. Every path that touches a server resolves the binary through this
+	// value, so the answer to "which tmux is this" is the same everywhere.
+	Binary string `json:"tmuxBinary"`
+
+	// SocketDir holds one socket per project, named after the project id.
+	//
+	// Empty means a directory under the data directory. It is the whole of the
+	// fault isolation: a tmux server is identified by its socket, so two socket
+	// paths are two servers, and two servers cannot take each other down.
+	SocketDir string `json:"tmuxSocketDir"`
 
 	// Shell is the shell a session runs when no command is given. Empty means
 	// the host's default shell, which is injected by the caller because it is
@@ -239,7 +267,13 @@ type Overrides struct {
 	RuntimeDistro string
 	WebDir        string
 	TerminalShell string
+
+	// TmuxSocket is the deprecated shared socket name. It is accepted and
+	// warned about rather than rejected, so that an existing invocation keeps
+	// starting.
 	TmuxSocket    string
+	TmuxBinary    string
+	TmuxSocketDir string
 	DebugAPI      bool
 }
 
@@ -412,6 +446,12 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	if v, ok := env(EnvTmuxSocket); ok && strings.TrimSpace(v) != "" {
 		cfg.Terminal.Socket = strings.TrimSpace(v)
 	}
+	if v, ok := env(EnvTmuxBinary); ok && strings.TrimSpace(v) != "" {
+		cfg.Terminal.Binary = strings.TrimSpace(v)
+	}
+	if v, ok := env(EnvTmuxSocketDir); ok && strings.TrimSpace(v) != "" {
+		cfg.Terminal.SocketDir = strings.TrimSpace(v)
+	}
 	if v, ok := env(EnvDebugAPI); ok {
 		cfg.Server.DebugAPI = parseBool(v)
 	}
@@ -449,6 +489,12 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 	if v := strings.TrimSpace(o.TmuxSocket); v != "" {
 		cfg.Terminal.Socket = v
+	}
+	if v := strings.TrimSpace(o.TmuxBinary); v != "" {
+		cfg.Terminal.Binary = v
+	}
+	if v := strings.TrimSpace(o.TmuxSocketDir); v != "" {
+		cfg.Terminal.SocketDir = v
 	}
 	// A boolean flag can only turn the diagnostic endpoints on, never off: they
 	// are off unless something asks for them, so there is nothing to override.
@@ -570,6 +616,26 @@ func validate(cfg *Config, stat func(string) (os.FileInfo, error)) error {
 			cfg.addWarning(fmt.Sprintf("projects root %s is not a directory", root))
 		}
 	}
+
+	// The deprecated shared socket name. It is warned about rather than
+	// rejected, because refusing to start would break an installation that is
+	// otherwise fine, and it is warned about rather than ignored because a user
+	// who set it believes it is doing something.
+	//
+	// What it is *not* is reinterpreted. Neither reading is safe: a socket name
+	// is not a directory, and a name that used to hold every project at once is
+	// not the directory that now holds one socket per project. Treating it as
+	// either would move every runtime to a path the user never named, silently.
+	if cfg.Terminal.Socket != "" {
+		where := cfg.TmuxSocketDir()
+		if where == "" {
+			where = "the default directory under the data directory"
+		}
+		cfg.addWarning(fmt.Sprintf(
+			"terminal.socket (%q) is deprecated and has no effect: since Phase 2.5 each project "+
+				"runs on its own tmux server, addressed by terminal.tmuxSocketDir (%s) plus the "+
+				"project id. Remove the setting.", cfg.Terminal.Socket, where))
+	}
 	return nil
 }
 
@@ -597,6 +663,44 @@ func (c *Config) SQLitePath() string {
 		return filepath.Clean(p)
 	}
 	return filepath.Clean(filepath.Join(c.DataDir, p))
+}
+
+// TmuxSocketDir returns the absolute directory holding one tmux socket per
+// project, or "" when none was configured.
+//
+// A relative path is resolved against the data directory rather than the
+// working directory, because the sockets are runtime state and belong beside
+// the database and the logs - the same rule SQLitePath follows. A directory
+// chosen by the process's working directory would silently change when the
+// server was started from somewhere else, and every project's runtime would
+// move with it.
+//
+// The empty result is left empty rather than filled with a default, because the
+// default's name is the runtime's business: this package decides where under
+// the data directory things live, and the session package decides what the
+// runtime's own directories are called. See the note on TerminalConfig.
+func (c *Config) TmuxSocketDir() string {
+	p := strings.TrimSpace(c.Terminal.SocketDir)
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	if c.DataDir == "" {
+		return filepath.Clean(p)
+	}
+	return filepath.Clean(filepath.Join(c.DataDir, p))
+}
+
+// TmuxBinary returns the tmux executable every project's runtime runs.
+//
+// Empty means a bare "tmux", resolved on PATH by the session package. It is not
+// resolved here: resolving is a filesystem lookup, and a configuration accessor
+// that touched the filesystem would make reading the configuration a thing that
+// can fail.
+func (c *Config) TmuxBinary() string {
+	return strings.TrimSpace(c.Terminal.Binary)
 }
 
 // ResolvedWebDir returns the absolute path of the built frontend directory.

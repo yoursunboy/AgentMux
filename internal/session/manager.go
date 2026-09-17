@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/project"
@@ -50,11 +51,20 @@ type RuntimeStore interface {
 // ErrRecordNotFound means no runtime metadata is stored for a project.
 var ErrRecordNotFound = errors.New("no runtime record")
 
-// ManagerOptions configures a Manager. Backend, Projects, and Store are
-// required.
+// ManagerOptions configures a Manager. Backends, Projects, Sockets, and Store
+// are required.
 type ManagerOptions struct {
-	// Backend is the session runtime. Required.
-	Backend Backend
+	// Backends builds the backend that owns one project's runtime. Required.
+	//
+	// It is a factory rather than one backend because one project's runtime
+	// must not share a server with another's: a shared server is a shared
+	// failure, which is the thing Phase 2.5 exists to remove.
+	Backends BackendFactory
+
+	// Sockets is where the project runtimes live. Required: reconciliation
+	// asks it what is actually on disk, and a manager that could not would be
+	// back to believing the database about liveness.
+	Sockets SocketLayout
 
 	// Projects resolves a project id into the project the runtime runs for.
 	// Required.
@@ -85,16 +95,18 @@ type ManagerOptions struct {
 
 // Manager owns every project's terminal runtime.
 type Manager struct {
-	backend  Backend
-	projects ProjectLookup
-	store    RuntimeStore
-	shell    string
-	cols     int
-	rows     int
-	chunks   int
-	bytes    int
-	log      *slog.Logger
-	now      func() time.Time
+	newBackend  BackendFactory
+	backendName string
+	sockets     SocketLayout
+	projects    ProjectLookup
+	store       RuntimeStore
+	shell       string
+	cols        int
+	rows        int
+	chunks      int
+	bytes       int
+	log         *slog.Logger
+	now         func() time.Time
 
 	// ctx is the lifetime of every subscription this manager opens. It is
 	// deliberately not a request's context: a subscription that died with the
@@ -103,17 +115,27 @@ type Manager struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu      sync.Mutex
-	runs    map[string]*runtime
-	orphans map[string]*Session
-	wg      sync.WaitGroup
-	closed  bool
+	// monitors counts what the Control Monitors have had to do. It is
+	// bookkeeping for the stability harness and for diagnostics: "the monitor
+	// is fine" is not a measurement, and a reconnect that happened is.
+	monitorReconnects atomic.Int64
+	monitorFailures   atomic.Int64
+
+	mu       sync.Mutex
+	runs     map[string]*runtime
+	backends map[string]Backend
+	orphans  map[string]Orphan
+	wg       sync.WaitGroup
+	closed   bool
 }
 
 // NewManager builds a Manager.
 func NewManager(o ManagerOptions) (*Manager, error) {
-	if o.Backend == nil {
-		return nil, errors.New("session: Backend is required")
+	if o.Backends == nil {
+		return nil, errors.New("session: Backends is required")
+	}
+	if o.Sockets == nil {
+		return nil, errors.New("session: Sockets is required")
 	}
 	if o.Projects == nil {
 		return nil, errors.New("session: Projects is required")
@@ -123,20 +145,23 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
-		backend:  o.Backend,
-		projects: o.Projects,
-		store:    o.Store,
-		shell:    o.Shell,
-		cols:     o.Cols,
-		rows:     o.Rows,
-		chunks:   o.HistoryChunks,
-		bytes:    o.HistoryBytes,
-		log:      o.Logger,
-		now:      o.Now,
-		ctx:      ctx,
-		cancel:   cancel,
-		runs:     make(map[string]*runtime),
-		orphans:  make(map[string]*Session),
+		newBackend:  o.Backends,
+		backendName: o.Backends.BackendName(),
+		sockets:     o.Sockets,
+		projects:    o.Projects,
+		store:       o.Store,
+		shell:       o.Shell,
+		cols:        o.Cols,
+		rows:        o.Rows,
+		chunks:      o.HistoryChunks,
+		bytes:       o.HistoryBytes,
+		log:         o.Logger,
+		now:         o.Now,
+		ctx:         ctx,
+		cancel:      cancel,
+		runs:        make(map[string]*runtime),
+		backends:    make(map[string]Backend),
+		orphans:     make(map[string]Orphan),
 	}
 	if m.cols <= 0 {
 		m.cols = DefaultCols
@@ -153,8 +178,225 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 	return m, nil
 }
 
-// Backend exposes the backend for diagnostics.
-func (m *Manager) Backend() Backend { return m.backend }
+// MonitorStats reports what the control monitors have had to do.
+//
+// A reconnect is not an error, so nothing else would ever surface one. It is
+// counted because an installation whose monitors reconnect constantly is one
+// with a runtime problem that otherwise looks like a working terminal.
+type MonitorStats struct {
+	// Reconnects is how many times a monitor had to re-establish its stream
+	// after one ended while the session was still there.
+	Reconnects int64 `json:"reconnects"`
+
+	// StreamReconnects is how many times a control stream ended and was
+	// re-established underneath a monitor that never noticed.
+	//
+	// It is separate from Reconnects because the two count different events.
+	// Reconnects counts the Control Monitor rebuilding its subscription, which
+	// only happens when the subscription ended too. StreamReconnects counts the
+	// ordinary case: the control client went away, the subscription outlived it
+	// and reattached, and everything above saw nothing but a gap in the output.
+	// An installation being disconnected from constantly looks healthy in every
+	// other number here, and this is the one that would say so.
+	StreamReconnects int64 `json:"streamReconnects"`
+
+	// Failures is how many times a monitor could not establish a stream at
+	// all. The monitor keeps trying; this is the count of the attempts that
+	// did not work.
+	Failures int64 `json:"failures"`
+
+	// Active is how many runtimes are being monitored right now.
+	Active int `json:"active"`
+}
+
+// MonitorStats implements the diagnostic accessor.
+func (m *Manager) MonitorStats() MonitorStats {
+	m.mu.Lock()
+	runs := make([]*runtime, 0, len(m.runs))
+	for _, rt := range m.runs {
+		runs = append(runs, rt)
+	}
+	m.mu.Unlock()
+
+	active := 0
+	for _, rt := range runs {
+		rt.mu.Lock()
+		if rt.sub != nil {
+			active++
+		}
+		rt.mu.Unlock()
+	}
+	return MonitorStats{
+		Reconnects:       m.monitorReconnects.Load(),
+		StreamReconnects: controlReconnects.Load(),
+		Failures:         m.monitorFailures.Load(),
+		Active:           active,
+	}
+}
+
+// SocketDir reports where the project runtimes live, for diagnostics.
+func (m *Manager) SocketDir() string { return m.sockets.Dir() }
+
+// BackendName names the kind of backend every project's runtime uses.
+func (m *Manager) BackendName() string { return m.backendName }
+
+// RuntimeStatus reports the terminal runtime installation the project runtimes
+// will use, and whether the configured factory can describe it at all.
+//
+// The manager asks the factory rather than probing tmux itself. A second probe
+// here would be a second answer to "which tmux", and the two would eventually
+// disagree on exactly the machine this exists to explain: the one with more
+// than one tmux installed. The factory resolves the same binary for this
+// answer that it hands to every backend it builds.
+func (m *Manager) RuntimeStatus(ctx context.Context) (TmuxStatus, bool) {
+	reporter, ok := m.newBackend.(StatusReporter)
+	if !ok {
+		return TmuxStatus{}, false
+	}
+	return reporter.Status(ctx), true
+}
+
+// SessionRef is a live runtime session together with the socket it lives on.
+//
+// The socket is part of a session's identity now rather than decoration. There
+// is no installation-wide server to list sessions from, so "which socket is
+// this session on" is the first question about it - and the answer is what
+// tells two same-named sessions in two different places apart.
+type SessionRef struct {
+	*Session
+
+	// Socket is the tmux socket the session's server is listening on.
+	Socket string `json:"socket"`
+
+	// ProjectID is the project the socket belongs to, empty when no registered
+	// project claims it.
+	ProjectID string `json:"projectId,omitempty"`
+
+	// Registered reports whether a registered project claims this socket. An
+	// unregistered one is an orphan: reported, never touched.
+	Registered bool `json:"registered"`
+}
+
+// Sessions reports every live runtime session on every socket in the socket
+// directory.
+//
+// It is a diagnostic and it costs one tmux invocation per socket, so it is
+// deliberately not on any hot path: the list of sessions is not something the
+// runtime needs to know in order to run, only something a person asks when they
+// want to see what is actually there. Reconciliation is the operation that does
+// this work for a reason; this one does it because someone asked.
+func (m *Manager) Sessions(ctx context.Context) ([]SessionRef, error) {
+	projects, err := m.projects.List(ctx, project.ListFilter{})
+	if err != nil {
+		return nil, err
+	}
+
+	known := make(map[string]bool, len(projects))
+	out := make([]SessionRef, 0, len(projects))
+	for _, p := range projects {
+		known[p.ID] = true
+		path := m.sockets.Path(p.ID)
+		if path == "" {
+			continue
+		}
+		probe := m.sockets.Probe(ctx, path)
+		if probe.State != SocketLive {
+			continue
+		}
+		for _, s := range probe.Sessions {
+			out = append(out, SessionRef{Session: s, Socket: path, ProjectID: p.ID, Registered: true})
+		}
+	}
+
+	files, err := m.sockets.List()
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if file.WellFormed && known[file.ProjectID] {
+			continue
+		}
+		probe := m.sockets.Probe(ctx, file.Path)
+		if probe.State != SocketLive {
+			continue
+		}
+		for _, s := range probe.Sessions {
+			out = append(out, SessionRef{Session: s, Socket: file.Path})
+		}
+	}
+
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Socket != out[j].Socket {
+			return out[i].Socket < out[j].Socket
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// Snapshot returns a runtime's current screen, escape sequences intact.
+//
+// It is the recovery half of the live-output contract rather than a substitute
+// for it: a client that has just connected, or one whose stream was
+// re-established, draws this and then follows the subscription. Reading the
+// screen repeatedly instead of subscribing would turn a live terminal into a
+// screenshot, which is why nothing in the runtime's normal path calls this.
+func (m *Manager) Snapshot(ctx context.Context, projectID string) ([]byte, error) {
+	rt, err := m.lookup(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if rt == nil {
+		return nil, newError(CodeNotRunning, "no terminal runtime is running for project %s", projectID)
+	}
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return nil, err
+	}
+	return backend.Snapshot(ctx, rt.session)
+}
+
+// backendFor returns the backend that owns a project's runtime.
+//
+// It is the only way anything in this file reaches a server, which is what
+// makes "one project, one server" a property of the code rather than a
+// convention: there is no field holding a shared backend to reach for by
+// mistake.
+func (m *Manager) backendFor(projectID string) (Backend, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, newError(CodeUnavailable, "the runtime manager is shut down")
+	}
+	if backend, ok := m.backends[projectID]; ok {
+		m.mu.Unlock()
+		return backend, nil
+	}
+	m.mu.Unlock()
+
+	// Built outside the lock: a factory may resolve a path or make a
+	// directory, and holding the manager's lock across that would let one
+	// project's setup stall every other project's status read - the exact
+	// coupling per-project runtimes exist to remove.
+	backend, err := m.newBackend.Backend(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil, newError(CodeUnavailable, "the runtime manager is shut down")
+	}
+	// Two callers racing to build the same project's backend is normal - a
+	// start and a status read - and only one of them may win, because two
+	// handles to one server would disagree about which subscriptions are open.
+	if existing, ok := m.backends[projectID]; ok {
+		return existing, nil
+	}
+	m.backends[projectID] = backend
+	return backend, nil
+}
 
 // runtime is one project's live runtime state.
 //
@@ -166,6 +408,21 @@ type runtime struct {
 	projectID string
 	session   string
 
+	// opMu serialises the multi-step operations on this runtime: start, stop,
+	// destroy.
+	//
+	// Those are sequences, not single calls - read a record, inspect a
+	// session, create one, resize it, attach - and each step is a separate
+	// tmux invocation. Two of them interleaved for the same project is how a
+	// start adopts a session a destroy is in the middle of killing, and the
+	// result is a runtime that reports RUNNING with nothing behind it. The
+	// lock is per runtime so that serialising one project's lifecycle does not
+	// serialise another's.
+	//
+	// Lock order: opMu may be held while taking mu; mu is never held while
+	// taking opMu.
+	opMu sync.Mutex
+
 	mu      sync.Mutex
 	state   State
 	message string
@@ -175,6 +432,9 @@ type runtime struct {
 	started time.Time
 	updated time.Time
 
+	// sub is the Control Monitor's stream: the one long-lived control-mode
+	// client AgentMux holds for this project. It belongs to the manager, not
+	// to any client of the API - see monitor.
 	sub     Subscription
 	buffer  *chunkBuffer
 	pump    context.CancelFunc
@@ -273,7 +533,11 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	if err != nil {
 		return nil, err
 	}
-	if err := m.backend.Available(ctx); err != nil {
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if err := backend.Available(ctx); err != nil {
 		return nil, err
 	}
 
@@ -281,6 +545,8 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	if err != nil {
 		return nil, err
 	}
+	rt.opMu.Lock()
+	defer rt.opMu.Unlock()
 
 	rt.mu.Lock()
 	if rt.state == StateRunning {
@@ -312,7 +578,7 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	// A session that exists is adopted rather than recreated. It may have been
 	// left by a previous server process, and it may still be running work the
 	// user cares about.
-	session, created, err := m.ensureSession(ctx, rt, runtimePath, cols, rows)
+	session, created, err := m.ensureSession(ctx, backend, rt, runtimePath, cols, rows)
 	if err != nil {
 		rt.setState(StateError, err.Error(), m.now())
 		m.recordFailure(ctx, projectID, rt.session)
@@ -330,7 +596,7 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 
 	// The size is asserted on every start, not only at creation: the canonical
 	// geometry is a decision, and re-asserting it is how it stays one.
-	if err := m.backend.Resize(ctx, rt.session, cols, rows); err != nil {
+	if err := backend.Resize(ctx, rt.session, cols, rows); err != nil {
 		rt.setState(StateError, err.Error(), m.now())
 		return nil, err
 	}
@@ -350,15 +616,15 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 
 	if err := m.store.Save(ctx, Record{
 		ProjectID: projectID,
-		Backend:   m.backend.Name(),
+		Backend:   m.backendName,
 		Session:   rt.session,
 		State:     StateRunning,
 		Cols:      cols,
 		Rows:      rows,
 		CreatedAt: session.Created,
 		UpdatedAt: now,
-		// The session was just created or adopted, so this is the moment it was
-		// last confirmed to exist.
+		// The session was just created or adopted, so this is the moment it
+		// was last confirmed to exist.
 		LastSeenAt: &now,
 	}); err != nil {
 		// The session is running, so failing the whole start would be wrong -
@@ -370,14 +636,15 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	}
 
 	m.log.Info("runtime started",
-		"projectId", projectID, "session", rt.session, "dir", runtimePath, "cols", cols, "rows", rows)
+		"projectId", projectID, "session", rt.session, "dir", runtimePath,
+		"cols", cols, "rows", rows, "socket", m.sockets.Path(projectID))
 	return m.describe(ctx, rt), nil
 }
 
 // ensureSession returns the project's session, creating it when absent. The
 // second result reports whether this call made it.
-func (m *Manager) ensureSession(ctx context.Context, rt *runtime, dir string, cols, rows int) (*Session, bool, error) {
-	if existing, err := m.backend.Inspect(ctx, rt.session); err == nil {
+func (m *Manager) ensureSession(ctx context.Context, backend Backend, rt *runtime, dir string, cols, rows int) (*Session, bool, error) {
+	if existing, err := backend.Inspect(ctx, rt.session); err == nil {
 		return existing, false, nil
 	} else if !errors.Is(err, ErrNoSuchSession) {
 		return nil, false, err
@@ -392,13 +659,13 @@ func (m *Manager) ensureSession(ctx context.Context, rt *runtime, dir string, co
 	if m.shell != "" {
 		spec.Command = []string{m.shell}
 	}
-	session, err := m.backend.Create(ctx, spec)
+	session, err := backend.Create(ctx, spec)
 	if err != nil {
 		if errors.Is(err, ErrSessionExists) {
 			// Lost a race with another start. The session exists, which is all
 			// this call needed - but this call did not make it, and its size is
 			// therefore not necessarily the size that was asked for.
-			existing, inspectErr := m.backend.Inspect(ctx, rt.session)
+			existing, inspectErr := backend.Inspect(ctx, rt.session)
 			return existing, false, inspectErr
 		}
 		return nil, false, err
@@ -420,13 +687,18 @@ func (m *Manager) runtimePath(p *project.Project) (string, error) {
 	return dir, nil
 }
 
-// attach opens the output stream and starts the pump that numbers it.
+// attach opens the runtime's Control Monitor, reusing a healthy one.
 //
 // An existing subscription is reused only while it is healthy. A subscription
 // whose stream has ended is a dead end: the session may since have been
 // recreated under the same name, and reusing the old stream would leave a
 // running terminal with no output arriving and nothing to say why.
 func (m *Manager) attach(rt *runtime) error {
+	backend, err := m.backendFor(rt.projectID)
+	if err != nil {
+		return err
+	}
+
 	rt.mu.Lock()
 	if rt.sub != nil && rt.sub.Err() == nil {
 		rt.mu.Unlock()
@@ -443,7 +715,7 @@ func (m *Manager) attach(rt *runtime) error {
 		_ = stale.Close()
 	}
 
-	sub, err := m.backend.Attach(m.ctx, rt.session)
+	sub, err := backend.Attach(m.ctx, rt.session)
 	if err != nil {
 		return wrapError(err, CodeStartFailed, "could not read the output of session %q", rt.session)
 	}
@@ -455,18 +727,114 @@ func (m *Manager) attach(rt *runtime) error {
 	rt.mu.Unlock()
 
 	m.wg.Add(1)
-	go m.pump(ctx, rt, sub)
+	go m.monitor(ctx, backend, rt, sub)
 	return nil
 }
 
-// pump numbers a subscription's output and fans it out.
+// Re-attach policy for a Control Monitor whose stream ended.
+const (
+	monitorInitialBackoff = 250 * time.Millisecond
+	monitorMaxBackoff     = 5 * time.Second
+	monitorBackoffFactor  = 2
+)
+
+// monitor keeps one runtime's output stream alive for as long as its session
+// exists.
+//
+// This is the Control Monitor, and its ownership rule is the reason it is a
+// goroutine here rather than a connection somewhere else:
+//
+//   - One project has exactly one, for as long as its runtime exists. It is
+//     established when the runtime starts or is adopted, and it is not
+//     re-established because somebody connected.
+//   - It belongs to the AgentMux server, not to a browser. A viewer reads the
+//     runtime's buffered output; it never creates, closes, or interrupts the
+//     thing that is reading the project's terminal. Phones that sleep, tablets
+//     that reload, and windows that close are therefore not runtime events.
+//   - It does not own the session. When the stream ends it re-establishes it;
+//     when the session behind it is gone it stops. It never destroys a
+//     session, because the session is precisely the thing that is supposed to
+//     outlive everything on this side. A tmux server still running after
+//     AgentMux has exited is the design, not a leak.
+//
+// The re-establishment is not defensive padding. A control client can die
+// while its session lives - it is a separate process, and it can be killed,
+// lose its socket, or be restarted - and the subscription below this is
+// entitled to conclude the session is gone when a single probe of it fails.
+// Deciding otherwise here, where the session can be asked again rather than
+// guessed about, is what keeps one unlucky probe from silently ending a
+// project's output.
+func (m *Manager) monitor(ctx context.Context, backend Backend, rt *runtime, sub Subscription) {
+	defer m.wg.Done()
+
+	backoff := monitorInitialBackoff
+	for {
+		m.drain(ctx, rt, sub)
+		if ctx.Err() != nil || m.ctx.Err() != nil {
+			return
+		}
+
+		// The stream ended. Before believing that, ask whether the session is
+		// still there - a dropped stream is not the same thing as an ended
+		// session, and the whole reason this loop exists is that the two are
+		// indistinguishable from inside a pump.
+		alive, err := backend.Exists(ctx, rt.session)
+		if err != nil {
+			// The question could not be answered, so no conclusion is drawn.
+			// Guessing either way is worse than waiting: guessing "gone" stops
+			// observing a session that is still running, and guessing "alive"
+			// loops on a dead one.
+			m.monitorFailures.Add(1)
+			m.log.Warn("could not tell whether the runtime's session is still there",
+				"projectId", rt.projectID, "session", rt.session, "error", err)
+			if !sleepContext(ctx, backoff) {
+				return
+			}
+			backoff = min(backoff*monitorBackoffFactor, monitorMaxBackoff)
+			continue
+		}
+		if !alive {
+			// Nothing to reconnect to, and nothing to destroy. The session
+			// ending is the runtime ending; the server it lived on is the
+			// project's and outlives it, which is what Stop means - the
+			// scrollback stays readable and the next Start reuses the server.
+			m.log.Info("the runtime's terminal session is gone; its control monitor is stopping",
+				"projectId", rt.projectID, "session", rt.session)
+			rt.setState(StateStopped, "the terminal session ended", m.now())
+			return
+		}
+
+		m.monitorReconnects.Add(1)
+		m.log.Warn("the runtime's control monitor lost its stream; re-establishing it",
+			"projectId", rt.projectID, "session", rt.session,
+			"retryIn", backoff, "error", sub.Err())
+
+		if !sleepContext(ctx, backoff) {
+			return
+		}
+		backoff = min(backoff*monitorBackoffFactor, monitorMaxBackoff)
+
+		next, err := backend.Attach(m.ctx, rt.session)
+		if err != nil {
+			m.monitorFailures.Add(1)
+			m.log.Warn("could not re-establish the control monitor",
+				"projectId", rt.projectID, "session", rt.session, "error", err)
+			continue
+		}
+		backoff = monitorInitialBackoff
+		rt.mu.Lock()
+		rt.sub = next
+		rt.mu.Unlock()
+		sub = next
+	}
+}
+
+// drain numbers a subscription's output and fans it out.
 //
 // This goroutine is the only writer of a runtime's sequence number, which is
 // what makes the numbering strictly increasing without a lock around every
 // chunk.
-func (m *Manager) pump(ctx context.Context, rt *runtime, sub Subscription) {
-	defer m.wg.Done()
-
+func (m *Manager) drain(ctx context.Context, rt *runtime, sub Subscription) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -475,7 +843,7 @@ func (m *Manager) pump(ctx context.Context, rt *runtime, sub Subscription) {
 			if !ok {
 				// The subscription ended. The session may still exist and be
 				// reconnecting, so the runtime is not marked dead here - the
-				// next reconciliation or start will decide that.
+				// monitor decides that, by asking the session itself.
 				if err := sub.Err(); err != nil {
 					m.log.Warn("runtime output stream ended",
 						"projectId", rt.projectID, "session", rt.session, "error", err)
@@ -542,6 +910,13 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 	if rt == nil {
 		return m.describeAbsent(ctx, projectID)
 	}
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	rt.opMu.Lock()
+	defer rt.opMu.Unlock()
 
 	rt.mu.Lock()
 	state := rt.state
@@ -551,7 +926,7 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 	}
 
 	rt.setState(StateStopping, "", m.now())
-	if err := m.backend.Stop(ctx, rt.session); err != nil && !errors.Is(err, ErrNoSuchSession) {
+	if err := backend.Stop(ctx, rt.session); err != nil && !errors.Is(err, ErrNoSuchSession) {
 		rt.setState(StateError, err.Error(), m.now())
 		return nil, err
 	}
@@ -565,9 +940,17 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 
 // Destroy removes a project's runtime completely.
 //
-// It ends the session, everything running in it, and its scrollback, and it
+// It ends the session, everything running in it, and its scrollback, it stops
+// the project's own tmux server if that leaves the server empty, and it
 // forgets the runtime record. Unlike Stop it is irreversible, which is why the
 // API separates them: one is "stop working", the other is "throw it away".
+//
+// Since Phase 2.5 it is also narrowly scoped, and that is a property of the
+// socket rather than of this function's care: the session name is this
+// project's, the socket is this project's, and the server is this project's.
+// Destroying one project cannot reach another's runtime even if it tried,
+// because there is no command here that names anything outside this project's
+// socket.
 //
 // The project is resolved first, like every other method here. A session left
 // behind by a project that has since been removed is an orphan, and orphans are
@@ -575,19 +958,23 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 // project id nobody recognises is exactly the guess reconciliation refuses to
 // make.
 func (m *Manager) Destroy(ctx context.Context, projectID string) error {
-	if _, err := m.project(ctx, projectID); err != nil {
+	p, err := m.project(ctx, projectID)
+	if err != nil {
 		return err
 	}
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	rt, ok := m.runs[projectID]
-	if ok {
-		delete(m.runs, projectID)
-	}
 	m.mu.Unlock()
 
-	session := project.SessionNameFor(projectID)
-
 	if ok {
+		rt.opMu.Lock()
+		defer rt.opMu.Unlock()
+
 		rt.mu.Lock()
 		cancel, sub := rt.pump, rt.sub
 		rt.pump, rt.sub = nil, nil
@@ -601,15 +988,76 @@ func (m *Manager) Destroy(ctx context.Context, projectID string) error {
 		rt.setState(StateStopped, "", m.now())
 	}
 
-	if err := m.backend.Destroy(ctx, session); err != nil {
+	session := p.SessionName()
+	if err := backend.Destroy(ctx, session); err != nil {
 		return err
 	}
+
+	// The project's tmux server is the project's own resource, so it goes too -
+	// but only once it is known to be empty. Killing a server that still holds
+	// a session would destroy something this call was not asked to destroy,
+	// and the emptiness is established by asking the socket rather than by
+	// assuming the session just killed was the only one on it.
+	socketPath := m.sockets.Path(projectID)
+	m.stopEmptyServer(ctx, backend, socketPath)
+
+	m.mu.Lock()
+	delete(m.runs, projectID)
+	delete(m.backends, projectID)
+	m.mu.Unlock()
+	if err := backend.Close(); err != nil {
+		m.log.Warn("could not release the project's tmux backend", "projectId", projectID, "error", err)
+	}
+
 	if err := m.store.Delete(ctx, projectID); err != nil && !errors.Is(err, ErrRecordNotFound) {
 		return wrapError(err, CodeStorageFailure, "the session was destroyed but its record could not be removed")
 	}
 
-	m.log.Info("runtime destroyed", "projectId", projectID, "session", session)
+	m.log.Info("runtime destroyed", "projectId", projectID, "session", session, "socket", socketPath)
 	return nil
+}
+
+// stopEmptyServer stops a project's tmux server when nothing is left on it,
+// and reclaims the socket file afterwards.
+//
+// The reclaim is not optional tidiness. `kill-server` leaves the socket file
+// behind - measured on tmux 3.4 and 3.7c - so a destroyed project without this
+// would leave a file that every later reconciliation has to classify, and the
+// directory would accumulate one dead socket per project ever destroyed.
+func (m *Manager) stopEmptyServer(ctx context.Context, backend Backend, socketPath string) {
+	if socketPath == "" {
+		return
+	}
+	probe := m.sockets.Probe(ctx, socketPath)
+	switch probe.State {
+	case SocketLive:
+		if len(probe.Sessions) > 0 {
+			m.log.Warn("the project's tmux server still holds sessions; it is left running",
+				"socket", socketPath, "sessions", len(probe.Sessions))
+			return
+		}
+		if err := backend.KillServer(ctx); err != nil {
+			m.log.Warn("could not stop the project's tmux server", "socket", socketPath, "error", err)
+			return
+		}
+	case SocketStale:
+		// The server is already gone and left its socket behind, which is what
+		// kill-server does. There is nothing to stop, only a file to clear.
+	default:
+		// Absent, or a state that could not be classified. Either way this is not
+		// the moment to touch the path: Reclaim refuses the unknown case for the
+		// same reason.
+		return
+	}
+
+	// Reclaim rather than os.Remove: it probes again, waits, and refuses unless
+	// it is sure there is no server behind the name, which is the only way to
+	// delete a socket without risking one that has just been started.
+	if removed, err := m.sockets.Reclaim(ctx, socketPath); err != nil {
+		m.log.Warn("could not reclaim the project's socket file", "socket", socketPath, "error", err)
+	} else if removed {
+		m.log.Debug("reclaimed the project's socket file", "socket", socketPath)
+	}
 }
 
 // Runtime returns a project's runtime state, or a stopped runtime when the
@@ -640,7 +1088,11 @@ func (m *Manager) Input(ctx context.Context, projectID string, data []byte) erro
 	if len(data) == 0 {
 		return nil
 	}
-	return m.backend.SendInput(ctx, rt.session, data)
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return err
+	}
+	return backend.SendInput(ctx, rt.session, data)
 }
 
 // Launch types a command line into a project's runtime.
@@ -649,7 +1101,11 @@ func (m *Manager) Launch(ctx context.Context, projectID, command string) error {
 	if err != nil {
 		return err
 	}
-	return m.backend.Launch(ctx, rt.session, command)
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return err
+	}
+	return backend.Launch(ctx, rt.session, command)
 }
 
 // Resize sets a project's canonical terminal size.
@@ -665,7 +1121,11 @@ func (m *Manager) Resize(ctx context.Context, projectID string, cols, rows int) 
 	if err != nil {
 		return nil, err
 	}
-	if err := m.backend.Resize(ctx, rt.session, cols, rows); err != nil {
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if err := backend.Resize(ctx, rt.session, cols, rows); err != nil {
 		return nil, err
 	}
 
@@ -740,26 +1200,38 @@ func (m *Manager) Watch(ctx context.Context, projectID string, since uint64) ([]
 // watchBufferDepth bounds one watcher's queue.
 const watchBufferDepth = 256
 
-// ReconcileReport describes what the runtime looked like when the server
+// ReconcileReport describes what the runtimes looked like when the server
 // started.
 type ReconcileReport struct {
-	// Running are projects whose session exists and whose record said it
-	// should be running. They are adopted, not restarted.
+	// Running are projects whose runtime was rediscovered and adopted: their
+	// socket has a live server and the server has their session. They are
+	// adopted, not restarted.
 	Running []string
 
-	// Stopped are projects whose record exists but whose session does not.
-	// They are not started automatically: a server restart is not a request to
-	// resume work.
+	// Stopped are projects whose record exists but whose session is not on
+	// their socket - because the session ended, or because the server went with
+	// it. They are not started automatically: a server restart is not a request
+	// to resume work.
 	Stopped []string
 
-	// Orphans are sessions that exist but belong to no registered project.
-	// They are reported and left alone.
+	// Orphans are runtimes that exist on a socket but belong to no registered
+	// project. They are reported and left alone.
 	Orphans []Orphan
+
+	// StaleSockets are socket files that were confirmed to have no server
+	// behind them and were removed.
+	StaleSockets []string
+
+	// UnreadableSockets are socket paths that could not be classified. They are
+	// reported rather than cleaned, because a socket AgentMux cannot read may
+	// be a server it cannot reach.
+	UnreadableSockets []string
 }
 
-// Orphan is a runtime session that no registered project claims.
+// Orphan is a runtime that no registered project claims.
 type Orphan struct {
 	Session string `json:"session"`
+	Socket  string `json:"socket,omitempty"`
 	Dir     string `json:"dir,omitempty"`
 	Cols    int    `json:"cols"`
 	Rows    int    `json:"rows"`
@@ -769,13 +1241,34 @@ type Orphan struct {
 	ProjectID string `json:"projectId,omitempty"`
 }
 
-// Reconcile compares what the database remembers with what the runtime
-// actually has, and reports the difference.
+// Reconcile compares what the database remembers with what the runtimes
+// actually have, and reports the difference.
 //
 // It never starts anything and never kills anything. Both would be guesses: a
 // session that survived a restart is evidence that the user wanted it, and a
-// session whose project is gone may still hold work somebody needs. The
-// honest thing to do with a discrepancy is to describe it.
+// session whose project is gone may still hold work somebody needs. The honest
+// thing to do with a discrepancy is to describe it.
+//
+// Since Phase 2.5 the unit of reconciliation is the socket rather than the
+// installation, because a socket is now what a runtime is. That changes the
+// cases it has to distinguish, and each one is answered with what the socket
+// says rather than with what the database hopes:
+//
+//	record RUNNING, server live, session there   adopt it and reattach (A)
+//	record RUNNING, server live, session gone    stopped - the session ended
+//	record RUNNING, no server                    stopped, never still running (B)
+//	socket live, no registered project           orphan; reported, not killed (C)
+//	socket file, no server behind it             stale; confirmed, then removed (D)
+//	socket path that cannot be read              unknown; reported, untouched
+//
+// The one thing that is never allowed is the second row's inverse: a runtime
+// whose server is gone must not keep being reported as running. A client acting
+// on "running" would send input to nothing and wait for output that cannot
+// come, and would have no way to learn otherwise.
+//
+// The only file this removes is a socket that has been confirmed dead, and the
+// confirmation is Reclaim's: two probes with a settle between them, and only
+// ever on tmux saying there is no server there.
 func (m *Manager) Reconcile(ctx context.Context) (ReconcileReport, error) {
 	var report ReconcileReport
 
@@ -797,119 +1290,246 @@ func (m *Manager) Reconcile(ctx context.Context) (ReconcileReport, error) {
 		known[p.ID] = true
 	}
 
-	sessions, err := m.backend.List(ctx)
+	sockets, err := m.sockets.List()
 	if err != nil {
 		return report, err
 	}
-	live := make(map[string]*Session, len(sessions))
-	for _, s := range sessions {
-		live[s.Name] = s
-	}
 
-	// Case C: a session with no registered project behind it.
 	m.mu.Lock()
-	m.orphans = make(map[string]*Session)
-	for _, s := range sessions {
-		id := strings.TrimPrefix(s.Name, project.SessionPrefix)
-		if known[id] {
+	m.orphans = make(map[string]Orphan)
+	m.mu.Unlock()
+
+	// Sockets no registered project claims. Case C and case D, and the two are
+	// answered differently on purpose: a server with sessions on it is somebody's
+	// work and is only described, while a socket file with no server behind it
+	// is litter and is removed once that has been confirmed.
+	for _, file := range sockets {
+		if file.WellFormed && known[file.ProjectID] {
 			continue
 		}
-		m.orphans[s.Name] = s
-		report.Orphans = append(report.Orphans, Orphan{
-			Session:   s.Name,
-			Dir:       s.Dir,
-			Cols:      s.Cols,
-			Rows:      s.Rows,
-			ProjectID: id,
-		})
+		m.reconcileUnclaimedSocket(ctx, file, &report)
 	}
-	m.mu.Unlock()
-	sort.Slice(report.Orphans, func(i, j int) bool { return report.Orphans[i].Session < report.Orphans[j].Session })
 
 	for _, p := range projects {
-		rec, recorded := byProject[p.ID]
-		session, running := live[p.SessionName()]
-
-		switch {
-		case running && recorded && rec.State == StateStopped:
-			// The user stopped this runtime and the session outlived the
-			// server. Reporting it as running would undo their decision.
-			rt, err := m.runtimeFor(p.ID, p.SessionName())
-			if err != nil {
-				return report, err
-			}
-			rt.mu.Lock()
-			rt.state = StateStopped
-			rt.cols, rt.rows = rec.Cols, rec.Rows
-			rt.started = session.Created
-			rt.updated = m.now()
-			rt.mu.Unlock()
-			report.Stopped = append(report.Stopped, p.ID)
-
-		case running:
-			// Case A: adopt the session that is already there.
-			rt, err := m.runtimeFor(p.ID, p.SessionName())
-			if err != nil {
-				return report, err
-			}
-			cols, rows := session.Cols, session.Rows
-			if recorded && rec.Cols > 0 && rec.Rows > 0 {
-				cols, rows = rec.Cols, rec.Rows
-			}
-			rt.mu.Lock()
-			rt.cols, rt.rows = cols, rows
-			rt.started = session.Created
-			rt.state = StateStarting
-			rt.updated = m.now()
-			rt.mu.Unlock()
-
-			if err := m.backend.Resize(ctx, p.SessionName(), cols, rows); err != nil {
-				rt.setState(StateError, err.Error(), m.now())
-				m.log.Error("could not restore the runtime size", "projectId", p.ID, "error", err)
-				continue
-			}
-			if err := m.attach(rt); err != nil {
-				rt.setState(StateError, err.Error(), m.now())
-				m.log.Error("could not reattach to a surviving session", "projectId", p.ID, "error", err)
-				continue
-			}
-			now := m.now()
-			rt.setState(StateRunning, "", now)
-			m.persistState(ctx, p.ID, rt, StateRunning)
-			report.Running = append(report.Running, p.ID)
-			m.log.Info("runtime rediscovered", "projectId", p.ID, "session", session.Name, "dir", session.Dir)
-
-		case recorded:
-			// Case B: the record exists, the session does not. Report it
-			// stopped and leave starting to the user.
-			rt, err := m.runtimeFor(p.ID, p.SessionName())
-			if err != nil {
-				return report, err
-			}
-			message := ""
-			if rec.State == StateRunning {
-				message = "the terminal session ended while the server was not running"
-			}
-			rt.mu.Lock()
-			rt.state = StateStopped
-			rt.message = message
-			rt.cols, rt.rows = rec.Cols, rec.Rows
-			if rt.cols <= 0 || rt.rows <= 0 {
-				rt.cols, rt.rows = m.cols, m.rows
-			}
-			rt.updated = m.now()
-			rt.mu.Unlock()
-			report.Stopped = append(report.Stopped, p.ID)
+		if err := m.reconcileProject(ctx, p, byProject[p.ID], &report); err != nil {
+			return report, err
 		}
 	}
 
 	sort.Strings(report.Running)
 	sort.Strings(report.Stopped)
+	sort.Strings(report.StaleSockets)
+	sort.Strings(report.UnreadableSockets)
+	sort.Slice(report.Orphans, func(i, j int) bool { return report.Orphans[i].Session < report.Orphans[j].Session })
 	return report, nil
 }
 
-// Orphans returns the last reconciliation's orphaned sessions.
-func (m *Manager) Orphans() []Orphan {
+// reconcileUnclaimedSocket deals with one socket file that no registered
+// project owns.
+func (m *Manager) reconcileUnclaimedSocket(ctx context.Context, file SocketFile, report *ReconcileReport) {
+	probe := m.sockets.Probe(ctx, file.Path)
+	switch probe.State {
+	case SocketAbsent:
+		// It went away between the listing and the probe. Nothing to do, and
+		// nothing to report: the state the caller cares about is already true.
+
+	case SocketLive:
+		// Case C. A server with no project behind it. It is reported and left
+		// running, whether or not it has sessions: killing it would be AgentMux
+		// destroying something it cannot account for, and the one thing that is
+		// certainly true about it is that AgentMux does not know what it is.
+		if len(probe.Sessions) == 0 {
+			m.log.Warn("a tmux server is running on a socket that belongs to no registered project",
+				"socket", file.Path, "projectId", file.ProjectID, "wellFormed", file.WellFormed)
+			return
+		}
+		for _, s := range probe.Sessions {
+			orphan := Orphan{
+				Session:   s.Name,
+				Socket:    file.Path,
+				Dir:       s.Dir,
+				Cols:      s.Cols,
+				Rows:      s.Rows,
+				ProjectID: strings.TrimPrefix(s.Name, project.SessionPrefix),
+			}
+			m.mu.Lock()
+			m.orphans[s.Name] = orphan
+			m.mu.Unlock()
+			report.Orphans = append(report.Orphans, orphan)
+		}
+
+	case SocketStale:
+		// Case D. tmux says there is no server here. It is removed, and Reclaim
+		// confirms that a second time before unlinking anything.
+		removed, err := m.sockets.Reclaim(ctx, file.Path)
+		if err != nil {
+			m.log.Warn("could not reclaim a stale socket", "socket", file.Path, "error", err)
+			return
+		}
+		if removed {
+			m.log.Info("removed a stale tmux socket left by a runtime that no project claims",
+				"socket", file.Path, "projectId", file.ProjectID)
+			report.StaleSockets = append(report.StaleSockets, file.Path)
+		}
+
+	default:
+		m.log.Warn("a tmux socket could not be classified; it is left untouched",
+			"socket", file.Path, "detail", probe.Detail)
+		report.UnreadableSockets = append(report.UnreadableSockets, file.Path)
+	}
+}
+
+// reconcileProject brings one project's runtime in line with what its socket
+// and its record say.
+func (m *Manager) reconcileProject(ctx context.Context, p *project.Project, rec Record, report *ReconcileReport) error {
+	recorded := rec.ProjectID != ""
+
+	// A socket path is only ever a function of the project id, so this cannot
+	// be empty for a project the store issued. Refusing to continue rather than
+	// falling back to a shared socket is the whole of Phase 2.5: a project
+	// without its own socket has no runtime, not a borrowed one.
+	socketPath := m.sockets.Path(p.ID)
+	if socketPath == "" {
+		m.log.Error("a project has no runtime socket path; its runtime is not reconciled",
+			"projectId", p.ID)
+		report.Stopped = append(report.Stopped, p.ID)
+		return nil
+	}
+
+	probe := m.sockets.Probe(ctx, socketPath)
+	var session *Session
+	if probe.State == SocketLive {
+		for _, s := range probe.Sessions {
+			if s.Name == p.SessionName() {
+				session = s
+				continue
+			}
+			// A second session on a project's own socket. AgentMux puts exactly
+			// one session on a server, so this was put there by something else -
+			// and since the socket is AgentMux's, "something else" had to reach
+			// past the directory's permissions to do it. It is reported and left
+			// alone.
+			orphan := Orphan{
+				Session:   s.Name,
+				Socket:    socketPath,
+				Dir:       s.Dir,
+				Cols:      s.Cols,
+				Rows:      s.Rows,
+				ProjectID: strings.TrimPrefix(s.Name, project.SessionPrefix),
+			}
+			m.mu.Lock()
+			m.orphans[s.Name] = orphan
+			m.mu.Unlock()
+			report.Orphans = append(report.Orphans, orphan)
+		}
+	}
+
+	switch {
+	case session != nil && recorded && rec.State == StateStopped:
+		// The user stopped this runtime and the session outlived the server.
+		// Reporting it as running would undo their decision.
+		rt, err := m.runtimeFor(p.ID, p.SessionName())
+		if err != nil {
+			return err
+		}
+		rt.mu.Lock()
+		rt.state = StateStopped
+		rt.cols, rt.rows = rec.Cols, rec.Rows
+		rt.started = session.Created
+		rt.updated = m.now()
+		rt.mu.Unlock()
+		report.Stopped = append(report.Stopped, p.ID)
+
+	case session != nil:
+		// Case A: adopt the session that is already there.
+		rt, err := m.runtimeFor(p.ID, p.SessionName())
+		if err != nil {
+			return err
+		}
+		cols, rows := session.Cols, session.Rows
+		if recorded && rec.Cols > 0 && rec.Rows > 0 {
+			cols, rows = rec.Cols, rec.Rows
+		}
+		rt.mu.Lock()
+		rt.cols, rt.rows = cols, rows
+		rt.started = session.Created
+		rt.state = StateStarting
+		rt.updated = m.now()
+		rt.mu.Unlock()
+
+		backend, err := m.backendFor(p.ID)
+		if err != nil {
+			return err
+		}
+		if err := backend.Resize(ctx, p.SessionName(), cols, rows); err != nil {
+			rt.setState(StateError, err.Error(), m.now())
+			m.log.Error("could not restore the runtime size", "projectId", p.ID, "error", err)
+			return nil
+		}
+		if err := m.attach(rt); err != nil {
+			rt.setState(StateError, err.Error(), m.now())
+			m.log.Error("could not reattach to a surviving session", "projectId", p.ID, "error", err)
+			return nil
+		}
+		now := m.now()
+		rt.setState(StateRunning, "", now)
+		m.persistState(ctx, p.ID, rt, StateRunning)
+		report.Running = append(report.Running, p.ID)
+		m.log.Info("runtime rediscovered", "projectId", p.ID, "session", session.Name,
+			"socket", socketPath, "dir", session.Dir)
+
+	case recorded:
+		// Case B: the record exists, the session does not. Report it stopped
+		// and leave starting to the user.
+		rt, err := m.runtimeFor(p.ID, p.SessionName())
+		if err != nil {
+			return err
+		}
+		message := ""
+		if rec.State == StateRunning {
+			// Which of the two happened is worth distinguishing, because one is
+			// a shell that exited and the other is a server that went away, and
+			// only the second one is the Phase 2 anomaly.
+			if probe.State == SocketLive {
+				message = "the terminal session ended"
+			} else {
+				message = "the terminal session ended while the server was not running"
+			}
+		}
+		rt.mu.Lock()
+		rt.state = StateStopped
+		rt.message = message
+		rt.cols, rt.rows = rec.Cols, rec.Rows
+		if rt.cols <= 0 || rt.rows <= 0 {
+			rt.cols, rt.rows = m.cols, m.rows
+		}
+		rt.updated = m.now()
+		rt.mu.Unlock()
+		report.Stopped = append(report.Stopped, p.ID)
+	}
+
+	// Case D for a project AgentMux does know about: its record may be a
+	// leftover, and the socket file behind it certainly is. Only a socket with
+	// no server behind it is touched, and only once Reclaim has confirmed it.
+	if probe.State == SocketStale {
+		removed, err := m.sockets.Reclaim(ctx, socketPath)
+		if err != nil {
+			m.log.Warn("could not reclaim a stale socket", "projectId", p.ID, "socket", socketPath, "error", err)
+		} else if removed {
+			m.log.Info("removed a stale tmux socket", "projectId", p.ID, "socket", socketPath)
+			report.StaleSockets = append(report.StaleSockets, socketPath)
+		}
+	}
+	if probe.State == SocketUnknown {
+		m.log.Warn("a project's tmux socket could not be classified; it is left untouched",
+			"projectId", p.ID, "socket", socketPath, "detail", probe.Detail)
+		report.UnreadableSockets = append(report.UnreadableSockets, socketPath)
+	}
+	return nil
+}
+
+// orphansForReport is the orphan map in report order.
+func (m *Manager) orphansForReport() []Orphan {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -927,17 +1547,41 @@ func (m *Manager) Orphans() []Orphan {
 	return out
 }
 
-// Describe returns a project's runtime from the backend's point of view.
+// Orphans returns the last reconciliation's orphaned runtimes.
+func (m *Manager) Orphans() []Orphan {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]Orphan, 0, len(m.orphans))
+	for _, o := range m.orphans {
+		out = append(out, o)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Session < out[j].Session })
+	return out
+}
+
+// Describe returns a project's runtime from its own socket's point of view.
 //
-// It is a diagnostic: it answers "what does the runtime think is there",
-// independently of what the database remembers or what this manager has in
-// memory. The three disagreeing is exactly the situation a reconciliation
+// It is a diagnostic: it answers "what does this project's runtime think is
+// there", independently of what the database remembers or what this manager has
+// in memory. The three disagreeing is exactly the situation a reconciliation
 // report exists to surface.
 func (m *Manager) Describe(ctx context.Context, projectID string) (*Session, error) {
-	return m.backend.Inspect(ctx, project.SessionNameFor(projectID))
+	backend, err := m.backendFor(projectID)
+	if err != nil {
+		return nil, err
+	}
+	return backend.Inspect(ctx, project.SessionNameFor(projectID))
 }
 
 // Close releases the manager's resources without touching any session.
+//
+// Shutting AgentMux down is not a request to end anyone's work, and since
+// Phase 2.5 that is a property of the architecture rather than of this
+// function's care: the tmux servers belong to the projects, not to AgentMux, so
+// there is nothing here to stop. The control monitors are closed and their
+// sessions are left running on their own servers, which is what makes a restart
+// a reconnection rather than a loss.
 func (m *Manager) Close() error {
 	m.mu.Lock()
 	if m.closed {
@@ -948,6 +1592,10 @@ func (m *Manager) Close() error {
 	runs := make([]*runtime, 0, len(m.runs))
 	for _, rt := range m.runs {
 		runs = append(runs, rt)
+	}
+	backends := make([]Backend, 0, len(m.backends))
+	for _, backend := range m.backends {
+		backends = append(backends, backend)
 	}
 	m.mu.Unlock()
 
@@ -972,7 +1620,18 @@ func (m *Manager) Close() error {
 
 	m.cancel()
 	m.wg.Wait()
-	return m.backend.Close()
+
+	// Any subscription a backend still holds after its runtime was drained. The
+	// per-runtime close above is the normal path; this is the backstop for a
+	// backend whose runtime was never adopted, so that no control client is
+	// left attached to a server this process is about to stop talking to.
+	var firstErr error
+	for _, backend := range backends {
+		if err := backend.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // project resolves a project id, mapping a miss to a runtime error.
@@ -1055,15 +1714,18 @@ func (m *Manager) runtimeFor(projectID, session string) (*runtime, error) {
 func (m *Manager) describe(ctx context.Context, rt *runtime) *Runtime {
 	snap := rt.snapshot()
 
-	// Liveness is asked of the backend rather than inferred from the state.
-	// The two genuinely differ: a stopped runtime keeps its session so that
-	// its scrollback survives, and a runtime whose server died under it has a
-	// state that is optimistic and a session that is not there.
-	alive, _ := m.backend.Exists(ctx, rt.session)
+	// Liveness is asked of the project's own socket rather than inferred from
+	// the state. The two genuinely differ: a stopped runtime keeps its session
+	// so that its scrollback survives, and a runtime whose server died under it
+	// has a state that is optimistic and a session that is not there.
+	alive := false
+	if backend, err := m.backendFor(rt.projectID); err == nil {
+		alive, _ = backend.Exists(ctx, rt.session)
+	}
 
 	return &Runtime{
 		ProjectID:    rt.projectID,
-		Backend:      m.backend.Name(),
+		Backend:      m.backendName,
 		Session:      rt.session,
 		State:        snap.state,
 		SessionAlive: alive,
@@ -1089,14 +1751,16 @@ func (m *Manager) describeAbsent(ctx context.Context, projectID string) (*Runtim
 		if record.Session != "" {
 			session = record.Session
 		}
-		alive, _ = m.backend.Exists(ctx, session)
+		if backend, err := m.backendFor(projectID); err == nil {
+			alive, _ = backend.Exists(ctx, session)
+		}
 	} else if !errors.Is(err, ErrRecordNotFound) {
 		return nil, wrapError(err, CodeStorageFailure, "could not read the runtime record for %s", projectID)
 	}
 
 	return &Runtime{
 		ProjectID:    projectID,
-		Backend:      m.backend.Name(),
+		Backend:      m.backendName,
 		Session:      session,
 		State:        StateStopped,
 		SessionAlive: alive,
@@ -1126,7 +1790,7 @@ func (m *Manager) persistState(ctx context.Context, projectID string, rt *runtim
 
 	record := Record{
 		ProjectID: projectID,
-		Backend:   m.backend.Name(),
+		Backend:   m.backendName,
 		Session:   rt.session,
 		State:     state,
 		Cols:      snap.cols,
@@ -1154,7 +1818,7 @@ func (m *Manager) persistState(ctx context.Context, projectID string, rt *runtim
 func (m *Manager) recordFailure(ctx context.Context, projectID, session string) {
 	record := Record{
 		ProjectID: projectID,
-		Backend:   m.backend.Name(),
+		Backend:   m.backendName,
 		Session:   session,
 		State:     StateError,
 		UpdatedAt: m.now(),

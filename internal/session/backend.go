@@ -102,6 +102,18 @@ type Backend interface {
 	// destructive and irreversible.
 	Destroy(ctx context.Context, name string) error
 
+	// KillServer stops the server this backend owns, ending every session on
+	// it at once.
+	//
+	// It is the one operation whose blast radius is larger than a session, and
+	// it is deliberately part of the interface rather than a capability a
+	// caller discovers: whether a shared server may be stopped is a question
+	// the architecture has to answer, and since Phase 2.5 the answer is that a
+	// backend's server holds exactly one project's runtimes, so stopping it is
+	// a project-scoped act. A backend that cannot honour "this stops only
+	// yours" must not implement this as anything broader.
+	KillServer(ctx context.Context) error
+
 	// Snapshot returns the session's current screen, escape sequences intact,
 	// for a client that needs to draw something before live output arrives.
 	Snapshot(ctx context.Context, name string) ([]byte, error)

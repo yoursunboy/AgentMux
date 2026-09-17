@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -93,8 +94,95 @@ func (h pinnedHost) CheckDependencies(ctx context.Context) []host.Dependency {
 }
 
 // ---------------------------------------------------------------------------
-// fakeBackend
+// fakeBackend, and the per-project plumbing the runtime manager needs around it
 // ---------------------------------------------------------------------------
+
+// fakeFactory hands every project the same fake backend.
+//
+// The manager takes a factory rather than one backend because since Phase 2.5
+// one project's runtime must not share a server with another's. The API layer
+// has nothing to say about that - it is tested in the session package against
+// real tmux - so the double answers every project with the one backend the
+// assertions below are written against.
+type fakeFactory struct{ backend *fakeBackend }
+
+func (f *fakeFactory) Backend(string) (session.Backend, error) { return f.backend, nil }
+
+func (f *fakeFactory) BackendName() string { return f.backend.Name() }
+
+// statusFactory is a factory that can also describe the tmux installation its
+// backends will run on.
+//
+// It is a separate type rather than a status field on fakeFactory because the
+// ability to answer is what is under test: fakeFactory cannot, and the server
+// has to leave the diagnostic out rather than invent one. One type with a nil
+// status would put both cases through one code path and prove neither.
+type statusFactory struct {
+	*fakeFactory
+	status session.TmuxStatus
+}
+
+func (f *statusFactory) Status(context.Context) session.TmuxStatus { return f.status }
+
+// fakeSockets is the socket layout that goes with fakeBackend.
+//
+// It mirrors the real layout's contract - a path per project id, a probe that
+// reports what is on a socket - without a filesystem. The distinction it does
+// keep is the one the manager depends on: a path belongs to exactly one project
+// id, so a probe of one project's socket reports that project's session and
+// nothing else. A double that returned every session for every path would let a
+// per-project bug pass here.
+type fakeSockets struct {
+	backend *fakeBackend
+
+	// dir is the directory the paths are built under.
+	dir string
+
+	// absent, when set, makes every probe report that there is no socket there.
+	// It stands in for a stopped runtime whose server is gone.
+	absent bool
+
+	// reclaimed records the socket paths Reclaim was asked about.
+	reclaimed []string
+}
+
+func newFakeSockets(b *fakeBackend) *fakeSockets {
+	return &fakeSockets{backend: b, dir: "/fake/tmux"}
+}
+
+func (s *fakeSockets) Dir() string { return s.dir }
+
+func (s *fakeSockets) Path(projectID string) string {
+	if !project.ValidID(projectID) {
+		return ""
+	}
+	return filepath.Join(s.dir, projectID+".sock")
+}
+
+func (s *fakeSockets) List() ([]session.SocketFile, error) {
+	return nil, nil
+}
+
+func (s *fakeSockets) Probe(_ context.Context, path string) session.SocketProbe {
+	if s.absent {
+		return session.SocketProbe{State: session.SocketAbsent}
+	}
+	id := strings.TrimSuffix(filepath.Base(path), ".sock")
+	want := project.SessionNameFor(id)
+	sessions, _ := s.backend.List(context.Background())
+	out := make([]*session.Session, 0, 1)
+	for _, sess := range sessions {
+		if sess.Name == want {
+			out = append(out, sess)
+		}
+	}
+	return session.SocketProbe{State: session.SocketLive, Sessions: out}
+}
+
+func (s *fakeSockets) Reclaim(_ context.Context, path string) (bool, error) {
+	s.reclaimed = append(s.reclaimed, path)
+	return false, nil
+}
 
 // fakeBackend is an in-memory session.Backend.
 //
@@ -120,6 +208,13 @@ type fakeBackend struct {
 	resized   map[string][2]int
 	launched  map[string][]string
 	stopCalls int
+
+	// serverKills counts KillServer calls. A project's Destroy may stop its own
+	// server once nothing is left on it, and a test that asserted "destroying a
+	// project stops one server" without this could not tell that from
+	// "destroying a project stops every server".
+	serverKills int
+
 	destroyed []string
 	subs      map[string][]*fakeSubscription
 	closed    bool
@@ -136,7 +231,6 @@ func newFakeBackend() *fakeBackend {
 }
 
 func (b *fakeBackend) Name() string { return "fake" }
-
 func (b *fakeBackend) Available(context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -235,6 +329,21 @@ func (b *fakeBackend) Destroy(_ context.Context, name string) error {
 	defer b.mu.Unlock()
 	delete(b.sessions, name)
 	b.destroyed = append(b.destroyed, name)
+	return nil
+}
+
+// KillServer ends every session, which is what stopping a tmux server does.
+//
+// It is recorded rather than only performed, because the assertion that matters
+// about it is a negative one: destroying one project must not stop a server
+// another project is still using.
+func (b *fakeBackend) KillServer(context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.serverKills++
+	for name := range b.sessions {
+		delete(b.sessions, name)
+	}
 	return nil
 }
 
@@ -1008,7 +1117,7 @@ func sequencesOf(chunks []session.Chunk) []uint64 {
 }
 
 // sessionNamesOf renders session names for a failure message.
-func sessionNamesOf(sessions []*session.Session) []string {
+func sessionNamesOf(sessions []session.SessionRef) []string {
 	out := make([]string, 0, len(sessions))
 	for _, s := range sessions {
 		out = append(out, s.Name)

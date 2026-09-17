@@ -20,16 +20,19 @@ import (
 // none of them may be duplicated elsewhere.
 const (
 	// DefaultTmuxBinary is the tmux executable.
+	//
+	// A bare name is resolved on PATH; an absolute path is used as given. Both
+	// are supported because both are real: a distribution install is a name,
+	// and a tmux built side by side with the system one into a user prefix is
+	// a path. Whatever this resolves to is the binary for every operation
+	// AgentMux performs, versions and dependency probes included - a machine
+	// with two tmux installations must not be measured with one and driven
+	// with the other.
 	DefaultTmuxBinary = "tmux"
 
-	// DefaultTmuxSocket is the private socket AgentMux's sessions live on.
-	//
-	// A private socket is not tidiness, it is isolation. AgentMux creates,
-	// resizes, interrupts, and destroys sessions; on the user's default socket
-	// it would be a guest in somebody else's server, able to disturb their
-	// work and be disturbed by it. The socket also makes the runtime
-	// reproducible: a listing that shows AgentMux's sessions shows only those.
-	DefaultTmuxSocket = "agentmux"
+	// DefaultTmuxSocketDirName is the directory under the data directory that
+	// holds one socket per project. See socket.go.
+	DefaultTmuxSocketDirName = "tmux"
 
 	// DefaultTmuxConfig is the server configuration file.
 	//
@@ -73,8 +76,19 @@ const (
 
 // TmuxOptions configures a TmuxBackend. Zero values mean the defaults above.
 type TmuxOptions struct {
-	Binary   string
-	Socket   string
+	Binary string
+
+	// SocketPath is the tmux socket this backend owns: one per project, so
+	// that this project's server is this project's alone.
+	//
+	// It is a path rather than a socket name because a name is resolved
+	// against a shared directory that the environment decides, and isolation
+	// that depends on the environment is not isolation. An empty path is
+	// refused by every operation that would touch a server - see run - so a
+	// misconfigured backend fails loudly instead of quietly becoming a guest
+	// in the user's own tmux.
+	SocketPath string
+
 	Config   string
 	Terminal string
 
@@ -85,7 +99,76 @@ type TmuxOptions struct {
 	// otherwise are ignored by List and never destroyed.
 	Prefix string
 
+	// Install is the tmux binary and what it says about itself, shared with
+	// every other backend running the same binary. Nil means this backend
+	// probes on its own.
+	Install *tmuxInstall
+
 	Logger *slog.Logger
+}
+
+// tmuxInstall is one tmux binary and its self-reported version.
+//
+// The version is cached here rather than per backend because every project's
+// backend runs the same binary: without this, a machine hosting twenty
+// projects would run `tmux -V` twenty times to learn one fact. The cache is
+// also what keeps the version honest - the answer reported by diagnostics is
+// the answer of the binary that actually runs the commands.
+type tmuxInstall struct {
+	bin string
+
+	once sync.Once
+	text string
+	err  error
+}
+
+// newTmuxInstall returns an installation whose version is already known, for
+// callers that probed it themselves.
+func newTmuxInstall(bin, version string, err error) *tmuxInstall {
+	install := &tmuxInstall{bin: bin}
+	install.once.Do(func() {
+		install.text, install.err = version, err
+	})
+	return install
+}
+
+// version returns the binary's version, probing at most once.
+func (i *tmuxInstall) version(ctx context.Context) (string, error) {
+	i.once.Do(func() {
+		out, err := exec.CommandContext(ctx, i.bin, "-V").Output()
+		if err != nil {
+			i.err = wrapError(err, CodeBackendUnavailable, "tmux is present but could not be run")
+			return
+		}
+		// "tmux 3.4"
+		i.text = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "tmux "))
+	})
+	return i.text, i.err
+}
+
+// TmuxStatus describes the tmux installation AgentMux will use. It is a
+// diagnostic, and it reports the binary rather than assuming one: on a machine
+// with two tmux installations "3.4" is not a measurement, "3.4 at /usr/bin/tmux"
+// is.
+type TmuxStatus struct {
+	Available bool   `json:"available"`
+	Version   string `json:"version,omitempty"`
+	Binary    string `json:"binary,omitempty"`
+	SocketDir string `json:"socketDir,omitempty"`
+
+	// MinimumVersion is the oldest tmux AgentMux will run on. It is a
+	// requirement and it is enforced, which is what makes it different from a
+	// recommendation.
+	//
+	// There is deliberately no RecommendedVersion field. Both versions
+	// measured on both platforms were completely stable (see the compatibility
+	// matrix in docs/RUNTIME.md), so naming a preferred one would be a
+	// preference dressed up as a finding - and a field that exists is a field
+	// a UI will render and a user will act on.
+	MinimumVersion string `json:"minimumVersion,omitempty"`
+
+	// Error explains why tmux is not usable, when it is not.
+	Error string `json:"error,omitempty"`
 }
 
 // TmuxBackend is the SessionBackend implemented on tmux.
@@ -109,8 +192,8 @@ type TmuxOptions struct {
 // one short-lived process per command, which interactive typing does not
 // notice and which buys a much simpler correctness story.
 type TmuxBackend struct {
-	bin          string
-	socket       string
+	install      *tmuxInstall
+	socketPath   string
 	config       string
 	terminal     string
 	historyLimit int
@@ -126,10 +209,6 @@ type TmuxBackend struct {
 
 	log *slog.Logger
 
-	versionOnce sync.Once
-	version     string
-	versionErr  error
-
 	// subs is every live subscription this process holds. Each one is its own
 	// control client, so one caller closing its stream cannot interrupt
 	// another's; the set exists so that Close and Destroy can detach them all.
@@ -139,9 +218,13 @@ type TmuxBackend struct {
 
 // NewTmuxBackend builds the tmux backend.
 func NewTmuxBackend(o TmuxOptions) *TmuxBackend {
+	install := o.Install
+	if install == nil {
+		install = &tmuxInstall{bin: orDefault(o.Binary, DefaultTmuxBinary)}
+	}
 	b := &TmuxBackend{
-		bin:          orDefault(o.Binary, DefaultTmuxBinary),
-		socket:       o.Socket,
+		install:      install,
+		socketPath:   strings.TrimSpace(o.SocketPath),
 		config:       orDefault(o.Config, DefaultTmuxConfig),
 		terminal:     orDefault(o.Terminal, DefaultTmuxTerminal),
 		historyLimit: o.HistoryLimit,
@@ -169,10 +252,27 @@ func orDefault(value, fallback string) string {
 // Name implements Backend.
 func (b *TmuxBackend) Name() string { return "tmux" }
 
-// Socket reports the socket this backend uses, or "" when it uses the default
-// one. It exists for diagnostics and for tests that need to tear down a tmux
-// server they started.
-func (b *TmuxBackend) Socket() string { return b.socket }
+// SocketPath reports the socket this backend owns.
+//
+// It exists for diagnostics and for tests that need to reach the same server
+// directly. Every one of AgentMux's own operations goes through args, which
+// uses it, so this is a reader and not a second source of truth.
+func (b *TmuxBackend) SocketPath() string { return b.socketPath }
+
+// Binary reports the tmux executable this backend runs, with a bare name
+// resolved against PATH.
+//
+// It reports the configured value unchanged when nothing resolves, because the
+// useful answer there is the name that failed rather than an empty string that
+// hides what was asked for. Diagnostics and the stability harness both record
+// this: a measurement that says "tmux 3.4" without saying which tmux is a
+// measurement that cannot be reproduced on a machine with two installed.
+func (b *TmuxBackend) Binary() string {
+	if path, err := exec.LookPath(b.install.bin); err == nil {
+		return path
+	}
+	return b.install.bin
+}
 
 // Available implements Backend.
 //
@@ -181,13 +281,16 @@ func (b *TmuxBackend) Socket() string { return b.socket }
 // version decides whether control mode and resize behave as this backend
 // assumes.
 func (b *TmuxBackend) Available(ctx context.Context) error {
-	path, err := exec.LookPath(b.bin)
+	if err := b.requireSocket(); err != nil {
+		return err
+	}
+	path, err := exec.LookPath(b.install.bin)
 	if err != nil {
 		return wrapError(err, CodeBackendUnavailable,
 			"tmux is not installed in the environment where the AgentMux server runs, "+
 				"so no terminal session can be started")
 	}
-	version, err := b.tmuxVersion(ctx)
+	version, err := b.install.version(ctx)
 	if err != nil {
 		return err
 	}
@@ -204,18 +307,22 @@ func (b *TmuxBackend) Available(ctx context.Context) error {
 	return nil
 }
 
-// tmuxVersion returns tmux's self-reported version, once per backend.
-func (b *TmuxBackend) tmuxVersion(ctx context.Context) (string, error) {
-	b.versionOnce.Do(func() {
-		out, err := exec.CommandContext(ctx, b.bin, "-V").Output()
-		if err != nil {
-			b.versionErr = wrapError(err, CodeBackendUnavailable, "tmux is present but could not be run")
-			return
-		}
-		// "tmux 3.4"
-		b.version = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(out)), "tmux "))
-	})
-	return b.version, b.versionErr
+// requireSocket refuses an operation that would otherwise address a tmux
+// server AgentMux does not own.
+//
+// An empty socket path does not mean "no socket"; to tmux it means the user's
+// default one, where their own sessions live. Creating, resizing, typing into,
+// or destroying on that socket would make AgentMux a guest in somebody else's
+// server with the ability to disturb their work - and it would silently break
+// the isolation this whole phase is built on. So it is refused here, once, at
+// the single point every server-addressing command passes through.
+func (b *TmuxBackend) requireSocket() error {
+	if b.socketPath == "" {
+		return newError(CodeBackendUnavailable,
+			"the tmux backend has no socket path; every AgentMux runtime owns its own "+
+				"tmux server, and an empty socket path would address the user's own")
+	}
+	return nil
 }
 
 // parseTmuxMajor reads the major version from a version like "3.4" or "3.4a".
@@ -247,10 +354,15 @@ func parseTmuxMajor(version string) (int, bool) {
 // with, which is what makes multibyte output survive. It is set here, on every
 // invocation, rather than left to the environment: terminal fidelity must not
 // depend on how somebody happened to launch the server.
+//
+// -S names the socket, and it is the flag that makes one project one server.
+// It appears on every invocation for the same reason -u does: an operation
+// that forgot it would address a different server than the one it was meant
+// for, and nothing about the result would look wrong.
 func (b *TmuxBackend) args(sub ...string) []string {
 	args := []string{"-u"}
-	if b.socket != "" {
-		args = append(args, "-L", b.socket)
+	if b.socketPath != "" {
+		args = append(args, "-S", b.socketPath)
 	}
 	if b.config != "" {
 		args = append(args, "-f", b.config)
@@ -259,13 +371,31 @@ func (b *TmuxBackend) args(sub ...string) []string {
 }
 
 // run executes one tmux command and returns its combined output.
+//
+// It is the single choke point for every command that talks to a server, and
+// it refuses to run at all without a socket path. Putting the check here
+// rather than in each method is what makes "every path uses this project's own
+// socket" a property of the code instead of a rule somebody has to remember:
+// there is no way to spell a tmux invocation in this package that skips it.
 func (b *TmuxBackend) run(ctx context.Context, sub ...string) (string, error) {
+	if err := b.requireSocket(); err != nil {
+		return "", err
+	}
+	return runTmux(ctx, b.install.bin, b.args(sub...)...)
+}
+
+// runTmux executes one tmux command line and returns its combined output.
+//
+// It is a free function because two callers need it and neither owns the
+// other: a backend runs commands for one project, and a socket probe runs a
+// read-only listing for a socket that may belong to no live runtime at all.
+func runTmux(ctx context.Context, bin string, args ...string) (string, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, tmuxCommandTimeout)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(ctx, b.bin, b.args(sub...)...)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	var combined bytes.Buffer
 	cmd.Stdout = &combined
 	cmd.Stderr = &combined
@@ -510,15 +640,7 @@ func (b *TmuxBackend) sessionExists(ctx context.Context, name string) bool {
 
 // Inspect implements Backend.
 func (b *TmuxBackend) Inspect(ctx context.Context, name string) (*Session, error) {
-	format := strings.Join([]string{
-		"#{session_name}",
-		"#{session_created}",
-		"#{window_width}",
-		"#{window_height}",
-		"#{pane_current_path}",
-	}, sessionFieldSeparator)
-
-	out, err := b.run(ctx, "list-panes", "-t", name, "-F", format)
+	out, err := b.run(ctx, "list-panes", "-t", name, "-F", sessionListFormat)
 	if err != nil {
 		if isMissingTarget(out) {
 			return nil, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
@@ -553,41 +675,38 @@ func (b *TmuxBackend) Inspect(ctx context.Context, name string) (*Session, error
 // bounded, so a path containing the separator still arrives intact.
 const sessionFieldSeparator = "|"
 
+// sessionListFormat is the -F format that describes one session per line.
+const sessionListFormat = "#{session_name}" + sessionFieldSeparator +
+	"#{session_created}" + sessionFieldSeparator +
+	"#{window_width}" + sessionFieldSeparator +
+	"#{window_height}" + sessionFieldSeparator +
+	"#{pane_current_path}"
+
 // List implements Backend.
 func (b *TmuxBackend) List(ctx context.Context) ([]*Session, error) {
-	format := strings.Join([]string{
-		"#{session_name}",
-		"#{session_created}",
-		"#{window_width}",
-		"#{window_height}",
-		"#{pane_current_path}",
-	}, sessionFieldSeparator)
-
-	out, err := b.run(ctx, "list-panes", "-a", "-F", format)
+	if err := b.requireSocket(); err != nil {
+		return nil, err
+	}
+	sessions, detail, err := listSessionsOn(ctx, b.install.bin, b.socketPath)
 	if err != nil {
 		// No server is not a failure: it means no sessions exist, which is the
 		// answer List was asked for.
-		if isMissingTarget(out) {
+		if isMissingTarget(detail) {
 			return nil, nil
 		}
 		// What tmux said is carried on the error, as runChecked does. "could not
 		// list sessions: exit status 1" on its own names the symptom and hides
 		// the cause, which is the one thing the operator cannot recover.
-		trimmed := strings.TrimSpace(out)
-		if trimmed == "" {
+		if detail == "" {
 			return nil, wrapError(err, CodeBackendFailure, "could not list sessions")
 		}
-		return nil, wrapError(err, CodeBackendFailure, "could not list sessions: %s", trimmed)
+		return nil, wrapError(err, CodeBackendFailure, "could not list sessions: %s", detail)
 	}
 
 	seen := make(map[string]bool)
-	var sessions []*Session
-	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		sess, ok := parseSessionLine(line)
-		if !ok || !strings.HasPrefix(sess.Name, b.prefix) {
+	var owned []*Session
+	for _, sess := range sessions {
+		if !strings.HasPrefix(sess.Name, b.prefix) {
 			continue
 		}
 		// One entry per session: a session with several panes is reported
@@ -596,9 +715,63 @@ func (b *TmuxBackend) List(ctx context.Context) ([]*Session, error) {
 			continue
 		}
 		seen[sess.Name] = true
-		sessions = append(sessions, sess)
+		owned = append(owned, sess)
 	}
-	return sessions, nil
+	return owned, nil
+}
+
+// listSessionsOn asks one tmux socket for every session on it.
+//
+// It is a free function rather than a method because a socket probe needs it
+// too, and a socket being probed may belong to no live runtime at all - there
+// is no backend to ask.
+//
+// It reports tmux's own words alongside the error. The difference between
+// "there is no server here" and "something is wrong here" is a difference in
+// wording and not in exit code, and one of those two answers leads to deleting
+// a file.
+func listSessionsOn(ctx context.Context, bin, socketPath string) ([]*Session, string, error) {
+	args := []string{"-u", "-S", socketPath, "-f", DefaultTmuxConfig,
+		"list-panes", "-a", "-F", sessionListFormat}
+	out, err := runTmux(ctx, bin, args...)
+	detail := strings.TrimSpace(out)
+	if err != nil {
+		// A live server with no sessions is neither a failure nor an absence.
+		// tmux says "no current target" and exits non-zero. Reading that as an
+		// error would make a project's socket look broken in the window
+		// between its last session being killed and its server exiting - which
+		// is precisely the window a reconciliation runs in.
+		if isNoSessions(detail) {
+			return nil, detail, nil
+		}
+		return nil, detail, err
+	}
+	return parseSessionList(out), detail, nil
+}
+
+// isNoSessions reports whether tmux's complaint means "there is a server and
+// it has nothing on it".
+//
+// Measured on tmux 3.4: `list-sessions` against a server with exit-empty off
+// and no sessions prints nothing and exits 0, while `list-panes -a` prints
+// "no current target" and exits 1.
+func isNoSessions(text string) bool {
+	return strings.Contains(text, "no current target") ||
+		strings.Contains(text, "no sessions")
+}
+
+// parseSessionList reads every line of a listing.
+func parseSessionList(out string) []*Session {
+	var sessions []*Session
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if sess, ok := parseSessionLine(line); ok {
+			sessions = append(sessions, sess)
+		}
+	}
+	return sessions
 }
 
 // parseSessionLine reads one description produced by List or Inspect.
@@ -791,8 +964,11 @@ func (b *TmuxBackend) Attach(ctx context.Context, name string) (Subscription, er
 
 // startControl launches one control-mode client for a session.
 func (b *TmuxBackend) startControl(ctx context.Context, name string) (*controlStream, error) {
+	if err := b.requireSocket(); err != nil {
+		return nil, err
+	}
 	args := b.args("-C", "attach-session", "-t", name)
-	return startControlStream(ctx, b.bin, args, name, b.log)
+	return startControlStream(ctx, b.install.bin, args, name, b.log)
 }
 
 // Close implements Backend.
@@ -833,13 +1009,17 @@ func (b *TmuxBackend) takeSubscriptions(name string) []*tmuxSubscription {
 // KillServer stops the tmux server this backend talks to, destroying every
 // session on it.
 //
-// It is destructive, it is not reachable from the API, and nothing in AgentMux
-// calls it during normal operation: Destroy removes one session, and Close
-// deliberately leaves them all running. It exists so that a test can start
-// from an empty runtime, and so that a future release has somewhere to put an
-// explicit "stop everything" action, which is a decision for a user to make
-// rather than a side effect of shutting a server down.
+// Since Phase 2.5 this is a project-scoped operation rather than an
+// installation-wide one: the backend owns one project's socket, so killing the
+// server reaches that project's sessions and nothing else. It is still
+// destructive and still not reachable from the API as a user action - Destroy
+// removes one session, and Close deliberately leaves them all running - but it
+// is now what makes Destroy complete, since a project's server is a project's
+// resource.
 func (b *TmuxBackend) KillServer(ctx context.Context) error {
+	if err := b.requireSocket(); err != nil {
+		return err
+	}
 	b.closeSubscriptions("")
 	// Nothing to kill is a success, so the result is deliberately discarded.
 	_, _ = b.run(ctx, "kill-server")

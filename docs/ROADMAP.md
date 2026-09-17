@@ -9,13 +9,15 @@ As of version 0.1.0:
 | Phase 0 — Foundation and documentation | **Done** | Workspace, `CLAUDE.md`, `.claude/rules/`, docs, environment checks. |
 | Phase 1 — Project model and server foundation | **Done** | Config, SQLite, HostAdapter, discovery, register/create API, server status, Phase 1 UI. |
 | Phase 2 — Persistent session runtime | **Done** | `SessionBackend` + `TmuxBackend`, runtime manager, persistence and reconciliation, runtime API, Phase 2 UI. No WebSocket, no real terminal view. |
+| Phase 2.5 — tmux stability validation and runtime isolation | **Partial** | One tmux server and socket per project; Control Monitor lifecycle; a four-environment tmux compatibility matrix. Complete except for re-running the pure-Linux columns, which need interactive authentication on the test host. See below. |
 | Phase 3 and later | Not started | No Claude Code launch, no xterm.js, no provider integration. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
-is actually installed there. The UI offers Start/Stop runtime and says plainly that the terminal view
-arrives in Phase 4. The provider still reports `integrated: false`. Nothing in the running product
-claims to do more than the table above.
+is actually installed there. `GET /api/server` also reports which tmux it found
+(`tmux.available`, `tmux.version`, `tmux.binary`). The UI offers Start/Stop runtime and says plainly
+that the terminal view arrives in Phase 4. The provider still reports `integrated: false`. Nothing in
+the running product claims to do more than the table above.
 
 ## Phase 0 — Foundation and documentation
 
@@ -94,6 +96,61 @@ What was built:
 
 Not built, deliberately: Claude Code launch, any WebSocket, any real terminal view, controller/viewer
 roles, prompt bar, Claude Hooks.
+
+## Phase 2.5 — tmux stability validation and runtime isolation
+
+Status: **partial**. See `docs/RUNTIME.md` §12–§14 for the design, the Control Monitor, and the
+compatibility matrix.
+
+Goal:
+
+Two questions, answered by measurement rather than by inference. First, is the server-disappearance
+anomaly observed during Phase 2 a property of tmux 3.4, of WSL, or of something AgentMux does? Second,
+whatever the answer, shrink the blast radius of a runtime fault to a single project.
+
+Deliver:
+
+- a tmux version × runtime environment comparison matrix — one unchanged stress harness across WSL2
+  and pure Linux, on tmux 3.4 and a source-built 3.7c;
+- one tmux server and socket per project;
+- a single, server-owned Control Monitor per runtime;
+- multi-socket reconciliation with explicit stale-socket and orphan handling;
+- a configurable tmux binary used by every code path;
+- diagnostics reporting which tmux was found.
+
+What was built:
+
+- **Runtime isolation.** Each project gets its own tmux server via `tmux -S
+  <data-dir>/tmux/<projectId>.sock`, socket directory mode `0700`. The socket name derives from the
+  stable project id, never from the display name. Verified end to end in real WSL: with three projects
+  running, killing one project's server leaves the other two running and correctly reported; the same
+  for destroying a runtime and for stopping the AgentMux server entirely.
+- **One Control Monitor per runtime.** A single long-lived `tmux -C` client owned by the server
+  runtime, not by any browser. Browsers never create or kill it, so opening the UI on a tablet cannot
+  disturb a session. A monitor whose client dies re-establishes its own stream; it is not the runtime
+  owner and never destroys a runtime on its way out.
+- **Reconciliation across many sockets.** On startup the socket directory is scanned, each socket
+  queried, and the result compared with `project_runtime`. A runtime whose server is gone stops
+  reporting `RUNNING`. Orphan runtimes are recorded and left alone. Stale sockets are confirmed dead,
+  re-checked after a delay, and only then removed, with a log line.
+- **`tmuxBinary`.** One resolved executable is used by every path — version detection, dependency
+  detection, create, list, attach, send, resize, stop, destroy, reconciliation, diagnostics, and the
+  stress harness. No `exec.Command("tmux", …)` reaches `PATH` behind its back.
+- **Compatibility matrix.** One harness, unchanged, four environments: **0 server deaths in 21,000
+  rounds** across WSL2 and pure Linux on both tmux versions. Reported as exactly that and nothing
+  stronger — not "fixed", not "100% stable". The Phase 2 anomaly did not reproduce in any environment;
+  the historical record of it is preserved in `docs/RUNTIME.md` §10, with the earlier explanation
+  explicitly withdrawn rather than quietly edited out.
+
+What this phase deliberately did **not** do, and Phase 3 must not assume: launch Claude Code as a
+project runtime, resume a Claude session, render a terminal, carry WebSocket traffic, add a prompt bar,
+add controller/viewer roles, or integrate CC Switch. It also did not restore the shared tmux server —
+per-project isolation is an architectural fault boundary, not a workaround for a bug.
+
+Not yet verified: the two pure-Linux matrix columns were measured earlier in the phase and were not
+re-run for the final report, because the test host requires interactive authentication this
+environment cannot provide. They are carried as recorded. That single item is why this phase is
+Partial rather than Done; nothing was simulated or fabricated in its place.
 
 ## Phase 3 — Claude runtime
 

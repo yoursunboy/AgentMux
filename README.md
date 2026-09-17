@@ -6,7 +6,7 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 2**. The project model, the server foundation,
+This repository is at **version 0.1.0, end of Phase 2.5**. The project model, the server foundation,
 and the persistent session runtime exist and work. The terminal view does not exist yet.
 
 | Works today | Does not exist yet |
@@ -19,6 +19,7 @@ and the persistent session runtime exist and work. The terminal view does not ex
 | SQLite metadata store with migrations | Codex, Gemini, OpenCode |
 | Persistent tmux sessions that outlive the server | |
 | Runtime start / stop / destroy, with reconciliation on restart | |
+| **One tmux server and socket per project**, so one project's runtime cannot take another's down | |
 | Raw byte-accurate input, real PTY resize, sequenced output | |
 | Phase 1 workspace UI (global bar, project panel, project manager) | |
 | Phase 2 runtime controls: running/stopped, start, stop | |
@@ -45,6 +46,16 @@ To build the frontend:
 For the session runtime:
 
 - tmux, on the same side of the WSL boundary as the server.
+
+**Which tmux.** AgentMux is tested against tmux **3.4** (the version Ubuntu 24.04 ships, and the
+version inside the WSL distributions this project is developed on) and tmux **3.7c** (the latest
+stable release at the time of the Phase 2.5 measurements). Both were run side by side through the same
+stress harness — see the compatibility matrix in `docs/RUNTIME.md` §14. Neither is *required*:
+AgentMux does not refuse to start on a different version, and it reports the one it found in
+`GET /api/server` (`tmux.version`, alongside `tmux.binary`). If you are installing tmux for AgentMux
+on Windows + WSL, **3.4 or newer from your distribution is the supported and tested choice**; there is
+no measured advantage to building a newer one, and AgentMux never treats "newest" as better. Windows
+has no native tmux, which is the whole reason the server belongs inside WSL.
 
 **The AgentMux server runs where the sessions run.** On Windows that means inside WSL: tmux, the
 shell a session hosts, and later the coding agent are all Linux processes, and a Windows-native
@@ -126,15 +137,31 @@ knowing:
 | `-runtime-mode <mode>` | `auto`, `native`, or `wsl`. |
 | `-runtime-distro <name>` | The WSL distribution to use. |
 | `-shell <path>` | The shell a terminal session runs. Defaults to the host's. |
-| `-tmux-socket <name>` | The tmux socket AgentMux sessions live on. Default `agentmux`. |
+| `-tmux-binary <path>` | The tmux executable every project's runtime runs. Default: `tmux` on `PATH`. Set it to `/usr/bin/tmux` or a user-local path to pin the exact binary. |
+| `-tmux-socket-dir <dir>` | Directory holding one tmux socket per project. Default `<data-dir>/tmux`. |
+| `-tmux-socket <name>` | **Deprecated, no effect.** Accepted and warned about, never silently reinterpreted. See below. |
 | `-config <file>` | Use a specific JSON configuration file. |
 | `-web-dir <dir>` | Serve the built frontend from this directory. |
 | `-debug-api` | Enable the diagnostic endpoints under `/api/debug`. Off by default; they accept raw terminal input and output. |
 | `-log-level`, `-log-format` | `debug`/`info`/`warn`/`error`, and `text`/`json`. |
 
-`-tmux-socket` is worth knowing about: AgentMux runs its sessions on its own socket, so
-`tmux ls` in your shell does not show them and your own tmux work is never touched by Destroy.
-`tmux -L agentmux ls` does.
+In the configuration file these are `terminal.tmuxBinary` and `terminal.tmuxSocketDir`; the
+environment overrides are `AGENTMUX_TMUX_BINARY` and `AGENTMUX_TMUX_SOCKET_DIR`.
+
+**One project, one tmux server, one socket.** Since Phase 2.5 each project's runtime gets its own
+tmux server, addressed as `tmux -S <data-dir>/tmux/<projectId>.sock`. tmux identifies a server by its
+socket path, so two paths are two servers, and a project's runtime cannot take another project's down:
+destroying one runtime, or losing its server, leaves the others untouched. The socket name comes from
+the stable project id and never from the display name, which changes.
+
+That replaced a single shared socket, which is what `-tmux-socket` used to select. The setting is
+still accepted so an existing configuration file does not fail to load, and the server logs a
+deprecation warning naming the replacement — it is **not** reinterpreted as a socket directory or as a
+socket name, because either reading would move every runtime to a path you never named. Remove it.
+
+Because sessions live on AgentMux's own per-project sockets, `tmux ls` in your shell does not show
+them and your own tmux work is never touched by Destroy. To look at one, name its socket:
+`tmux -S <data-dir>/tmux/<projectId>.sock ls`.
 
 **The Projects Root is the one setting that matters.** AgentMux never invents one and never scans
 outside the configured roots. The default on Windows is `D:\AI\Projects`. On Linux it is
@@ -150,6 +177,7 @@ Logs never contain API keys, tokens, secrets, or credentials.
 | --- | --- |
 | SQLite database | `<data-dir>/agentmux.db` |
 | Configuration file | `<data-dir>/config.json` |
+| tmux sockets, one per project | `<data-dir>/tmux/<projectId>.sock` |
 | Logs | stderr |
 
 The default data directory is `%AppData%\AgentMux` on Windows and `$XDG_CONFIG_HOME/AgentMux` (or

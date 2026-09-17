@@ -22,9 +22,11 @@ dist/
 .env.*
 !.env.example
 
-# Host credentials. Never committed: this file names machines and carries their
-# passwords in the clear. It is listed here so that a `git add -A` cannot pick it
-# up by accident, which is the only way it would ever reach a commit.
+# Host notes. Never committed: this file names machines and the experiments run
+# on them, which is local operational detail rather than project source. It is
+# listed here so that a `git add -A` cannot pick it up by accident, which is the
+# only way it would ever reach a commit. No credential belongs in it - the file
+# points at interactive authentication instead.
 docs/serverinfo.md
 *serverinfo*.local.md
 

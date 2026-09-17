@@ -14,6 +14,7 @@ package host
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // Errors reported by the host layer.
@@ -99,6 +100,14 @@ type Dependency struct {
 	Available bool   `json:"available"`
 	Path      string `json:"path,omitempty"`
 
+	// Probe is the program to look up, when it is not the one Name says.
+	//
+	// The two differ when a program is configurable: the report should still
+	// say "tmux", because that is what the user is being told about, while the
+	// lookup has to ask about the binary the runtime will actually run. An
+	// empty Probe means Name.
+	Probe string `json:"-"`
+
 	// Required records whether AgentMux needs this program for the current
 	// phase. tmux is required from Phase 2; the AI CLI becomes required in
 	// Phase 3.
@@ -112,6 +121,18 @@ type Dependency struct {
 
 	// Note explains what the program is used for.
 	Note string `json:"note,omitempty"`
+}
+
+// lookUp is the program this dependency's probe should resolve.
+//
+// It is a method rather than a field read so that "empty means Name" is stated
+// once: a probe list and a report both go through here, and a caller that
+// forgot the fallback would look up the empty string.
+func (d Dependency) lookUp() string {
+	if strings.TrimSpace(d.Probe) != "" {
+		return d.Probe
+	}
+	return d.Name
 }
 
 // Adapter is the single entry point for OS-specific behaviour.

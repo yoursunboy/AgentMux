@@ -360,6 +360,44 @@ func TestCheckDependenciesReportsEveryProbe(t *testing.T) {
 	}
 }
 
+// TestTheTmuxProbeAsksAboutTheConfiguredBinary is the dependency report's half
+// of the tmuxBinary setting.
+//
+// The report has to say "tmux", because that is what the user is being told
+// about, while the lookup has to ask about the binary the runtime will actually
+// run. On a machine with two tmux installations those are different questions,
+// and answering the first with the second's answer is how a runtime ends up
+// reported ready and then failing.
+func TestTheTmuxProbeAsksAboutTheConfiguredBinary(t *testing.T) {
+	a := newTestAdapter(nil, nil)
+	a.tmux = "/opt/custom/bin/tmux-3.7c"
+
+	var tmux *Dependency
+	for _, dep := range a.runtimeDependencies() {
+		if dep.Name == "tmux" {
+			d := dep
+			tmux = &d
+		}
+	}
+	if tmux == nil {
+		t.Fatal("tmux is not in the runtime probe list")
+	}
+	if tmux.lookUp() != a.tmux {
+		t.Errorf("the tmux probe looks up %q, want the configured binary %q", tmux.lookUp(), a.tmux)
+	}
+	if tmux.Name != "tmux" {
+		t.Errorf("the probe is reported as %q; the report names the program, not the path", tmux.Name)
+	}
+
+	// And the default is still a bare name, resolved on the runtime's PATH.
+	b := newTestAdapter(nil, nil)
+	for _, dep := range b.runtimeDependencies() {
+		if dep.Name == "tmux" && dep.lookUp() != "tmux" {
+			t.Errorf("the default tmux probe looks up %q, want %q", dep.lookUp(), "tmux")
+		}
+	}
+}
+
 // TestRuntimeDependenciesIncludeTheConfiguredShell keeps the shell in the
 // report: a session cannot start without one, so its absence is a runtime
 // blocker rather than a detail.

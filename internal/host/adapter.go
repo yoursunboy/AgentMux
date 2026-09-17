@@ -46,6 +46,16 @@ type Options struct {
 	// Shell is the shell a terminal session runs. Empty means DefaultShell.
 	// It is only used to report whether the runtime has it.
 	Shell string
+
+	// TmuxBinary is the tmux executable the terminal runtime runs. Empty means
+	// a bare "tmux", resolved on the runtime's PATH.
+	//
+	// It is here so that the dependency report describes the binary AgentMux
+	// will actually run. A machine can have more than one tmux - a distribution
+	// package and a newer one built into a user prefix - and a report that
+	// checked PATH while the runtime used a configured path would answer a
+	// question nobody asked, in the reassuring direction.
+	TmuxBinary string
 }
 
 // New builds the Adapter for the platform AgentMux is running on.
@@ -71,6 +81,7 @@ func New(o Options) (Adapter, error) {
 		roots:  normalizeRoots(o.Roots),
 		distro: distro,
 		shell:  shell,
+		tmux:   strings.TrimSpace(o.TmuxBinary),
 	}
 	if kind == KindWindows && mode == RuntimeWSL {
 		a.mapper = NewWSLPathMapper(o.WSLMountRoot)
@@ -199,6 +210,7 @@ type adapter struct {
 	roots  []string
 	mapper PathMapper
 	shell  string
+	tmux   string
 
 	supported         bool
 	unsupportedReason string
@@ -362,17 +374,28 @@ var serverProbes = []Dependency{
 }
 
 // runtimeProbes are the programs that must exist inside the terminal runtime.
-// The configured shell is appended to this list.
+// The configured shell and the configured tmux binary are appended to this list
+// by runtimeDependencies, because both are configurable.
 var runtimeProbes = []Dependency{
-	{
-		Name:     "tmux",
-		Required: true,
-		Note:     "The persistent terminal runtime. Sessions outlive the AgentMux server.",
-	},
 	{
 		Name: "claude",
 		Note: "Claude Code CLI. Required from Phase 3; this build never starts it.",
 	},
+}
+
+// runtimeDefaultTmux is the binary the runtime runs when none is configured.
+//
+// It is written down here rather than imported from the session package,
+// because host is the platform layer and session is not: the two agreeing on
+// the string "tmux" is a fact about tmux, not a dependency worth creating.
+const runtimeDefaultTmux = "tmux"
+
+// tmuxBinary is the tmux executable the runtime will run.
+func (a *adapter) tmuxBinary() string {
+	if v := strings.TrimSpace(a.tmux); v != "" {
+		return v
+	}
+	return runtimeDefaultTmux
 }
 
 // runtimeProbeTimeout bounds the cross-boundary dependency probe.
@@ -390,7 +413,7 @@ const runtimeProbeCacheTTL = 30 * time.Second
 // machines: reporting tmux from the Windows PATH would answer a question
 // nobody asked, because tmux is never going to run there.
 func (a *adapter) CheckDependencies(ctx context.Context) []Dependency {
-	out := make([]Dependency, 0, len(serverProbes)+len(runtimeProbes)+1)
+	out := make([]Dependency, 0, len(serverProbes)+len(runtimeProbes)+2)
 
 	for _, probe := range serverProbes {
 		out = append(out, probeLocal(probe, string(a.env)))
@@ -409,9 +432,22 @@ func (a *adapter) CheckDependencies(ctx context.Context) []Dependency {
 }
 
 // runtimeDependencies is the runtime probe list, including the configured
-// shell, which is worth reporting because a session cannot start without it.
+// shell and tmux binary, which are worth reporting because a session cannot
+// start without either.
+//
+// The tmux entry is built here rather than listed in runtimeProbes because the
+// binary is configurable. Its Name stays "tmux" whatever the path is: the
+// report answers "is the terminal runtime available", and a consumer looking
+// the entry up by name - the server info endpoint does - must keep finding it
+// when a path is configured.
 func (a *adapter) runtimeDependencies() []Dependency {
-	out := make([]Dependency, 0, len(runtimeProbes)+1)
+	out := make([]Dependency, 0, len(runtimeProbes)+2)
+	out = append(out, Dependency{
+		Name:     "tmux",
+		Probe:    a.tmuxBinary(),
+		Required: true,
+		Note:     "The persistent terminal runtime. Each project runs on its own tmux server.",
+	})
 	out = append(out, runtimeProbes...)
 	if a.shell != "" {
 		out = append(out, Dependency{
@@ -426,7 +462,7 @@ func (a *adapter) runtimeDependencies() []Dependency {
 func probeLocal(probe Dependency, where string) Dependency {
 	dep := probe
 	dep.ProbedIn = where
-	if found, err := exec.LookPath(probe.Name); err == nil {
+	if found, err := exec.LookPath(probe.lookUp()); err == nil {
 		dep.Available = true
 		dep.Path = found
 	}
@@ -453,7 +489,7 @@ func (a *adapter) probeRuntimeAcrossBoundary(ctx context.Context, runtime []Depe
 
 	names := make([]string, 0, len(runtime))
 	for _, dep := range runtime {
-		names = append(names, dep.Name)
+		names = append(names, dep.lookUp())
 	}
 	found, err := probeWSLRuntime(ctx, a.detectDistro(ctx), names)
 
@@ -466,7 +502,7 @@ func (a *adapter) probeRuntimeAcrossBoundary(ctx context.Context, runtime []Depe
 	for _, dep := range runtime {
 		dep.ProbedIn = where
 		if err == nil {
-			if path, ok := found[dep.Name]; ok && path != "" {
+			if path, ok := found[dep.lookUp()]; ok && path != "" {
 				dep.Available = true
 				dep.Path = path
 			}

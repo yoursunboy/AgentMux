@@ -3,6 +3,8 @@ package session
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"path/filepath"
@@ -90,30 +92,66 @@ func (f *fakeStore) Delete(_ context.Context, projectID string) error {
 // differ from its runtime path, so that a session started in the wrong one
 // cannot pass by accident. The runtime path is under /tmp so that the suite
 // never creates anything in a real Projects Root.
-func testProject(id string) *project.Project {
+func testProject(label string) *project.Project {
+	id := testProjectID(label)
 	return &project.Project{
 		ID:             id,
-		Name:           "Project " + id,
-		HostPath:       `D:\AI\Projects\2026 AgentMux\` + id,
-		RuntimePath:    "/tmp/agentmux-not-a-real-path/" + id,
+		Name:           "Project " + label,
+		HostPath:       `D:\AI\Projects\2026 AgentMux\` + label,
+		RuntimePath:    "/tmp/agentmux-not-a-real-path/" + label,
 		CollectionPath: `D:\AI\Projects\2026 AgentMux`,
 	}
 }
 
-// testManager builds a manager over a real backend on a socket of its own.
-func testManager(t *testing.T, store RuntimeStore, projects ...*project.Project) (*Manager, *TmuxBackend) {
-	t.Helper()
-	return testManagerOn(t, uniqueSocketName(), store, projects...)
+// testProjectID turns a readable label into an identifier of the shape AgentMux
+// issues, so a failure message can still name the project it is about without
+// the identifier being a label.
+//
+// It exists because the labels this suite used to pass as identifiers - "p_start",
+// "p_adopt" - stopped being identifiers in Phase 2.5. A project's socket path is
+// derived from its id and only an id AgentMux issued yields one, so a
+// label-shaped id produced an empty socket path, and an empty socket path made
+// newTestBackendOn skip. Every one of these tests would have gone green by not
+// running, which is the failure mode a test suite is least able to report about
+// itself.
+func testProjectID(label string) string {
+	digest := sha256.Sum256([]byte(label))
+	id := project.IDPrefix + hex.EncodeToString(digest[:testIDDigestBytes])
+	if !project.ValidID(id) {
+		// A panic rather than a skip: the point of this function is that an
+		// unusable id must be loud, and the id format changing is exactly the
+		// event that would otherwise silence the suite again.
+		panic("session tests: " + id + " is not an identifier AgentMux would issue")
+	}
+	return id
 }
 
-// testManagerOn builds a manager over a named socket, for the tests that need
-// two servers to look at the same tmux server in turn.
-func testManagerOn(t *testing.T, socket string, store RuntimeStore, projects ...*project.Project) (*Manager, *TmuxBackend) {
+// testIDDigestBytes is how much of the digest of a label becomes an id. Ten
+// bytes is what the production generator uses, and using the same number here
+// keeps the ids in this suite the same shape as the ones in a database.
+const testIDDigestBytes = 10
+
+// testManager builds a manager over a real per-project runtime factory, with a
+// socket directory of its own.
+func testManager(t *testing.T, store RuntimeStore, projects ...*project.Project) (*Manager, *TmuxBackend) {
+	t.Helper()
+	return testManagerOn(t, uniqueSocketDir(t), store, projects...)
+}
+
+// testManagerOn builds a manager over a given socket directory, for the tests
+// that need two managers to look at the same servers in turn.
+//
+// The returned backend is a second handle to the first project's server, on the
+// socket the manager itself will use for that project. It exists so a test can
+// reach past the manager - kill a server, list what is really there - without
+// going through the thing it is testing.
+func testManagerOn(t *testing.T, socketDir string, store RuntimeStore, projects ...*project.Project) (*Manager, *TmuxBackend) {
 	t.Helper()
 
-	backend := newTestBackendOn(t, socket)
+	runtimes := testRuntimes(t, socketDir)
 	m, err := NewManager(ManagerOptions{
-		Backend:  backend,
+		Backends: runtimes,
+		Sockets:  runtimes.Sockets(),
 		Projects: newFakeProjects(projects...),
 		Store:    store,
 		Logger:   discardLogger(),
@@ -122,6 +160,11 @@ func testManagerOn(t *testing.T, socket string, store RuntimeStore, projects ...
 		t.Fatalf("NewManager returned an error: %v", err)
 	}
 	t.Cleanup(func() { _ = m.Close() })
+
+	var backend *TmuxBackend
+	if len(projects) > 0 {
+		backend = newTestBackendOn(t, runtimes.Sockets().Path(projects[0].ID))
+	}
 	return m, backend
 }
 
@@ -146,8 +189,8 @@ func TestManagerStartCreatesTheSessionItsProjectNeeds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
-	if rt.Session != "amx-p_start" {
-		t.Errorf("the runtime's session is %q, want %q", rt.Session, "amx-p_start")
+	if rt.Session != p.SessionName() {
+		t.Errorf("the runtime's session is %q, want %q", rt.Session, p.SessionName())
 	}
 	if rt.State != StateRunning {
 		t.Errorf("the runtime is %q, want %q", rt.State, StateRunning)
@@ -230,8 +273,8 @@ func TestManagerStartRecordsTheRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no runtime record was written: %v", err)
 	}
-	if rec.Session != "amx-p_record" {
-		t.Errorf("the record names the session %q, want %q", rec.Session, "amx-p_record")
+	if rec.Session != p.SessionName() {
+		t.Errorf("the record names the session %q, want %q", rec.Session, p.SessionName())
 	}
 	if rec.Backend != "tmux" {
 		t.Errorf("the record names the backend %q, want %q", rec.Backend, "tmux")
@@ -281,72 +324,101 @@ func TestManagerStartIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestManagerStartsSeveralSessionsOnOneServer is the case that a single-start
-// test cannot reach, and the one a running AgentMux is always in.
+// TestManagerGivesEachProjectItsOwnServer is the isolation requirement measured
+// from the manager's side: three projects, three sockets, three servers, and
+// each server holding exactly one project's session.
 //
-// The first session on a fresh socket starts against no tmux server at all. The
-// second starts against a server that is already up with somebody else's
-// session in it - a different situation for tmux, which words its complaint by
-// target kind ("can't find window" from list-panes, rather than "can't find
-// session"), and therefore a different code path through the manager. That path
-// was wrong: the second start failed with a backend error, and a test that only
-// ever started one session per socket could not see it.
-func TestManagerStartsSeveralSessionsOnOneServer(t *testing.T) {
+// This test used to be called TestManagerStartsSeveralSessionsOnOneServer and
+// asserted the opposite - three sessions sharing one server - which is exactly
+// the arrangement Phase 2.5 removed. It survives in this shape because the
+// property worth keeping from it is not where the sessions are but that they do
+// not touch each other.
+func TestManagerGivesEachProjectItsOwnServer(t *testing.T) {
 	ctx := context.Background()
 
-	ids := []string{"p_first", "p_second", "p_third"}
-	projects := make([]*project.Project, 0, len(ids))
-	dirs := make(map[string]string, len(ids))
-	for _, id := range ids {
-		p := testProject(id)
+	labels := []string{"first", "second", "third"}
+	projects := make([]*project.Project, 0, len(labels))
+	dirs := make(map[string]string, len(labels))
+	for _, label := range labels {
+		p := testProject(label)
 		p.RuntimePath = t.TempDir()
-		dirs[id] = p.RuntimePath
+		dirs[p.ID] = p.RuntimePath
 		projects = append(projects, p)
 	}
 
-	m, backend := testManager(t, newFakeStore(), projects...)
+	runtimes := testRuntimes(t, uniqueSocketDir(t))
+	m, err := NewManager(ManagerOptions{
+		Backends: runtimes,
+		Sockets:  runtimes.Sockets(),
+		Projects: newFakeProjects(projects...),
+		Store:    newFakeStore(),
+		Logger:   discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager returned an error: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
 
-	for _, id := range ids {
-		rt, err := m.Start(ctx, id)
+	sockets := make(map[string]string, len(projects))
+	for _, p := range projects {
+		rt, err := m.Start(ctx, p.ID)
 		if err != nil {
-			t.Fatalf("starting %s failed: %v", id, err)
+			t.Fatalf("starting %s failed: %v", p.ID, err)
 		}
 		if rt.State != StateRunning {
-			t.Errorf("%s is %q, want %q", id, rt.State, StateRunning)
+			t.Errorf("%s is %q, want %q", p.ID, rt.State, StateRunning)
 		}
 		if !rt.SessionAlive {
-			t.Errorf("%s reports its session as not alive straight after starting it", id)
+			t.Errorf("%s reports its session as not alive straight after starting it", p.ID)
 		}
-		if rt.Session != project.SessionNameFor(id) {
-			t.Errorf("%s runs in session %q, want %q", id, rt.Session, project.SessionNameFor(id))
+		if rt.Session != project.SessionNameFor(p.ID) {
+			t.Errorf("%s runs in session %q, want %q", p.ID, rt.Session, project.SessionNameFor(p.ID))
 		}
+		sockets[p.ID] = runtimes.Sockets().Path(p.ID)
 	}
 
-	sessions, err := backend.List(ctx)
-	if err != nil {
-		t.Fatalf("List returned an error: %v", err)
-	}
-	if len(sessions) != len(ids) {
-		t.Errorf("there are %d sessions, want %d", len(sessions), len(ids))
+	// Three projects, three sockets. Two projects sharing a path would be one
+	// server and one fault domain, which is the whole of what this phase is
+	// about, so it is asserted rather than assumed.
+	seen := make(map[string]string, len(sockets))
+	for id, path := range sockets {
+		if path == "" {
+			t.Fatalf("%s has no socket path", id)
+		}
+		if other, ok := seen[path]; ok {
+			t.Errorf("%s and %s share the socket %q", id, other, path)
+		}
+		seen[path] = id
 	}
 
-	// Each session is in its own directory, which is what makes them separate
-	// projects rather than three shells in one place.
-	for _, sess := range sessions {
-		id := strings.TrimPrefix(sess.Name, "amx-")
-		if sess.Dir != dirs[id] {
-			t.Errorf("%s runs in %q, want its own directory %q", id, sess.Dir, dirs[id])
+	// Each socket carries this project's session and no other.
+	for _, p := range projects {
+		backend := newTestBackendOn(t, sockets[p.ID])
+		sessions, err := backend.List(ctx)
+		if err != nil {
+			t.Fatalf("List on %s's socket returned an error: %v", p.ID, err)
+		}
+		if len(sessions) != 1 {
+			t.Errorf("%s's server holds %d sessions, want only its own", p.ID, len(sessions))
+			continue
+		}
+		if sessions[0].Name != project.SessionNameFor(p.ID) {
+			t.Errorf("%s's server holds %q, want %q", p.ID, sessions[0].Name, project.SessionNameFor(p.ID))
+		}
+		if sessions[0].Dir != dirs[p.ID] {
+			t.Errorf("%s runs in %q, want its own directory %q", p.ID, sessions[0].Dir, dirs[p.ID])
 		}
 	}
 
 	// An input reaches its own session and no other.
-	if err := m.Launch(ctx, ids[0], "echo amx-manager-only"); err != nil {
-		t.Fatalf("could not type into %s: %v", ids[0], err)
+	first := projects[0].ID
+	if err := m.Launch(ctx, first, "echo amx-manager-only"); err != nil {
+		t.Fatalf("could not type into %s: %v", first, err)
 	}
 	deadline := time.Now().Add(outputWait)
 	var got []byte
 	for time.Now().Before(deadline) {
-		chunks, err := m.History(ctx, ids[0], 0)
+		chunks, err := m.History(ctx, first, 0)
 		if err != nil {
 			t.Fatalf("History returned an error: %v", err)
 		}
@@ -362,16 +434,86 @@ func TestManagerStartsSeveralSessionsOnOneServer(t *testing.T) {
 	if !bytes.Contains(got, []byte("amx-manager-only")) {
 		t.Errorf("the session that was typed into never received its own output")
 	}
-	for _, id := range ids[1:] {
-		chunks, err := m.History(ctx, id, 0)
+	for _, p := range projects[1:] {
+		chunks, err := m.History(ctx, p.ID, 0)
 		if err != nil {
 			t.Fatalf("History returned an error: %v", err)
 		}
 		for _, c := range chunks {
 			if bytes.Contains(c.Data, []byte("amx-manager-only")) {
-				t.Errorf("output meant for %s arrived at %s", ids[0], id)
+				t.Errorf("output meant for %s arrived at %s", first, p.ID)
 			}
 		}
+	}
+}
+
+// TestManagerStartsBesideAForeignSessionOnItsOwnSocket keeps the code path the
+// old shared-server test was written for.
+//
+// Starting a session when the server is already up with somebody else's session
+// in it is a different situation for tmux, which words its complaint by target
+// kind ("can't find window" from list-panes rather than "can't find session").
+// That path was wrong once, and a suite that only ever started one session per
+// socket could not see it. Since Phase 2.5 a project's socket is its own, so the
+// only session that can already be there is one nobody registered - and Start
+// has to work anyway, without touching it.
+func TestManagerStartsBesideAForeignSessionOnItsOwnSocket(t *testing.T) {
+	ctx := context.Background()
+
+	p := testProject("beside")
+	p.RuntimePath = t.TempDir()
+
+	runtimes := testRuntimes(t, uniqueSocketDir(t))
+	backend := newTestBackendOn(t, runtimes.Sockets().Path(p.ID))
+
+	foreignDir := t.TempDir()
+	foreign := project.SessionNameFor(testProjectID("foreign"))
+	if _, err := backend.Create(ctx, SessionSpec{Name: foreign, Dir: foreignDir, Cols: 80, Rows: 24}); err != nil {
+		t.Fatalf("could not create the foreign session: %v", err)
+	}
+
+	m, err := NewManager(ManagerOptions{
+		Backends: runtimes,
+		Sockets:  runtimes.Sockets(),
+		Projects: newFakeProjects(p),
+		Store:    newFakeStore(),
+		Logger:   discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewManager returned an error: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	rt, err := m.Start(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Start failed on a socket that already had a session on it: %v", err)
+	}
+	if rt.State != StateRunning {
+		t.Errorf("the runtime is %q, want %q", rt.State, StateRunning)
+	}
+
+	// Both sessions are on the server, and the foreign one is untouched.
+	sessions, err := backend.List(ctx)
+	if err != nil {
+		t.Fatalf("List returned an error: %v", err)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("the server holds %d sessions, want the foreign one and the project's", len(sessions))
+	}
+	alive, err := backend.Exists(ctx, foreign)
+	if err != nil {
+		t.Fatalf("Exists returned an error: %v", err)
+	}
+	if !alive {
+		t.Error("starting the project's runtime ended the session that was already there")
+	}
+
+	report, err := m.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile returned an error: %v", err)
+	}
+	if len(report.Orphans) != 1 || report.Orphans[0].Session != foreign {
+		t.Errorf("Reconcile reported the orphans %v, want just %q", report.Orphans, foreign)
 	}
 }
 
@@ -385,16 +527,22 @@ func TestManagerStartAdoptsASurvivingSession(t *testing.T) {
 	dir := t.TempDir()
 	p.RuntimePath = dir
 
-	backend := newTestBackend(t)
-	if _, err := backend.Create(ctx, SessionSpec{Name: "amx-p_adopt", Dir: dir, Cols: 90, Rows: 25}); err != nil {
+	// The session has to be on the socket the manager will look at, which is
+	// this project's own. A surviving session on somebody else's socket is not
+	// this project's runtime, and adopting it would be the shared-server
+	// behaviour Phase 2.5 removed.
+	runtimes := testRuntimes(t, uniqueSocketDir(t))
+	backend := newTestBackendOn(t, runtimes.Sockets().Path(p.ID))
+	if _, err := backend.Create(ctx, SessionSpec{Name: p.SessionName(), Dir: dir, Cols: 90, Rows: 25}); err != nil {
 		t.Fatalf("could not create the surviving session: %v", err)
 	}
-	if err := backend.Launch(ctx, "amx-p_adopt", "echo amx-survivor"); err != nil {
+	if err := backend.Launch(ctx, p.SessionName(), "echo amx-survivor"); err != nil {
 		t.Fatalf("could not type into the surviving session: %v", err)
 	}
 
 	m, err := NewManager(ManagerOptions{
-		Backend:  backend,
+		Backends: runtimes,
+		Sockets:  runtimes.Sockets(),
 		Projects: newFakeProjects(p),
 		Store:    newFakeStore(),
 		Logger:   discardLogger(),
@@ -408,7 +556,7 @@ func TestManagerStartAdoptsASurvivingSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
-	if rt.Session != "amx-p_adopt" {
+	if rt.Session != p.SessionName() {
 		t.Errorf("Start used the session %q, want the one that already existed", rt.Session)
 	}
 	if rt.Cols != 90 || rt.Rows != 25 {
@@ -429,12 +577,12 @@ func TestManagerStartAdoptsASurvivingSession(t *testing.T) {
 func TestManagerStartHonoursTheRecordedSize(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
-	socket := uniqueSocketName()
+	socketDir := uniqueSocketDir(t)
 
 	p := testProject("p_size")
 	p.RuntimePath = t.TempDir()
 
-	first, backend := testManagerOn(t, socket, store, p)
+	first, backend := testManagerOn(t, socketDir, store, p)
 	if _, err := first.Start(ctx, p.ID); err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
@@ -443,14 +591,14 @@ func TestManagerStartHonoursTheRecordedSize(t *testing.T) {
 	}
 
 	// The session ends; the record does not. That is what the record is for.
-	if err := backend.Destroy(ctx, "amx-p_size"); err != nil {
+	if err := backend.Destroy(ctx, p.SessionName()); err != nil {
 		t.Fatalf("could not destroy the session under the manager: %v", err)
 	}
 	if err := first.Close(); err != nil {
 		t.Fatalf("Close returned an error: %v", err)
 	}
 
-	second, backend2 := testManagerOn(t, socket, store, p)
+	second, backend2 := testManagerOn(t, socketDir, store, p)
 	rt, err := second.Start(ctx, p.ID)
 	if err != nil {
 		t.Fatalf("the second Start returned an error: %v", err)
@@ -480,12 +628,12 @@ func TestManagerStopInterruptsAndKeepsTheSession(t *testing.T) {
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
-	shell := shellCommand(t, backend, "amx-p_stop")
+	shell := shellCommand(t, backend, p.SessionName())
 
 	if err := m.Launch(ctx, p.ID, "sleep 300"); err != nil {
 		t.Fatalf("could not start a long-running command: %v", err)
 	}
-	waitForPaneCommand(t, backend, "amx-p_stop", "sleep")
+	waitForPaneCommand(t, backend, p.SessionName(), "sleep")
 
 	rt, err := m.Stop(ctx, p.ID)
 	if err != nil {
@@ -497,7 +645,7 @@ func TestManagerStopInterruptsAndKeepsTheSession(t *testing.T) {
 	if !rt.SessionAlive {
 		t.Error("Stop reports the session as gone; it must only end the work")
 	}
-	waitForPaneCommand(t, backend, "amx-p_stop", shell)
+	waitForPaneCommand(t, backend, p.SessionName(), shell)
 
 	rec, err := store.Get(ctx, p.ID)
 	if err != nil {
@@ -549,7 +697,7 @@ func TestManagerDestroyEndsTheSessionAndForgetsIt(t *testing.T) {
 		t.Fatalf("Destroy returned an error: %v", err)
 	}
 
-	alive, err := backend.Exists(ctx, "amx-p_destroy")
+	alive, err := backend.Exists(ctx, p.SessionName())
 	if err != nil {
 		t.Fatalf("Exists returned an error: %v", err)
 	}
@@ -594,7 +742,7 @@ func TestManagerRuntimeForANeverStartedProject(t *testing.T) {
 	if rt.SessionAlive {
 		t.Error("the runtime claims a session that was never started is alive")
 	}
-	if rt.Session != "amx-p_never" {
+	if rt.Session != p.SessionName() {
 		t.Errorf("the runtime names the session %q, want the one it would use", rt.Session)
 	}
 	if rt.Cols <= 0 || rt.Rows <= 0 {
@@ -625,7 +773,7 @@ func TestManagerRuntimeDoesNotAssumeASessionExists(t *testing.T) {
 	p := testProject("p_ghost")
 	p.RuntimePath = t.TempDir()
 	if err := store.Save(ctx, Record{
-		ProjectID: p.ID, Backend: "tmux", Session: "amx-p_ghost",
+		ProjectID: p.ID, Backend: "tmux", Session: p.SessionName(),
 		State: StateRunning, Cols: 100, Rows: 30, UpdatedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("could not seed the store: %v", err)
@@ -885,12 +1033,12 @@ func TestManagerWatchClosesCleanly(t *testing.T) {
 func TestManagerReconcileAdoptsASurvivingSession(t *testing.T) {
 	ctx := context.Background()
 	store := newFakeStore()
-	socket := uniqueSocketName()
+	socketDir := uniqueSocketDir(t)
 
 	p := testProject("p_case_a")
 	p.RuntimePath = t.TempDir()
 
-	first, _ := testManagerOn(t, socket, store, p)
+	first, _ := testManagerOn(t, socketDir, store, p)
 	if _, err := first.Start(ctx, p.ID); err != nil {
 		t.Fatalf("Start returned an error: %v", err)
 	}
@@ -899,7 +1047,7 @@ func TestManagerReconcileAdoptsASurvivingSession(t *testing.T) {
 		t.Fatalf("Close returned an error: %v", err)
 	}
 
-	second, _ := testManagerOn(t, socket, store, p)
+	second, _ := testManagerOn(t, socketDir, store, p)
 
 	report, err := second.Reconcile(ctx)
 	if err != nil {
@@ -975,7 +1123,7 @@ func TestManagerReconcileReportsAStoppedProject(t *testing.T) {
 	if err := store.Save(ctx, Record{
 		ProjectID: p.ID,
 		Backend:   "tmux",
-		Session:   "amx-p_case_b",
+		Session:   p.SessionName(),
 		State:     StateRunning,
 		Cols:      111,
 		Rows:      33,
@@ -998,7 +1146,7 @@ func TestManagerReconcileReportsAStoppedProject(t *testing.T) {
 	}
 
 	// Nothing was started on the user's behalf.
-	alive, err := backend.Exists(ctx, "amx-p_case_b")
+	alive, err := backend.Exists(ctx, p.SessionName())
 	if err != nil {
 		t.Fatalf("Exists returned an error: %v", err)
 	}
@@ -1025,13 +1173,17 @@ func TestManagerReconcileReportsAStoppedProject(t *testing.T) {
 func TestManagerReconcileReportsAnOrphan(t *testing.T) {
 	ctx := context.Background()
 
-	known := testProject("p_known")
+	known := testProject("known")
 	known.RuntimePath = t.TempDir()
 	m, backend := testManager(t, newFakeStore(), known)
 
+	// A session for a project nobody has a record of, sitting on the known
+	// project's own socket. Its name is a real identifier, so the orphan is
+	// reported with one.
+	deleted := testProjectID("deleted")
 	orphanDir := t.TempDir()
 	if _, err := backend.Create(ctx, SessionSpec{
-		Name: project.SessionNameFor("p_deleted"), Dir: orphanDir, Cols: 80, Rows: 24,
+		Name: project.SessionNameFor(deleted), Dir: orphanDir, Cols: 80, Rows: 24,
 	}); err != nil {
 		t.Fatalf("could not create the orphan session: %v", err)
 	}
@@ -1044,22 +1196,25 @@ func TestManagerReconcileReportsAnOrphan(t *testing.T) {
 		t.Fatalf("Reconcile reported %d orphans, want 1", len(report.Orphans))
 	}
 	orphan := report.Orphans[0]
-	if orphan.Session != "amx-p_deleted" {
-		t.Errorf("the orphan is %q, want %q", orphan.Session, "amx-p_deleted")
+	if want := project.SessionNameFor(deleted); orphan.Session != want {
+		t.Errorf("the orphan is %q, want %q", orphan.Session, want)
 	}
-	if orphan.ProjectID != "p_deleted" {
-		t.Errorf("the orphan names the project %q, want %q", orphan.ProjectID, "p_deleted")
+	if orphan.ProjectID != deleted {
+		t.Errorf("the orphan names the project %q, want %q", orphan.ProjectID, deleted)
+	}
+	if orphan.Socket == "" {
+		t.Error("the orphan does not name the socket it is on; a session on a per-project socket is only identifiable with it")
 	}
 	if orphan.Dir != orphanDir {
 		t.Errorf("the orphan's directory is %q, want %q", orphan.Dir, orphanDir)
 	}
 
-	if got := m.Orphans(); len(got) != 1 || got[0].Session != "amx-p_deleted" {
+	if got := m.Orphans(); len(got) != 1 || got[0].Session != project.SessionNameFor(deleted) {
 		t.Errorf("Orphans() = %v, want the session Reconcile just found", got)
 	}
 
 	// It is still running: reporting an orphan is not a licence to kill it.
-	alive, err := backend.Exists(ctx, "amx-p_deleted")
+	alive, err := backend.Exists(ctx, project.SessionNameFor(deleted))
 	if err != nil {
 		t.Fatalf("Exists returned an error: %v", err)
 	}
@@ -1180,7 +1335,7 @@ func TestManagerCloseLeavesSessionsAlone(t *testing.T) {
 		t.Fatalf("Close returned an error: %v", err)
 	}
 
-	alive, err := backend.Exists(ctx, "amx-p_close")
+	alive, err := backend.Exists(ctx, p.SessionName())
 	if err != nil {
 		t.Fatalf("Exists returned an error: %v", err)
 	}
@@ -1285,15 +1440,16 @@ func TestManagerFileWritesAreVisibleToTheServer(t *testing.T) {
 func TestManagerRejectsAnIncompleteConfiguration(t *testing.T) {
 	projects := newFakeProjects(testProject("p_x"))
 	store := newFakeStore()
-	backend := NewTmuxBackend(TmuxOptions{Logger: discardLogger()})
+	runtimes := testRuntimes(t, uniqueSocketDir(t))
 
 	cases := []struct {
 		name string
 		opts ManagerOptions
 	}{
-		{"no backend", ManagerOptions{Projects: projects, Store: store}},
-		{"no projects", ManagerOptions{Backend: backend, Store: store}},
-		{"no store", ManagerOptions{Backend: backend, Projects: projects}},
+		{"no backend", ManagerOptions{Sockets: runtimes.Sockets(), Projects: projects, Store: store}},
+		{"no sockets", ManagerOptions{Backends: runtimes, Projects: projects, Store: store}},
+		{"no projects", ManagerOptions{Backends: runtimes, Sockets: runtimes.Sockets(), Store: store}},
+		{"no store", ManagerOptions{Backends: runtimes, Sockets: runtimes.Sockets(), Projects: projects}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

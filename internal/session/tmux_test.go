@@ -333,7 +333,7 @@ func TestTmuxBackendStopInterruptsAndKeepsTheSession(t *testing.T) {
 // whose process had died would satisfy every other check here.
 func TestTmuxBackendSessionSurvivesTheBackendThatMadeIt(t *testing.T) {
 	ctx := context.Background()
-	socket := uniqueSocketName()
+	socket := uniqueSocketPath(t)
 
 	first := newTestBackendOn(t, socket)
 	session, dir := newTestSession(t, first, "p_persist", 100, 30)
@@ -1019,9 +1019,9 @@ func TestTmuxBackendAvailableRejectsAnOldVersion(t *testing.T) {
 	}
 
 	b := NewTmuxBackend(TmuxOptions{
-		Binary: "tmux-that-does-not-exist",
-		Socket: uniqueSocketName(),
-		Logger: slog.New(slog.DiscardHandler),
+		Binary:     "tmux-that-does-not-exist",
+		SocketPath: uniqueSocketPath(t),
+		Logger:     slog.New(slog.DiscardHandler),
 	})
 	if err := b.Available(context.Background()); !IsCode(err, CodeBackendUnavailable) {
 		t.Errorf("Available with a missing binary failed with %v, want %s", err, CodeBackendUnavailable)
@@ -1197,8 +1197,8 @@ func TestChunkBufferByteLimit(t *testing.T) {
 // rather than one that fails on its first call.
 func TestTmuxBackendOptionsDefault(t *testing.T) {
 	b := NewTmuxBackend(TmuxOptions{})
-	if b.bin != DefaultTmuxBinary {
-		t.Errorf("the binary is %q, want %q", b.bin, DefaultTmuxBinary)
+	if b.install.bin != DefaultTmuxBinary {
+		t.Errorf("the binary is %q, want %q", b.install.bin, DefaultTmuxBinary)
 	}
 	if b.config != DefaultTmuxConfig {
 		t.Errorf("the config is %q, want %q", b.config, DefaultTmuxConfig)
@@ -1215,10 +1215,17 @@ func TestTmuxBackendOptionsDefault(t *testing.T) {
 	if b.log == nil {
 		t.Error("the logger is nil, so a log call would panic")
 	}
-	// The socket is deliberately empty by default: "" means the user's default
-	// socket, and a default private name would make two installations collide.
-	if b.socket != "" {
-		t.Errorf("the socket is %q, want the empty default", b.socket)
+	// The socket path is empty here, and since Phase 2.5 that is a refusal
+	// rather than a fallback. Phase 2 read an empty socket as "the user's
+	// default socket", which meant a backend that had lost its socket path
+	// would quietly drive whatever server the user happened to own. There is no
+	// safe default now: every backend owns one project's server, so a backend
+	// without a socket has nothing to address.
+	if b.socketPath != "" {
+		t.Errorf("the socket path is %q, want the empty default", b.socketPath)
+	}
+	if err := b.Available(context.Background()); !IsCode(err, CodeBackendUnavailable) {
+		t.Errorf("Available without a socket path failed with %v, want %s", err, CodeBackendUnavailable)
 	}
 }
 

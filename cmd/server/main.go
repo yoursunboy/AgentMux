@@ -118,6 +118,8 @@ func run(args []string) error {
 		Distro:       cfg.Runtime.Distro,
 		WSLMountRoot: cfg.Runtime.WSLMountRoot,
 		Roots:        cfg.Projects.Roots,
+		Shell:        cfg.Terminal.Shell,
+		TmuxBinary:   cfg.TmuxBinary(),
 	})
 	if err != nil {
 		return err
@@ -147,11 +149,30 @@ func run(args []string) error {
 		return err
 	}
 
+	// One project, one tmux server, one socket. That is the whole of the fault
+	// isolation: a tmux server is identified by its socket, so a runtime fault
+	// reaches exactly the projects whose sockets it holds, which is one.
+	//
+	// The socket directory defaults to a subdirectory of the data directory so
+	// that it travels with the installation rather than with the shell the
+	// server happened to be started from.
+	socketDir := cfg.TmuxSocketDir()
+	if socketDir == "" {
+		socketDir = filepath.Join(cfg.DataDir, session.DefaultTmuxSocketDirName)
+	}
+	backends, err := session.NewProjectRuntimes(session.ProjectRuntimesOptions{
+		Binary:    cfg.TmuxBinary(),
+		SocketDir: socketDir,
+		Logger:    logger,
+	})
+	if err != nil {
+		return err
+	}
+	logger.Info("project runtimes", "tmuxBinary", backends.Status(ctx).Binary, "socketDir", backends.Sockets().Dir())
+
 	runtimes, err := session.NewManager(session.ManagerOptions{
-		Backend: session.NewTmuxBackend(session.TmuxOptions{
-			Socket: orDefault(cfg.Terminal.Socket, session.DefaultTmuxSocket),
-			Logger: logger,
-		}),
+		Backends:      backends,
+		Sockets:       backends.Sockets(),
 		Projects:      projectService,
 		Store:         store.Runtimes(),
 		Shell:         cfg.Terminal.Shell,
@@ -278,7 +299,9 @@ func loadConfig(args []string) (*config.Config, error) {
 		runtimeDistro = flags.String("runtime-distro", "", "WSL distribution name")
 		webDir        = flags.String("web-dir", "", "directory holding the built frontend")
 		shell         = flags.String("shell", "", "shell a terminal session runs (default: the host's)")
-		tmuxSocket    = flags.String("tmux-socket", "", "tmux socket name for AgentMux sessions (default "+session.DefaultTmuxSocket+")")
+		tmuxSocket    = flags.String("tmux-socket", "", "deprecated: the shared tmux socket name used before Phase 2.5; each project now has its own tmux server and this setting has no effect")
+		tmuxBinary    = flags.String("tmux-binary", "", "tmux executable every project's runtime runs (default: tmux on PATH)")
+		tmuxSocketDir = flags.String("tmux-socket-dir", "", "directory holding one tmux socket per project (default: <data-dir>/tmux)")
 		debugAPI      = flags.Bool("debug-api", false,
 			"enable the diagnostic runtime API under /api/debug; it exposes raw terminal input and output")
 		showVersion = flags.Bool("version", false, "print the version and exit")
@@ -318,6 +341,8 @@ func loadConfig(args []string) (*config.Config, error) {
 			WebDir:        *webDir,
 			TerminalShell: *shell,
 			TmuxSocket:    *tmuxSocket,
+			TmuxBinary:    *tmuxBinary,
+			TmuxSocketDir: *tmuxSocketDir,
 			DebugAPI:      *debugAPI,
 		},
 	})

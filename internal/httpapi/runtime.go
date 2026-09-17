@@ -210,7 +210,7 @@ func (s *Server) handleDebugRuntimeOutput(w http.ResponseWriter, r *http.Request
 	if r.URL.Query().Get("snapshot") != "" {
 		if described, err := s.runtime.Describe(ctx, projectID); err == nil {
 			response.Session = described
-			if snapshot, err := s.runtime.Backend().Snapshot(ctx, described.Name); err == nil {
+			if snapshot, err := s.runtime.Snapshot(ctx, projectID); err == nil {
 				response.Snapshot = snapshot
 			}
 		}
@@ -327,9 +327,15 @@ type debugRuntimesResponse struct {
 	// runtime the sessions below belong to.
 	Backend string `json:"backend"`
 
-	// Sessions are every AgentMux session the backend can see, including ones
-	// no registered project claims.
-	Sessions []*session.Session `json:"sessions"`
+	// SocketDir is where the project runtimes live. It is reported because
+	// since Phase 2.5 there is no single server to inspect: a session is only
+	// meaningful together with the socket it is on, and a reader who wants to
+	// look at one themselves needs to know where to look.
+	SocketDir string `json:"socketDir"`
+
+	// Sessions are every AgentMux session on every socket in the socket
+	// directory, including ones no registered project claims.
+	Sessions []session.SessionRef `json:"sessions"`
 
 	// Orphans are the sessions from the most recent reconciliation that no
 	// registered project claims. AgentMux reports them and does not touch them.
@@ -341,23 +347,23 @@ func (s *Server) handleDebugRuntimes(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := s.contextWithTimeout(r, runtimeReadTimeout)
 	defer cancel()
 
-	backend := s.runtime.Backend()
-	sessions, err := backend.List(ctx)
+	sessions, err := s.runtime.Sessions(ctx)
 	if err != nil {
 		writeServiceError(w, s.log, err)
 		return
 	}
 	if sessions == nil {
-		sessions = []*session.Session{}
+		sessions = []session.SessionRef{}
 	}
 	orphans := s.runtime.Orphans()
 	if orphans == nil {
 		orphans = []session.Orphan{}
 	}
 	writeJSON(w, s.log, http.StatusOK, debugRuntimesResponse{
-		Backend:  backend.Name(),
-		Sessions: sessions,
-		Orphans:  orphans,
+		Backend:   s.runtime.BackendName(),
+		SocketDir: s.runtime.SocketDir(),
+		Sessions:  sessions,
+		Orphans:   orphans,
 	})
 }
 

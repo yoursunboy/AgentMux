@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -59,9 +60,82 @@ const (
 // failures that move when you run it twice.
 var testSocketCounter atomic.Int64
 
-// uniqueSocketName returns a tmux socket name no other test is using.
-func uniqueSocketName() string {
-	return fmt.Sprintf("amx-test-%d-%d", os.Getpid(), testSocketCounter.Add(1))
+// uniqueSocketDir returns a directory no other test is using, for sockets to
+// live in. It is removed when the test ends.
+//
+// It is a directory rather than a path because a project's runtime is addressed
+// by a socket *path* since Phase 2.5, and the layout that turns a project id
+// into one is what the tests have to exercise. A test that named a socket the
+// old way would be testing a server it does not own.
+//
+// The directory is made under the system temporary directory rather than with
+// t.TempDir() because a socket path is bounded - about a hundred bytes on Linux
+// - and a test name descriptive enough to be worth reading is long enough to
+// exceed that. A too-long path fails with "File name too long" from somewhere
+// that says nothing about the test name being the cause.
+func uniqueSocketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", fmt.Sprintf("amx-%d-", testSocketCounter.Add(1)))
+	if err != nil {
+		t.Fatalf("could not make a socket directory: %v", err)
+	}
+	// Registered here rather than by the caller so that it runs after every
+	// cleanup the test registers later: t.Cleanup is last-in-first-out, and the
+	// server has to be gone before its directory can be removed.
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// uniqueSocketPath returns a socket path no other test is using, for a backend
+// that is not part of a manager's layout.
+func uniqueSocketPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(uniqueSocketDir(t), "tmux.sock")
+}
+
+// testRuntimes builds the per-project runtime factory the manager will use.
+//
+// The tmux probe is here rather than in each caller because every caller is a
+// test that starts real servers, and a few of them reach Start without ever
+// building a backend of their own - the isolation suite builds its manager and
+// its three projects and goes straight to Start. Without this they failed on a
+// machine with no tmux on the path, which is every Windows machine, and the
+// failure read as AgentMux being broken rather than as tmux being absent.
+func testRuntimes(t *testing.T, dir string) *ProjectRuntimes {
+	t.Helper()
+	requireTmuxInstalled(t)
+	runtimes, err := NewProjectRuntimes(ProjectRuntimesOptions{
+		SocketDir: dir,
+		Logger:    discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewProjectRuntimes returned an error: %v", err)
+	}
+	return runtimes
+}
+
+// runningOnWindows reports whether the suite is on Windows, for the handful of
+// assertions that are about POSIX behaviour.
+//
+// It reads the path separator rather than importing "runtime", because this
+// package has a type called runtime and Go will not have both names in one file.
+func runningOnWindows() bool { return os.PathSeparator == '\\' }
+
+// requireTmuxInstalled skips a test that needs tmux to be installed but does not
+// need a server of its own - a test about how tmux words a refusal, for example,
+// which is the evidence the socket states are classified from.
+func requireTmuxInstalled(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping the tmux integration tests in short mode")
+	}
+	probe := NewTmuxBackend(TmuxOptions{
+		SocketPath: filepath.Join(os.TempDir(), "amx-tmux-probe.sock"),
+		Logger:     slog.New(slog.DiscardHandler),
+	})
+	if err := probe.Available(context.Background()); err != nil {
+		t.Skipf("tmux is not usable here, so the runtime cannot be tested: %v", err)
+	}
 }
 
 // requireTmux skips a test where tmux cannot run.
@@ -78,16 +152,24 @@ func requireTmux(t *testing.T, b *TmuxBackend) {
 // newTestBackend returns a backend on a socket of its own.
 func newTestBackend(t *testing.T) *TmuxBackend {
 	t.Helper()
-	return newTestBackendOn(t, uniqueSocketName())
+	return newTestBackendOn(t, uniqueSocketPath(t))
 }
 
-// newTestBackendOn returns a backend on a named socket, for the tests that need
-// two backends to look at the same tmux server in turn.
-func newTestBackendOn(t *testing.T, socket string) *TmuxBackend {
+// newTestBackendOn returns a backend on a given socket path, for the tests that
+// need two backends to look at the same tmux server in turn.
+func newTestBackendOn(t *testing.T, socketPath string) *TmuxBackend {
 	t.Helper()
+	// An empty socket path is a defect in the test, never a property of the
+	// machine, so it must not reach requireTmux and become a skip. It did once:
+	// the manager tests were passing socket paths derived from label-shaped
+	// project ids, which Phase 2.5 turns into the empty string, and the whole
+	// suite reported success by not running.
+	if strings.TrimSpace(socketPath) == "" {
+		t.Fatalf("a test asked for a backend with no socket path; the project id it used is not one AgentMux would issue")
+	}
 	b := NewTmuxBackend(TmuxOptions{
-		Socket: socket,
-		Logger: slog.New(slog.DiscardHandler),
+		SocketPath: socketPath,
+		Logger:     slog.New(slog.DiscardHandler),
 	})
 	requireTmux(t, b)
 	t.Cleanup(func() {

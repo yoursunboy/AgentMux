@@ -71,6 +71,12 @@ type harnessOptions struct {
 
 	// debugAPI turns on the diagnostic runtime endpoints.
 	debugAPI bool
+
+	// tmuxStatus, when set, makes this server's backend factory able to
+	// describe the tmux installation its runtimes will use. Left nil the
+	// factory cannot, which is the case the server has to survive: an absent
+	// diagnostic field is honest and an invented one is not.
+	tmuxStatus *session.TmuxStatus
 }
 
 func newHarness(t *testing.T) *harness {
@@ -156,8 +162,14 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	}
 
 	backend := newFakeBackend()
+	plain := &fakeFactory{backend: backend}
+	var factory session.BackendFactory = plain
+	if o.tmuxStatus != nil {
+		factory = &statusFactory{fakeFactory: plain, status: *o.tmuxStatus}
+	}
 	manager, err := session.NewManager(session.ManagerOptions{
-		Backend:  backend,
+		Backends: factory,
+		Sockets:  newFakeSockets(backend),
 		Projects: service,
 		Store:    store.Runtimes(),
 		Logger:   discardLogger(),
@@ -359,6 +371,54 @@ func TestServerInfoDoesNotClaimATerminal(t *testing.T) {
 		if info.Features[feature] {
 			t.Errorf("features.%s is true, but it is not implemented yet", feature)
 		}
+	}
+}
+
+// TestServerInfoReportsTheTmuxItWillRun checks the diagnostic that makes the
+// compatibility matrix actionable: which binary, which version, and where the
+// per-project sockets are - asked of the runtime itself, because that is the
+// code that will run it.
+func TestServerInfoReportsTheTmuxItWillRun(t *testing.T) {
+	status := session.TmuxStatus{
+		Available:      true,
+		Version:        "3.4",
+		Binary:         "/usr/bin/tmux",
+		SocketDir:      "/home/user/.local/share/agentmux/tmux",
+		MinimumVersion: "3.0",
+	}
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, tmuxStatus: &status})
+	info := decode[serverInfoResponse](t, h.call(http.MethodGet, "/api/server", ""))
+
+	if info.Tmux == nil {
+		t.Fatal("tmux is absent, but this server's runtime can describe its installation")
+	}
+	if info.Tmux.Version != "3.4" {
+		t.Errorf("tmux.version = %q, want %q", info.Tmux.Version, "3.4")
+	}
+	if info.Tmux.Binary != "/usr/bin/tmux" {
+		t.Errorf("tmux.binary = %q, want %q", info.Tmux.Binary, "/usr/bin/tmux")
+	}
+	if !info.Tmux.Available {
+		t.Error("tmux.available is false, but the runtime resolved a usable tmux")
+	}
+	if info.Tmux.SocketDir == "" {
+		t.Error("tmux.socketDir is empty; a diagnostic that cannot say where the sockets are cannot explain an orphan")
+	}
+	if info.Tmux.MinimumVersion == "" {
+		t.Error("tmux.minimumVersion is empty; a user cannot tell a supported version from a merely present one")
+	}
+}
+
+// TestServerInfoOmitsTmuxItCannotDescribe is the other half of the diagnostic.
+// A runtime that cannot say which tmux it will run must leave the field out:
+// an invented version is worse than no version, because it is exactly the field
+// a user holds against the compatibility matrix.
+func TestServerInfoOmitsTmuxItCannotDescribe(t *testing.T) {
+	h := newHarness(t)
+	info := decode[serverInfoResponse](t, h.call(http.MethodGet, "/api/server", ""))
+
+	if info.Tmux != nil {
+		t.Errorf("tmux = %+v, but this harness's backend factory cannot describe an installation", *info.Tmux)
 	}
 }
 

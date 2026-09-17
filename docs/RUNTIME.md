@@ -812,6 +812,19 @@ per run by `AGENTMUX_STRESS_TMUX`. And the pure-Linux columns ran on the interna
 an isolated socket directory under `/tmp`, never on its default tmux socket and never touching the
 machine's existing sessions.
 
-**All four environments are §二十二 Case 4: nothing reproduced.** Per §21 of this document's own rules
-and §10's historical note, that is reported as `0 failures observed in 21,000 rounds` and nothing
-stronger — not "fixed", not "stable".
+**One correction to an earlier claim about the harness, because it was not true of every run.** The
+harness as it stands takes a private socket path: with `AGENTMUX_STRESS_SOCKET` unset it makes its own
+directory under the system temporary directory and names a socket inside it, so no run can reach
+another's server. An **earlier revision of the same harness** instead used a *named* socket — `tmux -L
+amx-stress-<pid>` — which places the socket in the machine's **default** tmux socket directory. It
+never touched the default session or any other session, and no measurement above is affected, but it
+did leave nine dead AgentMux sockets in `/tmp/tmux-1000/` on the WSL machine, where they were found
+during the Phase 2.5 cleanup. Each was confirmed to have no server behind it and removed; the
+directory is now empty, and the user's own default socket was never created, so nothing of theirs was
+ever in there. Recorded rather than quietly tidied, because "the tests never used the default tmux
+directory" was a claim this document made and the evidence did not support for those earlier runs.
+
+**All four environments are Case 4 of the Phase 2.5 directive's four result-judgement cases: nothing
+reproduced.** Under that directive's own rule against overstating a clean run, and §10's historical
+note, the result is reported as `0 failures observed in 21,000 rounds` and nothing stronger — not
+"fixed", not "stable".

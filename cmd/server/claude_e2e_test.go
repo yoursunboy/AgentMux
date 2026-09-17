@@ -836,10 +836,11 @@ func TestRealClaudeRunsInTheProjectDirectory(t *testing.T) {
 	// is text. Claude Code draws a full-screen interface, so a screen with
 	// nothing on it after a successful start would mean the process was running
 	// with nowhere to write.
-	snapshot, err := server.manager.Snapshot(context.Background(), p.ID)
+	screen, _, err := server.manager.Screen(context.Background(), p.ID)
 	if err != nil {
 		t.Fatalf("could not read the terminal's contents: %v", err)
 	}
+	snapshot := screen.Data
 	if len(bytes.TrimSpace(snapshot)) == 0 {
 		t.Error("the terminal is empty after Claude Code started")
 	}
@@ -1193,7 +1194,7 @@ func TestRealClaudeStopIsReportedHonestly(t *testing.T) {
 	if status := server.manager.ProjectStatus(p.ID); status != project.StatusRunning {
 		t.Errorf("the project's runtime is %s after its agent was stopped, want %s", status, project.StatusRunning)
 	}
-	if _, err := server.manager.Snapshot(context.Background(), p.ID); err != nil {
+	if _, _, err := server.manager.Screen(context.Background(), p.ID); err != nil {
 		t.Errorf("the terminal could not be read after the stop: %v", err)
 	}
 }
@@ -1228,10 +1229,11 @@ func TestRealClaudeAnswersAPrompt(t *testing.T) {
 		t.Fatal("no agent process to prompt")
 	}
 
-	before, err := server.manager.Snapshot(context.Background(), p.ID)
+	beforeScreen, _, err := server.manager.Screen(context.Background(), p.ID)
 	if err != nil {
 		t.Fatalf("could not read the terminal before prompting: %v", err)
 	}
+	before := beforeScreen.Data
 
 	// One line, because it is delivered as terminal input: a newline in the
 	// middle of it would submit half a prompt.
@@ -1251,10 +1253,12 @@ func TestRealClaudeAnswersAPrompt(t *testing.T) {
 	grew := false
 	var after []byte
 	for deadline := time.Now().Add(window); time.Now().Before(deadline); {
-		after, err = server.manager.Snapshot(context.Background(), p.ID)
+		var afterScreen session.Screen
+		afterScreen, _, err = server.manager.Screen(context.Background(), p.ID)
 		if err != nil {
 			t.Fatalf("could not read the terminal after prompting: %v", err)
 		}
+		after = afterScreen.Data
 		if len(after) > len(before) {
 			grew = true
 			break

@@ -104,15 +104,23 @@ code {
   min-height: 0;
 }
 
-@media (max-width: 1100px) {
+/* Three panels need a desktop's width, and that is a higher bar than it looks:
+   two project panels side by side are each half of what is left after the
+   manager, and a terminal squeezed under about 600px is too narrow to run a
+   full-screen program in. Below this the second project panel is the thing to
+   give up, because a panel nobody can read is worth less than one that fits. */
+@media (max-width: 1280px) {
   .workspace {
     grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
   }
 }
 
-@media (max-width: 780px) {
+/* One panel per page on phones, and on a tablet held upright - an iPad in
+   portrait is 820px, where a project panel and the manager side by side would
+   leave the terminal around 470px, about sixty columns. Turned on its side the
+   same tablet has room for both, and gets them. */
+@media (max-width: 900px) {
   .workspace {
-    /* One panel per page on phones. */
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -326,23 +334,149 @@ code {
   justify-content: flex-end;
 }
 
-.panel__prompt {
+/* When the terminal is showing, the body scrolls rather than clipping: the
+   terminal has a definite height so that xterm has something to fit to, and a
+   short window would otherwise push the Prompt Bar out of a panel that hides
+   its overflow. */
+.panel__body--terminal {
+  overflow-y: auto;
+}
+
+.panel--manager .panel__body {
+  gap: 12px;
+}
+
+/* --- Terminal ----------------------------------------------------------- */
+
+.panel__terminal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+}
+
+.terminal__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.terminal__state {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.terminal__state--open {
+  color: var(--online);
+}
+
+.terminal__state--connecting,
+.terminal__state--reconnecting {
+  color: var(--warning);
+}
+
+.terminal__state--failed {
+  color: var(--danger);
+}
+
+.terminal {
+  position: relative;
+  display: flex;
+  min-width: 0;
+}
+
+.terminal__screen {
   flex: 1;
+  min-width: 0;
+  /* A definite height is what xterm measures against. The viewport unit keeps
+     it useful on a tablet in landscape as well as on a desktop, and the floor
+     keeps a full-screen program legible in a short window. */
+  height: 52vh;
+  min-height: 240px;
+  padding: 6px 8px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.terminal__screen .xterm {
+  height: 100%;
+}
+
+/* The way back to the bottom, which is a local decision: the server is never
+   told where this browser's viewport is looking, because the other browser
+   watching the same terminal is looking somewhere else. */
+.terminal__more {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: #ffffff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+
+.terminal__notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.prompt-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.prompt-bar__input {
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   color: var(--text);
   padding: 7px 9px;
   font: inherit;
+  resize: vertical;
+  min-height: 34px;
+  max-height: 40vh;
 }
 
-.panel__prompt:disabled {
+.prompt-bar__input:disabled {
   color: var(--text-faint);
   cursor: not-allowed;
 }
 
-.panel--manager .panel__body {
-  gap: 12px;
+.prompt-bar__actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.prompt-bar__hint {
+  font-size: 12px;
+  color: var(--warning);
+}
+
+.button--small {
+  padding: 3px 8px;
+  font-size: 12px;
 }
 
 /* --- Metadata list ------------------------------------------------------ */
@@ -703,10 +837,32 @@ code {
 
 /* --- Touch and focus ---------------------------------------------------- */
 
+/* The keys a soft keyboard does not have.
+
+   Rendered for every browser and shown only where there is no keyboard to
+   speak of: a row of buttons under a desktop terminal is a row nobody needs,
+   and a display rule is a better way to say that than a media query read from
+   JavaScript, because it stays right when the pointer changes - an iPad with a
+   keyboard attached is a coarse pointer that has one. */
+.terminal__keys {
+  display: none;
+}
+
 @media (pointer: coarse) {
   .button,
   .project-list__item {
     min-height: 40px;
+  }
+
+  .terminal__keys {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .terminal__keys .button {
+    min-width: 44px;
+    font-family: var(--font-mono);
   }
 }
 

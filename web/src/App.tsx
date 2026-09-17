@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import {
   ApiError,
@@ -18,21 +18,28 @@ import { ProjectPanel } from './components/ProjectPanel'
 import { RegisterProjectDialog } from './components/RegisterProjectDialog'
 import { useProjects, useServerInfo } from './hooks/useProjects'
 import { describeError } from './lib/format'
+import { createTerminalClient } from './terminal/client'
+import { TerminalProvider } from './terminal/useTerminal'
 
 type Dialog = 'none' | 'new' | 'register'
 
 /**
- * App is the whole Phase 1 UI: a global bar, project panels, and the project
- * manager.
+ * App is the whole UI: a global bar, project panels, and the project manager.
  *
- * There is no router and no dashboard. The UI spec describes one workspace,
- * and inventing pages for a product with three screens would be furniture, not
+ * There is no router and no dashboard. The UI spec describes one workspace, and
+ * inventing pages for a product with three screens would be furniture, not
  * function.
  */
 export function App() {
   const server = useServerInfo()
   const projects = useProjects()
   const reloadServer = server.reload
+
+  // One terminal client for the page. It opens its socket when the first
+  // terminal is watched and closes it when the last one is released, so a page
+  // with nothing on screen holds no connection.
+  const [terminalClient] = useState(() => createTerminalClient())
+  useEffect(() => () => terminalClient.close(), [terminalClient])
 
   const [dialog, setDialog] = useState<Dialog>('none')
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -161,108 +168,115 @@ export function App() {
   )
 
   return (
-    <div className="app">
-      <GlobalBar
-        info={server.data}
-        loading={server.loading}
-        error={server.error ? describeError(server.error) : null}
-        onRetry={retryEverything}
-      />
-
-      {server.error && (
-        <ErrorBanner
-          message={describeError(server.error)}
-          {...(server.error instanceof ApiError && server.error.status > 0
-            ? { detail: `${server.error.code} (HTTP ${server.error.status})` }
-            : {})}
+    <TerminalProvider client={terminalClient}>
+      <div className="app">
+        <GlobalBar
+          info={server.data}
+          loading={server.loading}
+          error={server.error ? describeError(server.error) : null}
           onRetry={retryEverything}
         />
-      )}
 
-      {pageError && <ErrorBanner message={pageError} onDismiss={() => setPageError(null)} />}
-
-      {server.data && server.data.warnings.length > 0 && (
-        <div className="warnings">
-          {server.data.warnings.map((warning) => (
-            <span className="warnings__item" key={warning}>
-              {warning}
-            </span>
-          ))}
-        </div>
-      )}
-
-      <main className="workspace">
-        {selected ? (
-          <ProjectPanel
-            project={selected}
-            // All three facts the server folds into features.terminal: the
-            // build has the runtime, the server is on the right side of the
-            // WSL boundary, and tmux is installed where sessions run.
-            terminalAvailable={server.data?.features.terminal === true}
-            terminalBlocker={server.data?.terminalBlocker ?? ''}
-            busy={runtimeBusy}
-            onStartRuntime={() => void runRuntimeAction(selected.id, 'start')}
-            onStopRuntime={() => void runRuntimeAction(selected.id, 'stop')}
+        {server.error && (
+          <ErrorBanner
+            message={describeError(server.error)}
+            {...(server.error instanceof ApiError && server.error.status > 0
+              ? { detail: `${server.error.code} (HTTP ${server.error.status})` }
+              : {})}
+            onRetry={retryEverything}
           />
-        ) : (
-          <section className="panel panel--empty" aria-label="No project selected">
-            <div className="panel__body">
-              <p className="notice">
-                {projects.loading
-                  ? 'Loading…'
-                  : 'No project is open. Create or register one to get started.'}
-              </p>
-            </div>
-          </section>
         )}
 
-        <ProjectManagerPanel
-          projects={list}
-          projectsLoading={projects.loading}
-          projectsError={projects.error}
-          discovery={discovery}
-          discoveryLoading={discoveryLoading}
-          discoveryError={discoveryError}
-          busy={busy}
-          onOpenNew={() => {
-            setActionError(null)
-            setDialog('new')
-          }}
-          onOpenRegister={() => {
-            setActionError(null)
-            setDialog('register')
-          }}
-          onDiscover={() => void scan()}
-          onRegisterCandidate={onRegisterCandidate}
-          onRefresh={refreshProjects}
-          selectedId={selected?.id ?? null}
-          onSelect={(project) => setSelectedId(project.id)}
-        />
-      </main>
+        {pageError && <ErrorBanner message={pageError} onDismiss={() => setPageError(null)} />}
 
-      {dialog === 'new' && (
-        <NewProjectDialog
-          roots={roots}
-          busy={busy}
-          error={actionError?.dialog === 'new' ? actionError.error : null}
-          onCancel={() => setDialog('none')}
-          onSubmit={(input) => void onCreate(input)}
-        />
-      )}
+        {server.data && server.data.warnings.length > 0 && (
+          <div className="warnings">
+            {server.data.warnings.map((warning) => (
+              <span className="warnings__item" key={warning}>
+                {warning}
+              </span>
+            ))}
+          </div>
+        )}
 
-      {dialog === 'register' && (
-        <RegisterProjectDialog
-          discovery={discovery}
-          discoveryLoading={discoveryLoading}
-          discoveryError={discoveryError}
-          busy={busy}
-          error={actionError?.dialog === 'register' ? actionError.error : null}
-          onScan={() => void scan()}
-          onCancel={() => setDialog('none')}
-          onSubmit={(input) => void onRegister(input)}
-          onRegisterCandidate={onRegisterCandidate}
-        />
-      )}
-    </div>
+        <main className="workspace">
+          {selected ? (
+            <ProjectPanel
+              // Keyed by project so that switching projects is a different
+              // terminal rather than a change to this one: the view owns an
+              // xterm instance and its scrollback, and neither belongs to the
+              // panel that happens to be around it.
+              key={selected.id}
+              project={selected}
+              // All three facts the server folds into features.terminal: the
+              // build has the runtime, the server is on the right side of the
+              // WSL boundary, and tmux is installed where sessions run.
+              terminalAvailable={server.data?.features.terminal === true}
+              terminalBlocker={server.data?.terminalBlocker ?? ''}
+              busy={runtimeBusy}
+              onStartRuntime={() => void runRuntimeAction(selected.id, 'start')}
+              onStopRuntime={() => void runRuntimeAction(selected.id, 'stop')}
+            />
+          ) : (
+            <section className="panel panel--empty" aria-label="No project selected">
+              <div className="panel__body">
+                <p className="notice">
+                  {projects.loading
+                    ? 'Loading…'
+                    : 'No project is open. Create or register one to get started.'}
+                </p>
+              </div>
+            </section>
+          )}
+
+          <ProjectManagerPanel
+            projects={list}
+            projectsLoading={projects.loading}
+            projectsError={projects.error}
+            discovery={discovery}
+            discoveryLoading={discoveryLoading}
+            discoveryError={discoveryError}
+            busy={busy}
+            onOpenNew={() => {
+              setActionError(null)
+              setDialog('new')
+            }}
+            onOpenRegister={() => {
+              setActionError(null)
+              setDialog('register')
+            }}
+            onDiscover={() => void scan()}
+            onRegisterCandidate={onRegisterCandidate}
+            onRefresh={refreshProjects}
+            selectedId={selected?.id ?? null}
+            onSelect={(project) => setSelectedId(project.id)}
+          />
+        </main>
+
+        {dialog === 'new' && (
+          <NewProjectDialog
+            roots={roots}
+            busy={busy}
+            error={actionError?.dialog === 'new' ? actionError.error : null}
+            onCancel={() => setDialog('none')}
+            onSubmit={(input) => void onCreate(input)}
+          />
+        )}
+
+        {dialog === 'register' && (
+          <RegisterProjectDialog
+            discovery={discovery}
+            discoveryLoading={discoveryLoading}
+            discoveryError={discoveryError}
+            busy={busy}
+            error={actionError?.dialog === 'register' ? actionError.error : null}
+            onScan={() => void scan()}
+            onCancel={() => setDialog('none')}
+            onSubmit={(input) => void onRegister(input)}
+            onRegisterCandidate={onRegisterCandidate}
+          />
+        )}
+      </div>
+    </TerminalProvider>
   )
 }

@@ -76,7 +76,15 @@ func (b *chunkBuffer) append(c Chunk) {
 
 // since returns the buffered chunks whose sequence is greater than seq, oldest
 // first.
+//
+// A request for everything after the newest chunk gets nothing and allocates
+// nothing. That case is not hypothetical: it is what a subscriber asks for
+// when it wants to register for what comes next and has a screen that already
+// covers what came before, and it is the shape of every reconnect.
 func (b *chunkBuffer) since(seq uint64) []Chunk {
+	if seq >= b.latest() {
+		return nil
+	}
 	out := make([]Chunk, 0, b.count)
 	for i := 0; i < b.count; i++ {
 		c := b.ring[(b.start+i)%b.maxChunks]

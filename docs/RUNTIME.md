@@ -426,17 +426,27 @@ size its user chose.
 Each runtime numbers its output chunks with a monotonically increasing `seq`, and each chunk is
 `{projectId, sequence, bytes, timestamp}`.
 
-There is no WebSocket protocol yet (Phase 4). The sequence exists now because it is the thing that
-makes a future reconnect possible at all, and retrofitting it onto a live stream is much harder than
-starting with it:
+The sequence was introduced in Phase 2, before anything consumed it, because retrofitting it onto a
+live stream is much harder than starting with it. Phase 4 is what reads it: a snapshot frame carries
+the highest sequence number the screen it contains already includes, and every frame after it picks up
+from there. The original notes still describe what it was for:
 
-- A client that reconnects says "I have up to 7" and is given 8 onward.
+- A client that reconnects is given a screen and told where the stream resumes from it.
 - A second client attaching does not disturb the first.
 - History is bounded (a fixed number of chunks and bytes per runtime) and the bound is a memory
   decision, not a protocol one.
 
-Every live subscriber receives the same bytes; a subscriber that stops reading applies backpressure to
-tmux rather than having its output silently dropped.
+The snapshot is `capture-pane` rather than a replay of this history, and the reason is in §2 and in
+`docs/TERMINAL.md` §5.
+
+Every live subscriber receives the same bytes, and the two kinds of subscriber differ in what happens
+when one stops reading. **The control connection applies backpressure to tmux**: it is the only path
+the runtime's output has, so a manager that stops draining it slows the pane rather than losing
+anything. **A watcher loses chunks instead.** `Watch` hands out a bounded queue per watcher
+(`watchBufferDepth`, 256) and a watcher that overruns it is not given back-pressure — it is given a
+gap, which it detects from the sequence numbers it receives. That is the property Phase 4's transport
+is built on: a browser too slow to keep up is disconnected and re-synchronised with a snapshot
+(§16), and the runtime it was watching is unaffected.
 
 ## 8. Diagnostics
 
@@ -464,26 +474,29 @@ not exist, and `Available` says so. Anything above that is a warning, never a ha
 to start on a version AgentMux has not personally tested would take the runtime away from a user whose
 tmux is merely unusual.
 
-### The debug endpoints
+### The debug endpoints were deleted
 
-The debug endpoints exist so the runtime can be exercised end to end before there is a Web Terminal to
-exercise it with. **They are off unless `-debug-api` (or `AGENTMUX_DEBUG_API`) turns them on**, and
-they are expected to be deleted when Phase 4 provides a real terminal. They are not product API.
+Phase 2 and Phase 3 exposed a set of endpoints under `/api/debug` so the runtime could be exercised
+end to end before there was a Web Terminal to exercise it with: a session listing, an on-demand
+reconcile, buffered output, raw input, a resize. They were off unless `-debug-api` (or
+`AGENTMUX_DEBUG_API`) turned them on.
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/debug/runtimes` | List the backend's sessions and orphans |
-| `POST /api/debug/reconcile` | Run reconciliation and return the report |
-| `GET /api/debug/projects/{id}/runtime/output?since=N&snapshot=1` | Buffered chunks after `N`, optional pane snapshot |
-| `POST /api/debug/projects/{id}/runtime/input` | Send `text` (as UTF-8) **or** `bytes` (base64), optionally `enter` |
-| `POST /api/debug/projects/{id}/runtime/resize` | Resize a runtime |
+**Phase 4 deleted them.** There is no flag, no environment variable, and no handler: every
+`/api/debug/...` path answers `404 not_found` on every build. A flag that registers the routes and
+refuses inside the handler leaves the surface present and one configuration line away from live, and a
+route that writes arbitrary bytes into a session is not a thing to leave standing next to the real
+one. Where the runtime is exercised from now is the WebSocket at `/api/ws`, which reaches it
+only through `RuntimeManager` — see `docs/TERMINAL.md`.
 
-`input` refuses a body carrying both `text` and `bytes`: they are two fields, not a sequence, and a
-diagnostic endpoint that silently reordered a test's input would send the test's author looking in the
-wrong place.
+What the deleted endpoints established about the runtime is still true and still tested, and it is now
+asserted through the runtime's own API rather than through a diagnostic:
 
-Chunk data and snapshots are base64 on the wire (`[]byte` in Go), so the terminal's bytes round-trip
-exactly rather than through a lossy string.
+- Input is bytes, not text. `text` and `bytes` were separate fields because a caller that wants to
+  deliver an escape sequence, a control character, or a byte that is not valid UTF-8 has to be able to
+  say so exactly, and `Aw==` is a literal `0x03` rather than a Ctrl-C a text layer decided about.
+  The WebSocket carries the same distinction: input is base64 inside the message, not a string.
+- Output is bytes, not text. Chunk data is base64 on the wire (`[]byte` in Go), so the terminal's
+  bytes round-trip exactly rather than through a lossy string.
 
 ## 9. Verified behaviour
 
@@ -609,18 +622,21 @@ Stated rather than hidden.
   scrollback in tmux is unaffected, and that is what a client gets on reconnect.
 - **One backend.** `TmuxBackend` is the only implementation. The interface is shaped so a second one
   fits, but nothing has been written against a hypothetical second one.
-- **The debug API is unauthenticated**, like the rest of the Phase 2 API, and it exposes raw terminal
-  input and output. It is off by default and must not be turned on outside a local test.
-- **`-debug-api` exists only until Phase 4.** If it is still here after the Web Terminal lands, that
-  is a bug.
+- **The debug API is gone.** Phase 4 deleted it rather than gating it: no `/api/debug/...` path is
+  routed on any build. The surface that replaced it authenticates nothing either, and that is a
+  Phase 5+ concern — it binds to `127.0.0.1` and must not be exposed beyond a local test.
 
 ## 11. What this phase does not do
 
 Explicitly out of scope, and not stubbed or faked anywhere in the code:
 
-Claude Session Resume · xterm.js or any real terminal view · WebSocket terminal
-streaming · Prompt Bar · Controller/Viewer roles · Claude Hooks · Waiting/Completed states · CC Switch
+Claude Session Resume · Controller/Viewer roles · Claude Hooks · Waiting/Completed states · CC Switch
 · provider switching · push notifications · Codex, Gemini, OpenCode.
+
+The terminal view, the WebSocket transport and the Prompt Bar were on this list when it was written in
+Phase 2.5, and Phase 4 built them; `docs/TERMINAL.md` is now where they are described, and §16 below
+is what this document has to say about the runtime underneath them. What remains on the list above is
+still not stubbed or faked anywhere in the code.
 
 Phase 2.5 added no runtime feature. What it changed is where a runtime lives (one tmux server per
 project, §12), how one is watched (a single server-owned Control Monitor, §13), and what is known
@@ -633,8 +649,8 @@ states, persistence and reconciliation are unchanged.
 
 `GET /api/server` reports `features.terminal` as true only when the build has the runtime, the server
 is on the right side of the WSL boundary, **and** tmux is installed where sessions run. The UI offers
-Start/Stop runtime and says plainly that the terminal view arrives in Phase 4; it does not draw an
-empty rectangle.
+Start/Stop runtime, and Phase 4 made that flag decide whether a panel draws a real terminal rather
+than a placeholder — a server without a runtime still draws nothing instead of an empty rectangle.
 
 ## 12. Runtime isolation
 
@@ -751,8 +767,9 @@ buffer* in §2. The protocol permits exactly one remedy — a `capture-pane` sna
 stream is re-established, so the client sees the current screen even though it missed the bytes that
 drew it. **Phase 2.5 deliberately did not take it.** A snapshot is `capture-pane`, which is the polling
 mechanism this design replaced, and adding one would have meant a second, differently-shaped source of
-terminal bytes before anything consumed the first. It remains the documented remedy and it is the
-first thing Phase 4 should add, where a client that reconnects has a real reason to want it.
+terminal bytes before anything consumed the first. It remained the documented remedy, and **Phase 4
+took it** (§16): a client that reconnects, or that asks to be re-established while still connected, is
+sent the current screen and the sequence number it includes, and applies everything above that.
 
 ### The command path
 
@@ -862,5 +879,51 @@ fact about how the command was typed rather than about what is running.
 to "is this process running" is a stale answer waiting to happen, and §6's rule — the database holds
 only what a restart cannot recompute — applies to the agent as much as to the session.
 
-**No path for a browser to reach the agent's state.** §11's constraint is intact: the agent endpoints
-are REST and the agent's actual terminal is the pane it runs in. Phase 4 is what connects the two.
+**The agent is reachable two ways, and neither is a copy of the other.** The agent endpoints are REST
+and answer about the process; the terminal is the pane it runs in. Phase 4 connected the second
+without merging the two — the WebSocket carries bytes and never parses them, and nothing on that path
+reports which agent is running. §11's constraint is intact.
+
+## 16. The browser on top of the runtime
+
+Phase 4 put a terminal in a browser. `docs/TERMINAL.md` is the document for that layer; what belongs
+here is how it relates to everything above, and the short answer is that it does not change any of it.
+
+**The transport subscribes; it does not attach.** `terminal.Hub` is handed a resolver — it asks for a
+project's runtime and is given one, or is told there is none. It has no tmux socket path, no session
+name, and no way to acquire either, so "one control connection per runtime" (§13) is still true no
+matter how many browsers are open. §9 of `docs/ARCHITECTURE.md` is the argument for why that direction
+is the load-bearing one.
+
+**A browser cannot disturb the Control Monitor.** Connecting, disconnecting, crashing, subscribing and
+unsubscribing all happen on the watcher side of the manager. `MonitorStats.streamReconnects` counts
+control-client reconnects and is not moved by any amount of browser churn — which is what makes the
+reconnect cost measured in §13 attributable to the runtime rather than to who happens to be watching
+it, and what makes "closing the tab leaves Claude running" a consequence of the design rather than a
+promise.
+
+**Backpressure is asymmetric, and §7 is where the two halves are.** The control connection slows tmux
+when it cannot keep up; a watcher is given a gap instead. Both bounds are fixed and both are in the
+transport: 256 chunks waiting for one watcher (`watchBufferDepth`), 64 frames waiting for one browser
+(`outboundQueueDepth`). A browser that overruns either is re-synchronised from a snapshot rather than
+served more slowly, and a subscription that cannot hold a stream at all is dropped after eight attempts
+(`maxResyncs`) instead of retrying forever.
+
+**The canonical size is still the runtime's.** A resize from a browser goes where Start and Stop go:
+to the manager, which records the new cols and rows (§6) and resizes the pane. It is not a property of
+a connection. A browser that disconnects does not restore a previous size, a second browser does not
+get its own, and there is exactly one size per runtime however many are watching — which is why the
+transport has to reject a frantic stream of them rather than forwarding each one.
+
+**A snapshot is `capture-pane`, and it is not a stream.** §2 records what polling the screen costs:
+no scrollback, no bytes between ticks, and a re-encoding of the screen as text. Phase 4 did not
+overturn that. It used `capture-pane` for the one job polling is actually good at — replacing a
+screen at a known sequence boundary — and left the live path on the control connection. The fidelity
+limits that follow from this are stated rather than worked around in `docs/TERMINAL.md` §6.
+
+**No schema change.** `project_runtime` is unchanged and no table was added. A snapshot is taken when
+it is asked for and is not written down; terminal output still lives in tmux's scrollback and in
+memory, and nothing about a terminal reaches the database.
+
+**What Phase 4 means for this document**, then, is a reader. §1–§15 describe the runtime; §16 says
+that a browser is one of its readers and that the runtime was not reshaped to make that true.

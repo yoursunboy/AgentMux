@@ -382,26 +382,117 @@ func (m *Manager) Sessions(ctx context.Context) ([]SessionRef, error) {
 	return out, nil
 }
 
-// Snapshot returns a runtime's current screen, escape sequences intact.
+// How long Screen waits for a runtime's output to stop moving before it
+// captures, and how long it is willing to wait.
+//
+// The wait exists because a screen and a byte stream are not the same thing and
+// cannot be made to agree at an instant. A capture and the sequence number that
+// says "the stream is complete up to here" are two separate observations, and
+// anything the pane writes between them is in the screen *and* in the stream.
+//
+// Nothing can close that window, because tmux will not report the sequence
+// number that belongs to a capture. But it can be made empty in the case that
+// dominates every other: if the runtime produces no output at all while the
+// capture is taken, then nothing arrived in the window, and the boundary is
+// exact. A terminal sitting at a prompt, or an agent waiting for a reply, is
+// quiet for far longer than this.
+//
+// The maximum matters as much as the settle. A build printing continuously
+// never goes quiet, and a client asking for a screen must not be made to wait
+// for one to finish; past the deadline the capture is taken anyway, and
+// docs/TERMINAL.md says what that costs.
+const (
+	screenSettle    = 30 * time.Millisecond
+	screenSettleMax = 250 * time.Millisecond
+)
+
+// Screen returns a runtime's current screen together with the output sequence
+// the returned screen already contains.
 //
 // It is the recovery half of the live-output contract rather than a substitute
 // for it: a client that has just connected, or one whose stream was
 // re-established, draws this and then follows the subscription. Reading the
 // screen repeatedly instead of subscribing would turn a live terminal into a
 // screenshot, which is why nothing in the runtime's normal path calls this.
-func (m *Manager) Snapshot(ctx context.Context, projectID string) ([]byte, error) {
+//
+// # The boundary, exactly
+//
+// The uint64 returned is the highest sequence number this runtime had published
+// when the capture was requested. Its meaning is precise in one direction and
+// deliberately not claimed in the other:
+//
+//   - Every chunk with a sequence number at or below it is already drawn in the
+//     returned screen. A client must not replay those.
+//   - Every chunk above it was published after the capture was requested, and
+//     a client must apply those.
+//
+// It is not a claim that the screen is the result of applying chunks 1..n and
+// nothing else. A chunk published *during* the capture may already be drawn in
+// it. The quiesce above is what makes that case rare rather than routine; it is
+// not what makes it impossible, and TERMINAL.md records it as a known limit of
+// capture-pane rather than as something this code solves.
+func (m *Manager) Screen(ctx context.Context, projectID string) (Screen, uint64, error) {
 	rt, err := m.lookup(projectID)
 	if err != nil {
-		return nil, err
+		return Screen{}, 0, err
 	}
 	if rt == nil {
-		return nil, newError(CodeNotRunning, "no terminal runtime is running for project %s", projectID)
+		return Screen{}, 0, newError(CodeNotRunning,
+			"no terminal runtime is running for project %s", projectID)
 	}
 	backend, err := m.backendFor(projectID)
 	if err != nil {
-		return nil, err
+		return Screen{}, 0, err
 	}
-	return backend.Snapshot(ctx, rt.session)
+
+	boundary, err := m.quiesce(ctx, rt)
+	if err != nil {
+		return Screen{}, 0, err
+	}
+
+	screen, err := backend.Snapshot(ctx, rt.session)
+	if err != nil {
+		return Screen{}, 0, err
+	}
+	return screen, boundary, nil
+}
+
+// quiesce waits for a runtime's output to stop moving and returns the sequence
+// boundary to capture against.
+//
+// The boundary is read after the wait rather than before it, and the ordering
+// is the whole point. Read first, it would name a moment before the quiet
+// period, and every chunk published during the quiet period would be replayed
+// on top of a screen that already contains it. Read last, it names the state
+// the quiet period ended in, and everything at or below it is provably drawn.
+func (m *Manager) quiesce(ctx context.Context, rt *runtime) (uint64, error) {
+	deadline := m.now().Add(screenSettleMax)
+	last := rt.sequence()
+	for {
+		if !sleepContext(ctx, screenSettle) {
+			return 0, wrapError(ctx.Err(), CodeBackendFailure,
+				"gave up waiting for project %s's output to settle", rt.projectID)
+		}
+		current := rt.sequence()
+		if current == last {
+			return current, nil
+		}
+		if !m.now().Before(deadline) {
+			// Output never stopped. The capture goes ahead: a client asking to
+			// see the terminal must not be blocked by the terminal being busy.
+			m.log.Debug("screen captured while output was still arriving",
+				"projectId", rt.projectID, "sequence", current)
+			return current, nil
+		}
+		last = current
+	}
+}
+
+// sequence reads a runtime's current output sequence.
+func (r *runtime) sequence() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.seq
 }
 
 // backendFor returns the backend that owns a project's runtime.
@@ -1366,9 +1457,9 @@ func (m *Manager) History(ctx context.Context, projectID string, since uint64) (
 // The channel is closed when the returned cancel function is called or the
 // manager shuts down. Its buffer is bounded: a caller that stops reading loses
 // chunks rather than stalling the runtime, and detects the loss from the
-// sequence numbers. This is the shape the WebSocket terminal in a later phase
-// needs, and it is here now so that the data model is proven rather than
-// asserted.
+// sequence numbers. Phase 4's terminal transport is the caller this was shaped
+// for - a browser that stops reading is disconnected and re-synchronised with a
+// snapshot, and the pane it was watching never notices.
 func (m *Manager) Watch(ctx context.Context, projectID string, since uint64) ([]Chunk, <-chan Chunk, func(), error) {
 	rt, err := m.lookup(projectID)
 	if err != nil {

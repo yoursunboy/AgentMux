@@ -146,8 +146,8 @@ func TestTheConfiguredBinaryDrivesEveryRuntimePath(t *testing.T) {
 	if _, err := m.Resize(ctx, p.ID, 100, 30); err != nil {
 		t.Fatalf("Resize returned an error: %v", err)
 	}
-	if _, err := m.Snapshot(ctx, p.ID); err != nil {
-		t.Fatalf("Snapshot returned an error: %v", err)
+	if _, _, err := m.Screen(ctx, p.ID); err != nil {
+		t.Fatalf("Screen returned an error: %v", err)
 	}
 	if _, err := m.Sessions(ctx); err != nil {
 		t.Fatalf("Sessions returned an error: %v", err)

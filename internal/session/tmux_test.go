@@ -314,10 +314,7 @@ func TestTmuxBackendStopInterruptsAndKeepsTheSession(t *testing.T) {
 	if err := b.Launch(ctx, session.Name, "echo amx-alive-after-stop"); err != nil {
 		t.Fatalf("the session did not accept input after Stop: %v", err)
 	}
-	snapshot, err := b.Snapshot(ctx, session.Name)
-	if err != nil {
-		t.Fatalf("Snapshot returned an error: %v", err)
-	}
+	snapshot := screenRows(t, b, session.Name)
 	if !bytes.Contains(snapshot, []byte("amx-alive-after-stop")) {
 		t.Errorf("the shell did not run a command after Stop; the pane holds:\n%s", snapshot)
 	}
@@ -582,10 +579,7 @@ func TestTmuxBackendInputDeliversControlCharacters(t *testing.T) {
 	if err := b.SendInput(ctx, session.Name, []byte("echo amx-enter-works\r")); err != nil {
 		t.Fatalf("SendInput returned an error: %v", err)
 	}
-	snapshot, err := b.Snapshot(ctx, session.Name)
-	if err != nil {
-		t.Fatalf("Snapshot returned an error: %v", err)
-	}
+	snapshot := screenRows(t, b, session.Name)
 	if !bytes.Contains(snapshot, []byte("amx-enter-works")) {
 		t.Errorf("Enter did not submit the line; the pane holds:\n%s", snapshot)
 	}
@@ -621,10 +615,7 @@ func TestTmuxBackendInputDeliversEscapeSequences(t *testing.T) {
 
 	deadline := time.Now().Add(outputWait)
 	for time.Now().Before(deadline) {
-		snapshot, err := b.Snapshot(ctx, name)
-		if err != nil {
-			t.Fatalf("Snapshot returned an error: %v", err)
-		}
+		snapshot := screenRows(t, b, name)
 		if bytes.Count(snapshot, []byte(marker)) >= 3 {
 			// Once in the recalled command line, once in each of the two runs.
 			return
@@ -632,7 +623,7 @@ func TestTmuxBackendInputDeliversEscapeSequences(t *testing.T) {
 		time.Sleep(pollInterval)
 	}
 	snapshot, _ := b.Snapshot(ctx, name)
-	t.Errorf("up-arrow did not recall the previous command; the pane holds:\n%s", snapshot)
+	t.Errorf("up-arrow did not recall the previous command; the pane holds:\n%s", snapshot.Data)
 }
 
 // TestTmuxBackendLineDisciplineInterpretsErase records a property of ptys that
@@ -813,9 +804,27 @@ func TestTmuxBackendSnapshotCarriesEscapeSequences(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Snapshot returned an error: %v", err)
 		}
-		if bytes.Contains(snapshot, []byte("GREEN")) {
-			if !bytes.Contains(snapshot, []byte("\x1b[32m")) {
-				t.Errorf("the snapshot lost the colour escapes; it holds:\n%q", snapshot)
+		if bytes.Contains(snapshot.Data, []byte("GREEN")) {
+			if !bytes.Contains(snapshot.Data, []byte("\x1b[32m")) {
+				t.Errorf("the snapshot lost the colour escapes; it holds:\n%q", snapshot.Data)
+			}
+			// A screen is not only its text. The geometry has to describe the
+			// pane the rows were captured from, or a client sizes its terminal
+			// wrongly and wraps them in the wrong places.
+			if snapshot.Cols != 120 || snapshot.Rows != 30 {
+				t.Errorf("the screen is %dx%d, want the pane's 120x30", snapshot.Cols, snapshot.Rows)
+			}
+			if snapshot.CursorY < 0 || snapshot.CursorY >= snapshot.Rows {
+				t.Errorf("the cursor row is %d, which is outside a %d-row screen",
+					snapshot.CursorY, snapshot.Rows)
+			}
+			if snapshot.Alternate {
+				t.Error("the screen reports the alternate buffer, but the session is at a shell prompt")
+			}
+			// Render is what a client actually draws, and it has to place the
+			// cursor: capture-pane does not emit one.
+			if rendered := snapshot.Render(); !bytes.Contains(rendered, []byte("\x1b[")) {
+				t.Errorf("the rendered screen carries no escape sequences: %q", rendered)
 			}
 			return
 		}

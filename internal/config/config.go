@@ -43,7 +43,6 @@ const (
 	EnvTmuxBinary    = EnvPrefix + "TMUX_BINARY"
 	EnvTmuxSocketDir = EnvPrefix + "TMUX_SOCKET_DIR"
 	EnvClaudeBinary  = EnvPrefix + "CLAUDE_BINARY"
-	EnvDebugAPI      = EnvPrefix + "DEBUG_API"
 )
 
 // Runtime modes. "auto" lets the HostAdapter decide from the host platform.
@@ -117,18 +116,10 @@ type ServerConfig struct {
 	IdleTimeoutSec   int `json:"idleTimeoutSeconds"`
 	ShutdownGraceSec int `json:"shutdownGraceSeconds"`
 
-	// AllowedOrigins lists extra browser origins permitted by CORS, on top of
-	// the always-allowed loopback origins. Empty means loopback only.
+	// AllowedOrigins lists extra browser origins permitted by CORS and by the
+	// WebSocket upgrade's Origin check, on top of the always-allowed loopback
+	// origins. Empty means loopback only.
 	AllowedOrigins []string `json:"allowedOrigins"`
-
-	// DebugAPI enables the diagnostic endpoints under /api/debug.
-	//
-	// It is off by default and is not a product API: those endpoints exist so
-	// that the terminal runtime can be exercised end to end before there is a
-	// Web Terminal to exercise it with, and they are expected to be deleted
-	// once Phase 4 provides a real one. Leaving them on in an ordinary
-	// installation would expose raw terminal input and output over HTTP.
-	DebugAPI bool `json:"debugApi"`
 }
 
 // StorageConfig configures the metadata store.
@@ -290,8 +281,6 @@ type Overrides struct {
 	// ClaudeBinary is the Claude Code CLI a project's runtime starts. Empty
 	// means the bare name "claude" on PATH.
 	ClaudeBinary string
-
-	DebugAPI bool
 }
 
 // LoadOptions controls Load. The function hooks are injectable so the loader
@@ -472,9 +461,6 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	if v, ok := env(EnvClaudeBinary); ok && strings.TrimSpace(v) != "" {
 		cfg.Terminal.ClaudeBinary = strings.TrimSpace(v)
 	}
-	if v, ok := env(EnvDebugAPI); ok {
-		cfg.Server.DebugAPI = parseBool(v)
-	}
 }
 
 func applyOverrides(cfg *Config, o Overrides) {
@@ -518,22 +504,6 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 	if v := strings.TrimSpace(o.ClaudeBinary); v != "" {
 		cfg.Terminal.ClaudeBinary = v
-	}
-	// A boolean flag can only turn the diagnostic endpoints on, never off: they
-	// are off unless something asks for them, so there is nothing to override.
-	if o.DebugAPI {
-		cfg.Server.DebugAPI = true
-	}
-}
-
-// parseBool reads a boolean environment value. Anything unrecognised is false,
-// so a typo disables a feature rather than silently enabling one.
-func parseBool(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
 	}
 }
 

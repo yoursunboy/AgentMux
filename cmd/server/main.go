@@ -36,6 +36,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
+	"github.com/kutonlagos/agentmux/internal/terminal"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -234,6 +235,16 @@ func run(args []string) error {
 	}
 	webDir := cfg.ResolvedWebDir(workingDir)
 
+	// The terminal hub is what a browser's socket is handed to. It is built
+	// here rather than inside the API server because its lifetime is the
+	// process's: it has to be closed before the runtime manager is, so that
+	// every browser sees an ordinary close instead of a connection that dies
+	// when the process does.
+	terminalHub, err := terminal.NewHub(runtimes, terminal.HubOptions{Logger: logger})
+	if err != nil {
+		return err
+	}
+
 	api, err := httpapi.New(httpapi.Options{
 		Config:     cfg,
 		Host:       adapter,
@@ -241,6 +252,7 @@ func run(args []string) error {
 		Discoverer: discoverer,
 		Runtime:    runtimes,
 		Agent:      agents,
+		Terminal:   terminalHub,
 		Logger:     logger,
 		WebDir:     webDir,
 	})
@@ -275,6 +287,15 @@ func run(args []string) error {
 		return fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
 		logger.Info("shutdown signal received; stopping the server")
+	}
+
+	// Browser sockets are closed deliberately, and before the runtime manager
+	// is. A hijacked connection is not one http.Server.Shutdown tracks, so
+	// without this a browser would learn the server had stopped by its socket
+	// dying, which is the one signal it cannot tell apart from a network that
+	// went away.
+	if err := terminalHub.Close(); err != nil {
+		logger.Warn("could not close the terminal hub", "error", err)
 	}
 
 	// Browser disconnects must never affect project runtime, and a shutdown
@@ -322,9 +343,7 @@ func loadConfig(args []string) (*config.Config, error) {
 		tmuxBinary    = flags.String("tmux-binary", "", "tmux executable every project's runtime runs (default: tmux on PATH)")
 		tmuxSocketDir = flags.String("tmux-socket-dir", "", "directory holding one tmux socket per project (default: <data-dir>/tmux)")
 		claudeBinary  = flags.String("claude-binary", "", "Claude Code CLI a project's runtime starts (default: claude on PATH)")
-		debugAPI      = flags.Bool("debug-api", false,
-			"enable the diagnostic runtime API under /api/debug; it exposes raw terminal input and output")
-		showVersion = flags.Bool("version", false, "print the version and exit")
+		showVersion   = flags.Bool("version", false, "print the version and exit")
 
 		projectsRoots stringList
 	)
@@ -364,7 +383,6 @@ func loadConfig(args []string) (*config.Config, error) {
 			TmuxBinary:    *tmuxBinary,
 			TmuxSocketDir: *tmuxSocketDir,
 			ClaudeBinary:  *claudeBinary,
-			DebugAPI:      *debugAPI,
 		},
 	})
 }

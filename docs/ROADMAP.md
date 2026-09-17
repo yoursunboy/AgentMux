@@ -11,17 +11,24 @@ As of version 0.1.0:
 | Phase 2 — Persistent session runtime | **Done** | `SessionBackend` + `TmuxBackend`, runtime manager, persistence and reconciliation, runtime API, Phase 2 UI. No WebSocket, no real terminal view. |
 | Phase 2.5 — tmux stability validation and runtime isolation | **Partial** | One tmux server and socket per project; Control Monitor lifecycle; a four-environment tmux compatibility matrix. Complete except for re-running the pure-Linux columns, which need interactive authentication on the test host. See below. |
 | Phase 3 — Real Claude Code runtime | **Partial** | `internal/claude` launcher, agent lifecycle in `internal/session`, agent API, real-CLI integration tests. Runtime integration is complete and verified against the real CLI; the one outstanding item is that the WSL Claude Code is not signed in, so E2E conversation is not yet possible on this host. See below. |
-| Phase 4 — Web terminal | Not started | No WebSocket, no xterm.js, no terminal stream. |
+| Phase 4 — Web terminal | **Done** | `/api/ws` transport, snapshot and live output, raw input, Prompt Bar, resize, local scroll, reconnect and resync, touch keys. Verified in a real browser, including a tablet in emulation. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
 is actually installed there. `GET /api/server` also reports which tmux it found
 (`tmux.available`, `tmux.version`, `tmux.binary`), and which Claude Code it would launch
 (`claude.path`, `claude.version`, `claude.command`), with `features.claudeRuntime` saying whether one
-can be started here at all. The UI offers Start/Stop runtime and says plainly that the terminal view
-arrives in Phase 4; starting Claude is available through the API and has no UI yet. The provider still
-reports `integrated: false`, because Phase 8's provider switching is what that field describes.
-Nothing in the running product claims to do more than the table above.
+can be started here at all. The UI offers Start/Stop runtime, and a panel for a running project holds
+the terminal itself: the live screen, a Prompt Bar, a resize that follows the window, and a way to ask
+for the screen again. Starting Claude is still available only through the API — the runtime panel
+shows the agent's state and offers no button for it, which is a gap in the UI rather than in the
+runtime. The provider still reports `integrated: false`, because Phase 8's provider switching is what
+that field describes. Nothing in the running product claims to do more than the table above.
+
+One consequence of Phase 4 being done is worth stating where the phases are listed: the terminal is
+only as useful as what is inside it. The WSL Claude Code on the development host is installed but not
+signed in, so a terminal opened there shows Claude Code's own sign-in screen. That is a property of
+the host, not of this build — see Phase 3 — and Phase 4 is specified to leave authentication alone.
 
 ## Phase 0 — Foundation and documentation
 
@@ -95,7 +102,8 @@ What was built:
 - Reconciliation on startup: Case A rediscovered as `RUNNING`, Case B reported `STOPPED` and **not**
   auto-started, Case C recorded as an orphan and **left running**.
 - Runtime API: `GET`/`POST start`/`POST stop`/`DELETE` under `/api/projects/{id}/runtime`.
-- Off-by-default diagnostic endpoints under `/api/debug`, to be deleted in Phase 4.
+- Off-by-default diagnostic endpoints under `/api/debug`. **Deleted in Phase 4**, not gated: no flag,
+  no environment variable, no handler.
 - Frontend: Start/Stop runtime controls and an honest "Terminal UI coming in Phase 4".
 
 Not built, deliberately: Claude Code launch, any WebSocket, any real terminal view, controller/viewer
@@ -213,6 +221,15 @@ to hide it. It is the single reason this phase is Partial rather than Done.
 
 ## Phase 4 — Web terminal
 
+Status: **done**. See `docs/TERMINAL.md` for the protocol, the snapshot boundary, the limits and the
+known fidelity limits.
+
+Goal:
+
+Show a project's real terminal in a browser and let a person work in it — the same bytes a terminal
+emulator would get, the same keystrokes a keyboard would send — without the browser becoming a second
+path to the terminal or a second owner of it.
+
 Deliver:
 
 - xterm.js;
@@ -222,6 +239,39 @@ Deliver:
 - Prompt Bar;
 - reconnect snapshot;
 - touch terminal keys.
+
+What was built:
+
+- **`internal/terminal`** — the transport. One WebSocket per browser, subscriptions multiplexed on
+  it, output in binary frames and control in JSON. It subscribes to the runtime manager and has no
+  tmux socket path of its own, so a browser connecting or disconnecting never touches the control
+  connection. Limits on message size, input size, subscription count and terminal geometry; a
+  documented set of error codes; and a logging rule that excludes terminal bytes in both directions.
+- **`GET /api/ws`** — the endpoint, with an Origin policy that refuses a page from another site and an
+  explicit protocol-version check that refuses a client that states a version this server does not
+  speak.
+- **Snapshots and the boundary** — a fresh screen for a client that has just connected or reconnected,
+  carrying the highest sequence number it already contains, so the client knows exactly where the live
+  stream resumes. Taken with a short settle so the boundary is usually exact; the ceiling on that
+  settle is documented as a duplicate risk rather than hidden.
+- **`web/src/terminal/`** and **`TerminalView`**, **`ProjectTerminal`**, **`PromptBar`** — the client:
+  xterm.js with the Unicode 11 width tables, raw input over one channel shared with the Prompt Bar,
+  debounced resize, a local scroll model with a "new output" affordance rather than a viewport that is
+  yanked to the bottom, reconnection, and a button that asks the server for the screen again.
+- **Touch keys** — escape, tab, Ctrl+C and the four arrows, shown only where the pointer is coarse,
+  each sending exactly the bytes the real key sends. A soft keyboard no longer resizes the pty.
+- **The debug endpoints were deleted**, not gated — see `docs/API.md`.
+- **Layout widths corrected for a tablet**: three panels now need a desktop's width, so an iPad in
+  portrait gets the terminal full width (~100 columns) instead of a 470-pixel panel, and in landscape
+  it gets a project panel and the manager side by side (~107 columns).
+
+Verification: unit and integration tests in both languages, plus four browser suites driven by
+Playwright against a real server, a real tmux session and a real xterm.js — protocol and backpressure
+over a raw socket, the interface itself, snapshot recovery and the tablet, and the theme.
+
+Outstanding: nothing in the phase. The limit worth repeating is that a snapshot is the pane as tmux
+reports it, so a full-screen program that keeps state it never repaints is restored to what it looks
+like rather than to what it knows. `docs/TERMINAL.md` §6 lists exactly what survives.
 
 ## Phase 5 — Multi-project grid
 

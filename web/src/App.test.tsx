@@ -11,6 +11,21 @@ import {
   makeTerminalReadyServerInfo,
 } from './test/fixtures'
 
+// Two boundaries are replaced for this suite, and both are ones App does not
+// implement: xterm's renderer, which cannot run in jsdom and whose fidelity is
+// settled in a real browser, and the socket, which a test asserting on page
+// routing has no reason to open. Everything in between - the subscription, the
+// sequence rules, the frames - is exercised by its own suite.
+vi.mock('./components/TerminalView', async () => {
+  const double = await import('./test/terminal')
+  return { TerminalView: double.FakeTerminalView }
+})
+
+vi.mock('./terminal/client', async () => {
+  const double = await import('./test/terminal')
+  return { createTerminalClient: () => double.makeClient().client }
+})
+
 interface Route {
   status?: number
   body: unknown

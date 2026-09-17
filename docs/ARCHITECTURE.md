@@ -5,7 +5,7 @@
 ```text
 iPad / Phone / PC
         │
-        │ HTTPS + WebSocket      (WebSocket is Phase 4; this build is REST only)
+        │ HTTPS + WebSocket
         ▼
 ┌─────────────────────────────┐
 │       AgentMux Server       │   runs inside WSL on Windows (see §7)
@@ -13,6 +13,7 @@ iPad / Phone / PC
 │ Project Manager             │   internal/project        — built
 │ Session Manager             │   internal/session        — built in Phase 2
 │ Terminal Manager            │   part of session.Manager — sequence, history
+│ Terminal Transport          │   internal/terminal       — built in Phase 4
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Controller Manager          │   Phase 6, not stubbed
@@ -95,8 +96,10 @@ It holds every policy decision — what a session is called, where it runs, how 
 written down, how a project's status is derived — and the HTTP layer calls it rather than the backend.
 Reconciliation on startup is here too.
 
-Not yet owned here: controller leases, viewer lists, and scroll positions. Those are properties of
-live connections and belong to Phase 4's WebSocket layer.
+Not yet owned here: controller leases and viewer lists. Those are properties of live connections and
+are Phase 6. Phase 4 put a browser on the other end of the manager's subscriptions without giving it
+either — every subscription is equal and any of them may type — and it settled the third item on that
+list, scroll position, by deciding the server does not own it at all.
 
 ### SessionBackend
 
@@ -301,16 +304,25 @@ pty inside tmux
 → tmux control mode ("tmux -C", %output records)
 → controlStream decoder (bytes, not text)
 → session.Manager: sequence, bounded history, subscriptions
-→ (Phase 4: WebSocket)
-→ (Phase 4: xterm.js)
+→ terminal.Hub: frames, limits, one socket per browser
+→ xterm.js
 ```
 
-Clients never attach directly to tmux, and — from Phase 4 — never touch a tmux socket at all.
+Clients never attach directly to tmux, and never touch a tmux socket at all. The last two stages are
+Phase 4 and are described in `docs/TERMINAL.md`; the three above them are Phase 2 and are described in
+`docs/RUNTIME.md`.
 
-Phase 2 implements the first three stages and stops there. There is no WebSocket and no xterm.js.
+The direction is the load-bearing part. `terminal.Hub` may only *subscribe* to the runtime manager —
+it has no tmux socket path, no session name, and no way to acquire either. A transport that opened its
+own `tmux -C` connection would be a second path to the same terminal, and two paths to one terminal is
+how a server ends up with a control connection per browser tab, a pane that resizes when somebody
+closes a window, and output that arrives twice or not at all depending on which connection won. There
+is one control connection per runtime, it belongs to the manager, and a browser is one of its readers.
+
 The reason output is taken from tmux's control mode rather than from `capture-pane` on a timer is
 recorded in `docs/RUNTIME.md` §2: polling cannot see scrollback or anything between ticks, and it
 re-encodes the screen as text, losing the difference between a carriage return and a newline.
+`capture-pane` is still used, but for the opposite job — a snapshot to recover with, not a stream.
 
 ## 10. Terminal state
 
@@ -331,7 +343,8 @@ Implemented in Phase 2.
 
 Not implemented, and not stubbed: `controllerId`, `controllerLease`, `connectedViewers`. A viewer
 subscription exists as `Backend.Attach` — several may be open at once and each receives the same
-bytes — but there is no roster, no lease, and no notion of who may type. That is Phase 6.
+bytes — and Phase 4 gave that a front end without giving it a roster. There is still no lease and no
+notion of who may type. That is Phase 6.
 
 Client-local:
 
@@ -343,34 +356,47 @@ followOutput
 grid/focus/fullscreen
 ```
 
-All Phase 4 or later, and all held by the client, not the server.
+`scroll position` and `followOutput` are Phase 4 and are held by the client, not the server — there is
+no message that could carry a scroll position, and a server that knew one client's would have to pick
+it over another's. `font size` and `zoom` are not implemented; the terminal fits its container rather
+than being sized by hand. `grid/focus/fullscreen` is Phase 5.
 
 ## 11. WebSocket model
 
-Prefer one main WebSocket per browser.
+One main WebSocket per browser, implemented as `GET /api/ws`. Subscriptions are multiplexed on it and
+the frames carry the project they belong to, so watching a second project does not mean a second
+connection and a second set of failure modes.
 
-Logical message categories:
+Message categories as built:
 
 ```text
-terminal.output
-terminal.input
-terminal.resize
-project.status
-controller.acquire
-controller.release
-controller.changed
-server.status
-provider.changed
+binary:  terminal output (frame type 0x01)
+         terminal snapshot (frame type 0x02)
+text:    hello, unsubscribed, resized, error, pong
+         subscribe, unsubscribe, input, resize, resync, ping
 ```
 
-Batch high-volume output.
+High-volume output is batched in the runtime manager, which is the layer that knows how much is
+waiting; the transport frames what it is given rather than coalescing it again.
 
-**Not implemented yet; this is Phase 4.** No WebSocket endpoint exists and nothing streams to a
-browser. What the phases so far provide is the data model that makes it possible: every output chunk
-carries a monotonic `sequence` per runtime, and a bounded history is kept, so a reconnecting client can
-be given what it missed rather than a redraw of the current screen. Introducing the sequence after the
-fact is much harder than starting with it — and Phase 3 made the thing behind it worth streaming, by
-putting a real Claude Code session inside the runtime.
+The split between binary and text is the decision that shapes this section. Terminal output is bytes,
+and a JSON envelope around a screenful of escape sequences would mean base64, a third more bytes, and
+an encoding step on the hot path. Control is the opposite — rare, small, and worth being readable in a
+log or in a browser's frame list. So output travels in binary frames whose header carries the project
+and the range of sequence numbers it contains, and everything else is a JSON object with a `type`.
+
+`project.status` and `server.status` are not implemented, and the reason is the same for both: the UI
+already learns project state from `GET /api/projects`, and there was no second consumer to justify a
+push. `controller.changed` is Phase 6 and `provider.changed` is Phase 8.
+
+A client never sends a binary frame. Raw input is bytes, but it is bytes the client is sending rather
+than bytes a terminal is producing, and routing it through the same typed, size-limited, individually
+rejectable channel as every other client intent is worth the base64.
+
+The data model that makes all of this possible was already there from Phase 2 — a monotonic sequence
+per runtime and a bounded history — and introducing the sequence after the fact would have been much
+harder than starting with it. Phase 3 made the thing behind it worth streaming, by putting a real
+Claude Code session inside the runtime. The full protocol is in `docs/TERMINAL.md`.
 
 ## 12. Reconnection
 
@@ -383,13 +409,23 @@ client reconnects
 → resumes live output
 ```
 
-**The stronger version of this is already true in Phase 2, one level down.** The AgentMux server
-itself can stop and restart without affecting a session: tmux owns the PTYs, and it is a separate
-process. On startup the server reconciles what it has recorded against what the backend actually has
-and answers Case A/B/C accordingly — see §13 and `docs/RUNTIME.md` §6. A project whose session
-survived is reported `RUNNING` again, without the user's work having been interrupted.
+Implemented in Phase 4, with a snapshot rather than a replay. A reconnecting client is sent the
+current screen and told the highest sequence number that screen already contains, and it applies
+everything above that. Replay sounds cheaper, but it is only correct if the client's screen is exactly
+what the server thinks it is — and the reason a client needs recovery is that it is not sure. A
+snapshot cannot be wrong about what the client is showing, because it replaces it.
 
-The browser-facing half of this flow — subscribe, snapshot, resume — is Phase 4.
+The same path serves a client that asks to be re-established while connected — a person pressing
+"Redraw" — so there is one recovery implementation rather than two. And the server takes it
+unprompted when a subscription falls behind, which is why a browser cannot normally observe a
+sequence gap at all: the seam is closed before it is visible.
+
+**The stronger version of this is also true one level down, and it predates Phase 4.** The AgentMux
+server itself can stop and restart without affecting a session: tmux owns the PTYs, and it is a
+separate process. On startup the server reconciles what it has recorded against what the backend
+actually has and answers Case A/B/C accordingly — see §13 and `docs/RUNTIME.md` §6. A project whose
+session survived is reported `RUNNING` again, without the user's work having been interrupted, and a
+browser that reconnects afterwards finds the terminal where it was left.
 
 ## 13. Persistence
 
@@ -417,12 +453,32 @@ liveness is asked of the runtime, which is the only thing that knows. The full l
 and what is deliberately not is the header of `migrations/0002_project_runtime.sql` and
 `docs/RUNTIME.md` §6.
 
-Migrations are embedded SQL files applied in order and recorded by name, so a future schema change
-is a new numbered file rather than an edit to an applied one.
+Phase 4 added a live terminal and did not add a table. A snapshot is taken from tmux when it is asked
+for and is not written down; the browser keeps the screen in memory and nothing else, so nothing about
+a terminal reaches `localStorage` or the database. That is the same rule as before, applied to a
+feature that would have made it easy to break.
+
+Migrations are embedded SQL files applied in order and recorded by name, so a future schema change is
+a new numbered file rather than an edit to an applied one.
 
 ## 14. Security
 
 Do not expose provider secrets.
+
+**Terminal input is not a command channel.** There is no message in the WebSocket protocol that runs a
+command: a browser may send raw keystrokes to a terminal it has already subscribed to, and those bytes
+go to whatever is already running in the pane, exactly as typing would. Nothing accepts a filesystem
+path from a client either — a subscribe names a `projectId`, which the server resolves against the
+projects it already knows.
+
+**A page from another origin cannot open a terminal.** The WebSocket handshake is checked against the
+request's own host and against `server.allowedOrigins`; a missing `Origin` is allowed because browsers
+always send one, so a request without one is a program rather than a page. This is the check that stops
+a site the user is visiting from connecting to a local AgentMux server.
+
+**Nothing sensitive is logged.** Terminal output, raw input, and the contents of a Prompt Bar prompt are
+never written to the log at any level, in either direction. The permitted fields are listed in
+`docs/TERMINAL.md` §13.
 
 Recommended early deployment:
 
@@ -430,3 +486,7 @@ Recommended early deployment:
 Tailscale/private network
 → AgentMux
 ```
+
+The terminal endpoint has no authentication of its own — it is as reachable as the server is — so the
+network boundary above is what keeps it private, and that is a deployment decision rather than
+something this layer decides.

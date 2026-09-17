@@ -18,6 +18,11 @@ const (
 	CodeNotFound       = "not_found"
 	CodeInternal       = "internal_error"
 	CodeInvalidRequest = "invalid_request"
+
+	// CodeForbidden means the request came from somewhere this server will not
+	// serve. It is used by the WebSocket upgrade, where the caller is a browser
+	// page on another origin rather than a client that got a detail wrong.
+	CodeForbidden = "forbidden"
 )
 
 // APIError is the body of a failing response.

@@ -56,6 +56,20 @@ const (
 	// makes a reattached client able to show what it missed.
 	DefaultTmuxHistoryLimit = 50000
 
+	// DefaultSnapshotHistory is how many lines above the visible pane a
+	// snapshot carries.
+	//
+	// It is what makes a freshly connected terminal scrollable rather than a
+	// single screenful: everything the agent said before this client arrived
+	// is in tmux's scrollback and nowhere else - the runtime's own buffer is
+	// bounded and belongs to the live stream, not to the screen.
+	//
+	// It is deliberately much smaller than DefaultTmuxHistoryLimit. A snapshot
+	// is sent once per connection and re-sent on every resync, so its size is
+	// a reconnect cost, and two hundred lines is already more than a person
+	// scrolls back through on a tablet. Zero means the visible pane only.
+	DefaultSnapshotHistory = 200
+
 	// tmuxMinVersion is the oldest tmux AgentMux supports.
 	//
 	// It is a real floor rather than caution: the runtime resizes with
@@ -94,6 +108,11 @@ type TmuxOptions struct {
 
 	// HistoryLimit is the per-pane scrollback tmux keeps.
 	HistoryLimit int
+
+	// SnapshotHistory is how many lines above the visible pane a Snapshot
+	// carries. Zero means the defaults above; a negative value means the
+	// visible pane only.
+	SnapshotHistory int
 
 	// Prefix is the session-name namespace this backend owns. Sessions named
 	// otherwise are ignored by List and never destroyed.
@@ -192,11 +211,12 @@ type TmuxStatus struct {
 // one short-lived process per command, which interactive typing does not
 // notice and which buys a much simpler correctness story.
 type TmuxBackend struct {
-	install      *tmuxInstall
-	socketPath   string
-	config       string
-	terminal     string
-	historyLimit int
+	install         *tmuxInstall
+	socketPath      string
+	config          string
+	terminal        string
+	historyLimit    int
+	snapshotHistory int
 
 	// prefix is the namespace AgentMux owns. It comes from project.SessionPrefix
 	// rather than a literal here, so that the name a session is created with
@@ -223,17 +243,24 @@ func NewTmuxBackend(o TmuxOptions) *TmuxBackend {
 		install = &tmuxInstall{bin: orDefault(o.Binary, DefaultTmuxBinary)}
 	}
 	b := &TmuxBackend{
-		install:      install,
-		socketPath:   strings.TrimSpace(o.SocketPath),
-		config:       orDefault(o.Config, DefaultTmuxConfig),
-		terminal:     orDefault(o.Terminal, DefaultTmuxTerminal),
-		historyLimit: o.HistoryLimit,
-		prefix:       orDefault(o.Prefix, project.SessionPrefix),
-		log:          o.Logger,
-		subs:         make(map[*tmuxSubscription]struct{}),
+		install:         install,
+		socketPath:      strings.TrimSpace(o.SocketPath),
+		config:          orDefault(o.Config, DefaultTmuxConfig),
+		terminal:        orDefault(o.Terminal, DefaultTmuxTerminal),
+		historyLimit:    o.HistoryLimit,
+		snapshotHistory: o.SnapshotHistory,
+		prefix:          orDefault(o.Prefix, project.SessionPrefix),
+		log:             o.Logger,
+		subs:            make(map[*tmuxSubscription]struct{}),
 	}
 	if b.historyLimit <= 0 {
 		b.historyLimit = DefaultTmuxHistoryLimit
+	}
+	// Zero means "unset" and a negative value means "none", which are different
+	// answers: the first is a caller that did not say, the second is one that
+	// did.
+	if b.snapshotHistory == 0 {
+		b.snapshotHistory = DefaultSnapshotHistory
 	}
 	if b.log == nil {
 		b.log = slog.New(slog.DiscardHandler)
@@ -923,24 +950,121 @@ func (b *TmuxBackend) Destroy(ctx context.Context, name string) error {
 	return nil
 }
 
+// paneScreenFormat is the list-panes format that describes a screen.
+//
+// It is read in one call so the four facts cannot disagree with each other: a
+// cursor read separately from the geometry could be a cursor position in a
+// pane that has since been resized.
+const paneScreenFormat = "#{cursor_x}" + sessionFieldSeparator +
+	"#{cursor_y}" + sessionFieldSeparator +
+	"#{pane_width}" + sessionFieldSeparator +
+	"#{pane_height}" + sessionFieldSeparator +
+	"#{alternate_on}"
+
 // Snapshot implements Backend.
 //
 // capture-pane is used here and only here. It answers "what is on the screen
 // right now", which is exactly the question a client that has just connected
 // needs answered once. It is not how live output is obtained - that is what
 // control mode is for - because a snapshot cannot see between two calls.
-func (b *TmuxBackend) Snapshot(ctx context.Context, name string) ([]byte, error) {
+//
+// # The flags, and why each one
+//
+//	-p   print to stdout instead of writing to a buffer
+//	-e   include escape sequences, so colours and attributes survive
+//	-N   preserve trailing spaces, so a coloured region reaches the edge of
+//	     the pane instead of stopping at the last character on the line
+//	-S   start this many lines above the visible pane, so the client receives
+//	     the recent scrollback it could not otherwise get
+//
+// -J is deliberately absent. It joins wrapped lines, which is the opposite of
+// what a terminal needs: a row that wrapped is two rows on the screen, and
+// joining them would produce one line that no longer fits the pane it came
+// from.
+//
+// The result is not written to a client unchanged - rowsToCRLF explains why -
+// and it is not the whole of a terminal's state. What it does not carry is
+// listed in docs/TERMINAL.md.
+func (b *TmuxBackend) Snapshot(ctx context.Context, name string) (Screen, error) {
 	if !b.sessionExists(ctx, name) {
-		return nil, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
+		return Screen{}, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
 	}
-	out, err := b.run(ctx, "capture-pane", "-p", "-e", "-t", name)
+
+	// The geometry and the cursor are read first so that they describe a pane
+	// at or before the moment the content was captured. A cursor read after
+	// the content could belong to a screen the content does not show.
+	described, err := b.run(ctx, "list-panes", "-t", name, "-F", paneScreenFormat)
 	if err != nil {
-		return nil, wrapError(err, CodeBackendFailure, "could not capture session %q", name)
+		if isMissingTarget(described) {
+			return Screen{}, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
+		}
+		return Screen{}, wrapError(err, CodeBackendFailure,
+			"could not read the screen geometry of session %q", name)
 	}
-	// The bytes are returned exactly as tmux produced them, escape sequences
-	// included. Any tidying here would be the lossy step this whole design
-	// exists to avoid.
-	return []byte(out), nil
+	cols, rows, cursorX, cursorY, alt, err := parsePaneScreen(firstLine(described))
+	if err != nil {
+		return Screen{}, err
+	}
+
+	args := []string{"capture-pane", "-p", "-e", "-N", "-t", name}
+	if b.snapshotHistory > 0 {
+		args = append(args, "-S", "-"+strconv.Itoa(b.snapshotHistory))
+	}
+	captured, err := b.run(ctx, args...)
+	if err != nil {
+		if isMissingTarget(captured) {
+			return Screen{}, fmt.Errorf("%w: %s", ErrNoSuchSession, name)
+		}
+		return Screen{}, wrapError(err, CodeBackendFailure, "could not capture session %q", name)
+	}
+
+	return Screen{
+		Data:      rowsToCRLF([]byte(captured)),
+		Cols:      cols,
+		Rows:      rows,
+		CursorX:   cursorX,
+		CursorY:   cursorY,
+		Alternate: alt,
+	}, nil
+}
+
+// parsePaneScreen decodes the paneScreenFormat line.
+//
+// Every field is parsed rather than assumed. A tmux that answers a format
+// question with something unexpected is a tmux whose screen should not be
+// drawn from a guess, and the error names the line it could not read.
+func parsePaneScreen(line string) (cols, rows, cursorX, cursorY int, alternate bool, err error) {
+	parts := strings.Split(line, sessionFieldSeparator)
+	if len(parts) != 5 {
+		return 0, 0, 0, 0, false, newError(CodeBackendFailure,
+			"unexpected pane screen description: %q", line)
+	}
+	numbers := make([]int, 4)
+	for i, field := range []string{parts[0], parts[1], parts[2], parts[3]} {
+		value, convErr := strconv.Atoi(strings.TrimSpace(field))
+		if convErr != nil {
+			return 0, 0, 0, 0, false, newError(CodeBackendFailure,
+				"unexpected value %q in pane screen description %q", field, line)
+		}
+		numbers[i] = value
+	}
+	cursorX, cursorY, cols, rows = numbers[0], numbers[1], numbers[2], numbers[3]
+	alternate = strings.TrimSpace(parts[4]) == "1"
+
+	if cols <= 0 || rows <= 0 {
+		return 0, 0, 0, 0, false, newError(CodeBackendFailure,
+			"pane screen description reports a %dx%d pane: %q", cols, rows, line)
+	}
+	// A cursor outside the pane would place the client's cursor off-screen.
+	// Clamping is not the same as correcting: tmux reports the cursor of the
+	// visible pane, and a value outside it means the two calls disagreed about
+	// which pane they were describing.
+	if cursorX < 0 || cursorX >= cols || cursorY < 0 || cursorY >= rows {
+		return 0, 0, 0, 0, false, newError(CodeBackendFailure,
+			"pane screen description places the cursor at %d,%d in a %dx%d pane: %q",
+			cursorX, cursorY, cols, rows, line)
+	}
+	return cols, rows, cursorX, cursorY, alternate, nil
 }
 
 // PaneProcess implements ProcessInspector.

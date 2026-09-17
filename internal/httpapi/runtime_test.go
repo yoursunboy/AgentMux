@@ -3,7 +3,6 @@ package httpapi
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,10 +13,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
+	"github.com/kutonlagos/agentmux/internal/terminal"
 )
 
 // This file holds the runtime half of the API tests, plus the two test doubles
@@ -354,13 +356,27 @@ func (b *fakeBackend) KillServer(context.Context) error {
 	return nil
 }
 
-func (b *fakeBackend) Snapshot(_ context.Context, name string) ([]byte, error) {
+// Snapshot returns the pane the terminal is showing.
+//
+// It answers with a Screen rather than with bytes because that is what a client
+// draws from: the geometry, the buffer and the cursor are part of the answer,
+// and a double that returned only text would let a handler drop all three and
+// still pass. The text carries escape sequences for the same reason - a
+// snapshot with its colour stripped is a different terminal from the one the
+// user is looking at.
+func (b *fakeBackend) Snapshot(_ context.Context, name string) (session.Screen, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if _, ok := b.sessions[name]; !ok {
-		return nil, session.ErrNoSuchSession
+	found, ok := b.sessions[name]
+	if !ok {
+		return session.Screen{}, session.ErrNoSuchSession
 	}
-	return []byte("\x1b[32mfake pane\x1b[0m"), nil
+	return session.Screen{
+		Data:    []byte("\x1b[32mfake pane\x1b[0m"),
+		Cols:    found.Cols,
+		Rows:    found.Rows,
+		CursorY: found.Rows - 1,
+	}, nil
 }
 
 func (b *fakeBackend) Attach(_ context.Context, name string) (session.Subscription, error) {
@@ -544,18 +560,6 @@ func (h *harness) waitForSequence(t *testing.T, projectID string, want uint64) {
 		time.Sleep(2 * time.Millisecond)
 	}
 	t.Fatalf("the runtime never reached sequence %d", want)
-}
-
-// decodeChunks reads a debug output body, concatenating the chunk payloads so
-// a test compares terminal bytes rather than their base64 encoding.
-func decodeChunks(t *testing.T, recorder *httptest.ResponseRecorder) []byte {
-	t.Helper()
-	body := decode[debugOutputResponse](t, recorder)
-	var out bytes.Buffer
-	for _, chunk := range body.Chunks {
-		out.Write(chunk.Data)
-	}
-	return out.Bytes()
 }
 
 // projectRuntimePath returns the path a project's session must run in.
@@ -876,293 +880,714 @@ func TestRuntimeEndpointsReportAMissingProject(t *testing.T) {
 	}
 }
 
-// TestRuntimeResizeRejectsAnImpossibleSize checks the boundary between a bad
-// request and a conflict with the current state. A size of zero is the
-// client's mistake; resizing a stopped runtime is not.
-func TestRuntimeResizeRejectsAnImpossibleSize(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-
-	recorder := h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/resize", `{"cols":0,"rows":0}`)
-	h.wantError(t, recorder, http.StatusBadRequest, session.CodeInvalidSize)
-
-	// Nothing is running, so a well-formed size is a conflict rather than a
-	// bad request.
-	recorder = h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/resize", `{"cols":100,"rows":30}`)
-	h.wantError(t, recorder, http.StatusConflict, session.CodeNotRunning)
-}
-
-// TestRuntimeResizeIsKeptAndApplied checks that the resize reaches the backend
-// and comes back as the runtime's canonical size.
-func TestRuntimeResizeIsKeptAndApplied(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-	h.startRuntime(t, id)
-
-	resized := decode[runtimeResponse](t, h.call(http.MethodPost,
-		"/api/debug/projects/"+id+"/runtime/resize", `{"cols":100,"rows":30}`)).Runtime
-	if resized.Cols != 100 || resized.Rows != 30 {
-		t.Errorf("size = %dx%d, want 100x30", resized.Cols, resized.Rows)
-	}
-
-	cols, rows, ok := h.backend.sizeOf(project.SessionNameFor(id))
-	if !ok || cols != 100 || rows != 30 {
-		t.Errorf("the backend was asked for %dx%d (set=%v), want 100x30", cols, rows, ok)
-	}
-}
-
 // ---------------------------------------------------------------------------
-// Input
+// The terminal socket
 // ---------------------------------------------------------------------------
 
-// TestRuntimeInputCarriesEveryByteKind is the input half of the byte contract.
+// The tests below are the HTTP half of the Web Terminal: that the endpoint
+// exists, that it refuses what it must refuse, and that a browser which speaks
+// the protocol really gets a terminal out of it.
 //
-// The cases are the ones a terminal actually receives and that a naive
-// implementation loses: multi-byte UTF-8, a control character, an escape
-// sequence, and a carriage return. The runtime has no concept of a prompt, so
-// none of these may be filtered, translated, or refused.
-func TestRuntimeInputCarriesEveryByteKind(t *testing.T) {
-	cases := []struct {
-		name string
-		body string
-		want []byte
-	}{
-		{
-			name: "ascii",
-			body: `{"text":"ls -la","enter":true}`,
-			want: []byte("ls -la\r"),
-		},
-		{
-			name: "chinese",
-			body: `{"text":"echo 中文测试","enter":true}`,
-			want: []byte("echo 中文测试\r"),
-		},
-		{
-			name: "control character",
-			// Ctrl-C: the byte that interrupts whatever is running.
-			body: `{"bytes":"` + base64.StdEncoding.EncodeToString([]byte{0x03}) + `"}`,
-			want: []byte{0x03},
-		},
-		{
-			name: "arrow key",
-			// Up, as a terminal actually sends it.
-			body: `{"bytes":"` + base64.StdEncoding.EncodeToString([]byte("\x1b[A")) + `"}`,
-			want: []byte("\x1b[A"),
-		},
-		{
-			name: "bytes then enter",
-			body: `{"bytes":"` + base64.StdEncoding.EncodeToString([]byte("echo hi")) + `","enter":true}`,
-			want: []byte("echo hi\r"),
-		},
-		{
-			name: "a byte that is not valid UTF-8",
-			// A lone 0xff cannot appear in a JSON string, so this is the case
-			// that a text-only input channel would have to refuse.
-			body: `{"bytes":"` + base64.StdEncoding.EncodeToString([]byte{0xff, 0xfe}) + `"}`,
-			want: []byte{0xff, 0xfe},
-		},
+// They go over a real listener and a real WebSocket handshake, because the part
+// of a WebSocket server that a ResponseRecorder cannot test is exactly the part
+// that goes wrong. The handshake hijacks the connection and everything after it
+// is framed bytes rather than HTTP, so a test that used ServeHTTP with a
+// recorder would check the routing and nothing else.
+//
+// The protocol's own edges - sequence gaps, re-synchronisation, a client that
+// stops reading, the message limits - are tested in internal/terminal against a
+// fake runtime, where they can be provoked deterministically and where the
+// failure is read from the frames rather than inferred. What is here is the
+// wiring: route to hub to manager to backend, and back.
+
+// socketReadWait bounds a test's wait for something the server should send.
+//
+// It is generous because it bounds a failure rather than a success: a passing
+// read returns as soon as the bytes arrive, and the only thing this deadline
+// decides is how long a test sits there before reporting that nothing came.
+const socketReadWait = 5 * time.Second
+
+// terminalHello is the greeting a connection begins with.
+//
+// It is decoded into a struct of this package's own rather than into the
+// terminal package's, which is deliberate: a test that decoded the server's
+// greeting with the server's own type would pass even if the field names on the
+// wire were wrong, and the wire is what a browser has to agree with.
+type terminalHello struct {
+	Type     string `json:"type"`
+	Protocol int    `json:"protocol"`
+	ClientID string `json:"clientId"`
+	Server   string `json:"server"`
+	Version  string `json:"version"`
+}
+
+// terminalConn is a test client for the one terminal socket.
+//
+// It reads messages rather than asserting on them, so a test can say which one
+// it is waiting for and let the rest pass. A client that instead asserted "the
+// next thing is the snapshot" would be asserting an ordering the protocol does
+// not promise: output produced while the snapshot is being taken is allowed to
+// arrive around it, and a test that forbade that would fail on a busy machine.
+type terminalConn struct {
+	t    *testing.T
+	conn *websocket.Conn
+}
+
+// dialTerminal opens the terminal socket against this harness's server.
+//
+// The rest of the suite drives handlers through ServeHTTP with a recorder,
+// which is the cheapest way to test an HTTP API. A WebSocket cannot be tested
+// that way - the handshake hijacks the connection, and hijacking is exactly
+// what a ResponseRecorder is not - so this opens a real listener on a loopback
+// port and speaks the real protocol over it.
+func (h *harness) dialTerminal(t *testing.T, headers http.Header) *terminalConn {
+	t.Helper()
+
+	srv := httptest.NewServer(h.server.Handler())
+	socketURL := "ws" + strings.TrimPrefix(srv.URL, "http") + terminal.Endpoint
+
+	conn, resp, err := websocket.DefaultDialer.Dial(socketURL, headers)
+	if err != nil {
+		srv.Close()
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("dialing %s failed with status %d: %v", socketURL, status, err)
 	}
+	// One cleanup rather than two so that the order cannot be got wrong: the
+	// client has to go first, because httptest.Server.Close waits for the
+	// connections it is still serving and a hijacked socket is not one the
+	// client's own Close reaches from the other side.
+	t.Cleanup(func() {
+		_ = conn.Close()
+		srv.Close()
+	})
+	return &terminalConn{t: t, conn: conn}
+}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-			id, _ := h.registerProject(t, "app")
-			h.startRuntime(t, id)
+// socketURL is the address of this harness's terminal endpoint, for the tests
+// that dial it themselves.
+func (h *harness) socketURL(srv *httptest.Server) string {
+	return "ws" + strings.TrimPrefix(srv.URL, "http") + terminal.Endpoint
+}
 
-			recorder := h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/input", tc.body)
-			if recorder.Code != http.StatusOK {
-				t.Fatalf("status = %d, body was %s", recorder.Code, recorder.Body.String())
-			}
-
-			got := h.backend.receivedInput(project.SessionNameFor(id))
-			if !bytes.Equal(got, tc.want) {
-				t.Errorf("the backend received %q, want %q", got, tc.want)
-			}
-		})
+// send writes one client message.
+func (c *terminalConn) send(v any) {
+	c.t.Helper()
+	data, err := json.Marshal(v)
+	if err != nil {
+		c.t.Fatalf("could not encode a client message: %v", err)
+	}
+	_ = c.conn.SetWriteDeadline(time.Now().Add(socketReadWait))
+	if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		c.t.Fatalf("sending %s failed: %v", data, err)
 	}
 }
 
-// TestRuntimeInputRefusesAmbiguousText checks the one shape the input endpoint
-// will not guess at. Text and bytes are two fields rather than a sequence, so a
-// body carrying both has no defined order; picking one silently would send the
-// author of a failing test looking in the wrong place.
-func TestRuntimeInputRefusesAmbiguousText(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-	h.startRuntime(t, id)
-
-	body := `{"text":"echo hi","bytes":"` + base64.StdEncoding.EncodeToString([]byte{0x0d}) + `"}`
-	recorder := h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/input", body)
-	h.wantError(t, recorder, http.StatusBadRequest, CodeInvalidRequest)
-
-	if got := h.backend.receivedInput(project.SessionNameFor(id)); len(got) != 0 {
-		t.Errorf("a rejected input still reached the backend: %q", got)
-	}
+// nextControl waits for the next control message of the given type, letting
+// binary frames pass.
+func (c *terminalConn) nextControl(want string) []byte {
+	c.t.Helper()
+	return c.nextControlMatch(want, nil)
 }
 
-// TestRuntimeLaunchTypesACommandLine checks the second input path: a whole
-// command line typed into the shell, which is how work is started.
-func TestRuntimeLaunchTypesACommandLine(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-	h.startRuntime(t, id)
-
-	recorder := h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/input",
-		`{"keys":["printf 'hello\n'","sleep 5"]}`)
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, body was %s", recorder.Code, recorder.Body.String())
-	}
-
-	sessionName := project.SessionNameFor(id)
-	h.backend.mu.Lock()
-	launched := append([]string(nil), h.backend.launched[sessionName]...)
-	h.backend.mu.Unlock()
-
-	want := []string{"printf 'hello\n'", "sleep 5"}
-	if len(launched) != len(want) {
-		t.Fatalf("the backend was asked to run %q, want %q", launched, want)
-	}
-	for i := range want {
-		if launched[i] != want[i] {
-			t.Errorf("command %d = %q, want %q", i, launched[i], want[i])
+// nextControlMatch waits for the next control message of the given type that
+// also satisfies match, when one is given.
+//
+// It exists because a type is not always enough to identify the message a test
+// is waiting for: a client that resizes twice receives two acknowledgements of
+// the same type, and a test that read the first one would be asserting the
+// wrong size.
+func (c *terminalConn) nextControlMatch(want string, match func([]byte) bool) []byte {
+	c.t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(socketReadWait))
+	for {
+		kind, data, err := c.conn.ReadMessage()
+		if err != nil {
+			c.t.Fatalf("waiting for a %q message: %v", want, err)
+		}
+		if kind != websocket.TextMessage {
+			continue
+		}
+		var envelope struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			c.t.Fatalf("the server sent a text message that is not JSON: %q", data)
+		}
+		if envelope.Type == want && (match == nil || match(data)) {
+			return data
 		}
 	}
 }
 
-// TestRuntimeInputRequiresARunningRuntime keeps a client from believing input
-// was delivered to a terminal that is not there.
-func TestRuntimeInputRequiresARunningRuntime(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-
-	recorder := h.call(http.MethodPost, "/api/debug/projects/"+id+"/runtime/input", `{"text":"ls"}`)
-	h.wantError(t, recorder, http.StatusConflict, session.CodeNotRunning)
-}
-
-// ---------------------------------------------------------------------------
-// Output
-// ---------------------------------------------------------------------------
-
-// TestRuntimeOutputIsSequencedAndByteExact is §十四 and §十三 at the API
-// boundary: every chunk carries a gap-free sequence number, and the bytes
-// arrive as they were produced - escape sequences, non-ASCII text, and control
-// characters included.
-func TestRuntimeOutputIsSequencedAndByteExact(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-	h.startRuntime(t, id)
-
-	// Three chunks of the kinds a terminal really produces: a coloured line, a
-	// progress update that overwrites itself on one line, and Chinese text.
-	sessionName := project.SessionNameFor(id)
-	h.backend.deliver(t, sessionName, []byte("\x1b[32mok\x1b[0m\r\n"))
-	h.backend.deliver(t, sessionName, []byte("progress 10%\rprogress 20%\r"))
-	h.backend.deliver(t, sessionName, []byte("中文输出\n"))
-	h.waitForSequence(t, id, 3)
-
-	whole := decodeChunks(t, h.call(http.MethodGet, "/api/debug/projects/"+id+"/runtime/output", ""))
-	want := "\x1b[32mok\x1b[0m\r\nprogress 10%\rprogress 20%\r中文输出\n"
-	if string(whole) != want {
-		t.Errorf("the output pipeline changed the bytes:\n got %q\nwant %q", whole, want)
-	}
-
-	// The resume point returns exactly what came after it.
-	body := decode[debugOutputResponse](t,
-		h.call(http.MethodGet, "/api/debug/projects/"+id+"/runtime/output?since=2", ""))
-	if len(body.Chunks) != 1 {
-		t.Fatalf("?since=2 returned %d chunks, want 1 (sequences: %v)", len(body.Chunks), sequencesOf(body.Chunks))
-	}
-	if body.Chunks[0].Sequence != 3 {
-		t.Errorf("the chunk after sequence 2 is numbered %d, want 3", body.Chunks[0].Sequence)
-	}
-	if body.Sequence != 3 {
-		t.Errorf("the reported sequence is %d, want 3", body.Sequence)
-	}
-
-	// A malformed resume point is the client's mistake and is reported as one.
-	h.wantError(t,
-		h.call(http.MethodGet, "/api/debug/projects/"+id+"/runtime/output?since=-1", ""),
-		http.StatusBadRequest, CodeInvalidRequest)
-}
-
-// TestRuntimeSnapshotKeepsEscapeSequences checks the diagnostic that a future
-// client will draw before live output arrives. It is a redraw, not a stream,
-// but it must not be stripped on the way out either.
-func TestRuntimeSnapshotKeepsEscapeSequences(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
-	id, _ := h.registerProject(t, "app")
-	h.startRuntime(t, id)
-
-	body := decode[debugOutputResponse](t,
-		h.call(http.MethodGet, "/api/debug/projects/"+id+"/runtime/output?snapshot=1", ""))
-	if body.Session == nil {
-		t.Fatal("?snapshot=1 returned no session description")
-	}
-	if !bytes.Contains(body.Snapshot, []byte("\x1b[")) {
-		t.Errorf("the snapshot lost its escape sequences: %q", body.Snapshot)
+// nextFrame waits for the next binary frame of the given type, letting control
+// messages pass.
+//
+// It decodes with the protocol's own decoder rather than by hand, so the test
+// asserts on a frame's meaning rather than on its byte layout; that the layout
+// is what the documentation says is the internal/terminal frame tests' job.
+func (c *terminalConn) nextFrame(want uint8) terminal.Frame {
+	c.t.Helper()
+	_ = c.conn.SetReadDeadline(time.Now().Add(socketReadWait))
+	for {
+		kind, data, err := c.conn.ReadMessage()
+		if err != nil {
+			c.t.Fatalf("waiting for a binary frame of type %#x: %v", want, err)
+		}
+		if kind != websocket.BinaryMessage {
+			continue
+		}
+		frame, err := terminal.DecodeFrame(data)
+		if err != nil {
+			c.t.Fatalf("the server sent a frame a client cannot decode: %v", err)
+		}
+		if frame.Type == want {
+			return frame
+		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// The diagnostic surface
-// ---------------------------------------------------------------------------
+// hello reads and decodes the greeting.
+func (c *terminalConn) hello() terminalHello {
+	c.t.Helper()
+	var decoded terminalHello
+	if err := json.Unmarshal(c.nextControl(terminal.MsgHello), &decoded); err != nil {
+		c.t.Fatalf("the greeting did not decode: %v", err)
+	}
+	return decoded
+}
 
-// TestDebugEndpointsDoNotExistByDefault is §十九. The diagnostics exist so the
-// runtime can be exercised before there is a Web Terminal to exercise it with;
-// they are not a product API, and an ordinary installation must not have a
-// route that accepts raw terminal input.
-func TestDebugEndpointsDoNotExistByDefault(t *testing.T) {
+// subscribe asks for a project's terminal.
+func (c *terminalConn) subscribe(projectID string, cols, rows int) {
+	c.t.Helper()
+	c.send(map[string]any{
+		"type":      terminal.MsgSubscribe,
+		"projectId": projectID,
+		"cols":      cols,
+		"rows":      rows,
+	})
+}
+
+// close ends the connection, as closing a browser tab does.
+func (c *terminalConn) close() { _ = c.conn.Close() }
+
+// TestTheTerminalSocketGreetsAndIdentifiesItself checks the endpoint answers
+// with the protocol rather than with a route that happens to exist.
+//
+// A client that cannot tell what it is talking to has to guess, and a client
+// that guesses draws the wrong thing rather than refusing.
+func TestTheTerminalSocketGreetsAndIdentifiesItself(t *testing.T) {
 	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
-	id, _ := h.registerProject(t, "app")
 
-	for _, tc := range []struct {
-		method string
-		target string
-	}{
-		{http.MethodGet, "/api/debug/runtimes"},
-		{http.MethodPost, "/api/debug/reconcile"},
-		{http.MethodGet, "/api/debug/projects/" + id + "/runtime/output"},
-		{http.MethodPost, "/api/debug/projects/" + id + "/runtime/input"},
-		{http.MethodPost, "/api/debug/projects/" + id + "/runtime/resize"},
-	} {
-		t.Run(tc.method+" "+tc.target, func(t *testing.T) {
-			recorder := h.call(tc.method, tc.target, "")
-			h.wantError(t, recorder, http.StatusNotFound, CodeNotFound)
+	conn := h.dialTerminal(t, nil)
+	greeting := conn.hello()
+
+	if greeting.Protocol != terminal.ProtocolVersion {
+		t.Errorf("the server greeted with protocol %d, want %d",
+			greeting.Protocol, terminal.ProtocolVersion)
+	}
+	if greeting.ClientID == "" {
+		t.Error("the greeting carries no client id, so a browser cannot be identified in a log")
+	}
+	if greeting.Server == "" {
+		t.Error("the greeting does not say which server answered")
+	}
+}
+
+// TestTheTerminalSocketAnswersTheSubprotocolABrowserOffers is the handshake a
+// browser needs and a program does not.
+//
+// A browser that offers a subprotocol and is answered without one fails the
+// connection outright, so a client offering agentmux.terminal.v1 against a
+// server that does not list it does not open a socket at all. The second half
+// of the test is the half that is easy to lose while fixing the first: a client
+// that offers nothing must still be answered, which is every non-browser client
+// and every other test in this package.
+func TestTheTerminalSocketAnswersTheSubprotocolABrowserOffers(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+
+	t.Run("offered", func(t *testing.T) {
+		srv := httptest.NewServer(h.server.Handler())
+		defer srv.Close()
+
+		dialer := websocket.Dialer{Subprotocols: []string{terminal.Subprotocol}}
+		conn, resp, err := dialer.Dial(h.socketURL(srv), nil)
+		if err != nil {
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			t.Fatalf("dialing with the terminal subprotocol failed with status %d: %v", status, err)
+		}
+		defer conn.Close()
+
+		if got := conn.Subprotocol(); got != terminal.Subprotocol {
+			t.Errorf("negotiated subprotocol %q, want %q", got, terminal.Subprotocol)
+		}
+	})
+
+	t.Run("not offered", func(t *testing.T) {
+		conn := h.dialTerminal(t, nil)
+		if got := conn.conn.Subprotocol(); got != "" {
+			t.Errorf("negotiated subprotocol %q with a client that asked for none", got)
+		}
+	})
+}
+
+// TestTheTerminalSocketRefusesAProtocolItDoesNotSpeak is the other half of
+// versioning.
+//
+// An absent version is allowed - a client that has not stated one is told what
+// this server speaks - but a stated version that is wrong is a deliberate
+// question with a knowable answer, and the answer is not "guess". A stale tab
+// left open across a server upgrade has to be told it is stale rather than fed
+// bytes it will mis-draw.
+func TestTheTerminalSocketRefusesAProtocolItDoesNotSpeak(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+
+	for _, version := range []string{"0", "2", "99", "latest"} {
+		t.Run(version, func(t *testing.T) {
+			h.wantError(t,
+				h.call(http.MethodGet, terminal.Endpoint+"?"+terminal.ProtocolParam+"="+version, ""),
+				http.StatusBadRequest, CodeInvalidRequest)
 		})
 	}
 }
 
-// TestDebugRuntimesListsWhatTheBackendHas checks the diagnostic that answers
-// "what does the runtime actually hold", which is the question a user asks
-// after a restart surprises them.
-func TestDebugRuntimesListsWhatTheBackendHas(t *testing.T) {
-	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true, debugAPI: true})
+// TestTheTerminalSocketRefusesAForeignOrigin is §五十二.
+//
+// The check exists because a WebSocket is not subject to the same-origin policy
+// once a server has accepted it. Without it, any page in any browser on this
+// machine - and, on an installation reachable from a LAN, any page in any
+// browser on that LAN - could open a terminal on this project and type into it,
+// including into a Claude Code session that is mid-run.
+func TestTheTerminalSocketRefusesAForeignOrigin(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+
+	for _, origin := range []string{
+		"http://evil.example",
+		"https://evil.example",
+		// The shape the check could plausibly get wrong: a host that merely
+		// starts with this server's address.
+		"http://127.0.0.1.evil.example",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			h.wantError(t,
+				h.call(http.MethodGet, terminal.Endpoint, "", "Origin", origin),
+				http.StatusForbidden, CodeForbidden)
+		})
+	}
+}
+
+// TestTheTerminalSocketAcceptsItsOwnOrigin is the case the policy exists to
+// permit.
+//
+// A page served by this server may open a terminal on it, wherever the server
+// is reachable. That is what makes AgentMux usable from a tablet on a LAN
+// without configuring anything, and it is safe for the obvious reason: the page
+// came from here.
+func TestTheTerminalSocketAcceptsItsOwnOrigin(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+
+	srv := httptest.NewServer(h.server.Handler())
+	defer srv.Close()
+
+	origin := "http://" + strings.TrimPrefix(srv.URL, "http://")
+	conn, resp, err := websocket.DefaultDialer.Dial(
+		h.socketURL(srv), http.Header{"Origin": []string{origin}})
+	if err != nil {
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		t.Fatalf("a page served by this server was refused a terminal (status %d, origin %s): %v",
+			status, origin, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	_ = conn.SetReadDeadline(time.Now().Add(socketReadWait))
+	if _, _, err := conn.ReadMessage(); err != nil {
+		t.Fatalf("the connection was accepted but says nothing: %v", err)
+	}
+}
+
+// TestTheTerminalSocketOnlyServesRegisteredProjects is §五十.
+//
+// A client names a project; it never names a path, a session, or a command.
+// The identifier is resolved against what this server has registered, so a
+// socket cannot reach a terminal the server was not told about, and there is no
+// message in the protocol that would let it try.
+func TestTheTerminalSocketOnlyServesRegisteredProjects(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
 	id, _ := h.registerProject(t, "app")
 	h.startRuntime(t, id)
 
-	body := decode[debugRuntimesResponse](t, h.call(http.MethodGet, "/api/debug/runtimes", ""))
-	if body.Backend != "fake" {
-		t.Errorf("backend = %q, want the backend in use", body.Backend)
+	conn := h.dialTerminal(t, nil)
+	conn.hello()
+
+	for _, tc := range []struct {
+		name      string
+		projectID string
+		code      string
+	}{
+		{
+			// A well-formed identifier for a project this server does not have.
+			// It is refused by the project lookup rather than by the syntax
+			// check, which is why it carries the project code.
+			name:      "a project that is not registered",
+			projectID: "p_00000000000000000000",
+			code:      session.CodeProjectNotFound,
+		},
+		{
+			// A path, dressed as an identifier. This is the case the syntax
+			// check exists for, and it is checked before anything is resolved.
+			name:      "a filesystem path",
+			projectID: "../../etc",
+			code:      terminal.CodeBadProject,
+		},
+		{
+			// The session name rather than the project id: the two are related
+			// by a prefix, and a client that confused them would otherwise reach
+			// a terminal by the wrong name.
+			name:      "a session name",
+			projectID: project.SessionNameFor(id),
+			code:      terminal.CodeBadProject,
+		},
+		{
+			name:      "an empty identifier",
+			projectID: "",
+			code:      terminal.CodeBadProject,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn.subscribe(tc.projectID, 0, 0)
+
+			var refusal struct {
+				Type      string `json:"type"`
+				Code      string `json:"code"`
+				Message   string `json:"message"`
+				ProjectID string `json:"projectId"`
+			}
+			if err := json.Unmarshal(conn.nextControl(terminal.MsgError), &refusal); err != nil {
+				t.Fatalf("the refusal did not decode: %v", err)
+			}
+			if refusal.Code != tc.code {
+				t.Errorf("subscribing to %q was refused with %q (%s), want %q",
+					tc.projectID, refusal.Code, refusal.Message, tc.code)
+			}
+			if refusal.Message == "" {
+				t.Error("the refusal does not say what was wrong")
+			}
+		})
 	}
-	if len(body.Sessions) != 1 || body.Sessions[0].Name != project.SessionNameFor(id) {
-		t.Errorf("sessions = %v, want the one session for %s", sessionNamesOf(body.Sessions), id)
+
+	// Nothing was subscribed, so the connection still holds nothing - and the
+	// registered project it could have subscribed to is still available, which
+	// is what says the refusals did not consume anything.
+	if got := h.server.terminal.Stats().Subscriptions; got != 0 {
+		t.Errorf("the server holds %d subscriptions after four refusals, want 0", got)
+	}
+	conn.subscribe(id, 80, 24)
+	if frame := conn.nextFrame(terminal.FrameSnapshot); frame.ProjectID != id {
+		t.Errorf("the snapshot names %q, want %q", frame.ProjectID, id)
 	}
 }
 
-// sequencesOf renders chunk sequence numbers for a failure message.
-func sequencesOf(chunks []session.Chunk) []uint64 {
-	out := make([]uint64, 0, len(chunks))
-	for _, chunk := range chunks {
-		out = append(out, chunk.Sequence)
+// TestABrowserGetsAWorkingTerminal is the phase's acceptance criterion stated
+// as one exchange.
+//
+// A browser connects, subscribes to a project, is sent the screen that is
+// already there, is sent what the terminal produces next, types into it, and
+// resizes it. Each step is checked against the backend the manager is driving,
+// so a frame that arrived without the corresponding input reaching the terminal
+// - or the reverse - fails here.
+func TestABrowserGetsAWorkingTerminal(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+	id, _ := h.registerProject(t, "app")
+	h.startRuntime(t, id)
+	name := project.SessionNameFor(id)
+
+	conn := h.dialTerminal(t, nil)
+	conn.hello()
+
+	// Subscribing carries the size the browser's viewport already has, so the
+	// terminal is resized once - before the snapshot - instead of the client
+	// drawing a screen at the old size and then reflowing it.
+	conn.subscribe(id, 100, 30)
+
+	// The size reaches the terminal, and the acknowledgement comes back to the
+	// subscriber that asked as well as to any other viewer: there is one pty,
+	// so there is one size, and a second tab rendering its own idea of it would
+	// draw a terminal that does not match the program inside.
+	var ack struct {
+		Type string `json:"type"`
+		Cols int    `json:"cols"`
+		Rows int    `json:"rows"`
 	}
-	return out
+	if err := json.Unmarshal(conn.nextControl(terminal.MsgResized), &ack); err != nil {
+		t.Fatalf("the resize acknowledgement did not decode: %v", err)
+	}
+	if ack.Cols != 100 || ack.Rows != 30 {
+		t.Errorf("the terminal was resized to %dx%d, want the 100x30 the browser asked for", ack.Cols, ack.Rows)
+	}
+	if cols, rows, ok := h.backend.sizeOf(name); !ok || cols != 100 || rows != 30 {
+		t.Errorf("the backend was asked for %dx%d (set=%v), want 100x30", cols, rows, ok)
+	}
+
+	// Then the screen. A client that started from an empty terminal would show
+	// a blank window until something happened to print, which on a Claude Code
+	// session is a long and alarming blank.
+	snapshot := conn.nextFrame(terminal.FrameSnapshot)
+	if snapshot.ProjectID != id {
+		t.Errorf("the snapshot names project %q, want %q", snapshot.ProjectID, id)
+	}
+	if snapshot.Cols != 100 || snapshot.Rows != 30 {
+		t.Errorf("the snapshot is %dx%d, want the 100x30 the terminal now is",
+			snapshot.Cols, snapshot.Rows)
+	}
+	if !bytes.Contains(snapshot.Payload, []byte("\x1b[")) {
+		t.Errorf("the snapshot stripped the pane's escape sequences: %q", snapshot.Payload)
+	}
+	if snapshot.FirstSequence != snapshot.LastSequence {
+		t.Errorf("the snapshot's boundary is %d..%d, want a single number: a screen is "+
+			"a statement about the whole terminal, not a range of chunks",
+			snapshot.FirstSequence, snapshot.LastSequence)
+	}
+
+	// What the terminal produces next arrives as output, byte for byte. The
+	// bytes are the kinds a real session makes: a colour escape, a Chinese
+	// character, and a carriage return.
+	live := []byte("\x1b[32mclaude\x1b[0m\r\n中文\r\n")
+	h.backend.deliver(t, name, live)
+
+	output := conn.nextFrame(terminal.FrameOutput)
+	if !bytes.Equal(output.Payload, live) {
+		t.Errorf("the live frame carries %q, want %q", output.Payload, live)
+	}
+	// This is the rule a client applies to decide whether it missed anything,
+	// asserted where it is produced rather than only where it is consumed.
+	if !output.Accounts(snapshot.LastSequence) {
+		t.Errorf("the output frame covers %d..%d, which does not follow the snapshot's %d: "+
+			"a client applying its own gap rule would reject it",
+			output.FirstSequence, output.LastSequence, snapshot.LastSequence)
+	}
+
+	// Typing. A keystroke is bytes rather than text, and Ctrl-C is the case
+	// that proves it: it is the byte that interrupts whatever is running.
+	conn.send(map[string]any{
+		"type":      terminal.MsgInput,
+		"projectId": id,
+		"data":      []byte{0x03},
+	})
+	h.waitForInput(t, id, []byte{0x03})
+
+	// An arrow key and multi-byte text in one message, which is what a paste
+	// and a key held down both look like. The terminal sorts input from output
+	// by nothing at all, so the only thing a test can check is that what was
+	// typed is what the terminal received, in order and with nothing added.
+	conn.send(map[string]any{
+		"type":      terminal.MsgInput,
+		"projectId": id,
+		"data":      append([]byte("\x1b[A"), []byte("中文")...),
+	})
+	h.waitForInput(t, id, append([]byte{0x03, 0x1b, '[', 'A'}, []byte("中文")...))
+
+	// A resize reaches the terminal, and comes back to this subscriber too.
+	conn.send(map[string]any{
+		"type":      terminal.MsgResize,
+		"projectId": id,
+		"cols":      120,
+		"rows":      40,
+	})
+	if err := json.Unmarshal(conn.nextControlMatch(terminal.MsgResized, func(raw []byte) bool {
+		var m struct {
+			Cols int `json:"cols"`
+			Rows int `json:"rows"`
+		}
+		return json.Unmarshal(raw, &m) == nil && m.Cols == 120 && m.Rows == 40
+	}), &ack); err != nil {
+		t.Fatalf("the resize acknowledgement did not decode: %v", err)
+	}
+	h.waitForSize(t, id, 120, 40)
+
+	// Unsubscribing is acknowledged, so a client tearing a terminal down can
+	// tell that the server has stopped sending for it rather than guess from
+	// silence.
+	conn.send(map[string]any{"type": terminal.MsgUnsubscribe, "projectId": id})
+	var unsubscribed struct {
+		Type      string `json:"type"`
+		ProjectID string `json:"projectId"`
+	}
+	if err := json.Unmarshal(conn.nextControl(terminal.MsgUnsubscribed), &unsubscribed); err != nil {
+		t.Fatalf("the unsubscribe acknowledgement did not decode: %v", err)
+	}
+	if unsubscribed.ProjectID != id {
+		t.Errorf("the acknowledgement names %q, want %q", unsubscribed.ProjectID, id)
+	}
+
+	// And input for a project this connection is no longer watching is refused.
+	// This is §五十一 at the protocol level: the socket types into a terminal
+	// the user already started, and into nothing else.
+	conn.send(map[string]any{
+		"type":      terminal.MsgInput,
+		"projectId": id,
+		"data":      []byte("rm -rf /"),
+	})
+	var refusal struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal(conn.nextControl(terminal.MsgError), &refusal); err != nil {
+		t.Fatalf("the refusal did not decode: %v", err)
+	}
+	if refusal.Code != terminal.CodeNotSubscribed {
+		t.Errorf("input after unsubscribing was refused with %q, want %q",
+			refusal.Code, terminal.CodeNotSubscribed)
+	}
+	h.waitForInput(t, id, append([]byte{0x03, 0x1b, '[', 'A'}, []byte("中文")...))
 }
 
-// sessionNamesOf renders session names for a failure message.
-func sessionNamesOf(sessions []session.SessionRef) []string {
-	out := make([]string, 0, len(sessions))
-	for _, s := range sessions {
-		out = append(out, s.Name)
+// TestClosingTheBrowserLeavesTheTerminalAlone is §一 and §三十八: the browser
+// is a viewer, not the owner.
+//
+// A runtime that ended when its last viewer left would be a runtime that ends
+// whenever somebody's laptop sleeps. The subscription is the browser's; the
+// session belongs to the project, and the control connection that reads it
+// belongs to the manager.
+func TestClosingTheBrowserLeavesTheTerminalAlone(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+	id, _ := h.registerProject(t, "app")
+	h.startRuntime(t, id)
+	name := project.SessionNameFor(id)
+
+	conn := h.dialTerminal(t, nil)
+	conn.hello()
+	conn.subscribe(id, 80, 24)
+	conn.nextFrame(terminal.FrameSnapshot)
+
+	before := h.runtimeState(t, id).Sequence
+
+	conn.close()
+	h.waitForSubscriptions(t, 0)
+
+	state := h.runtimeState(t, id)
+	if state.State != session.StateRunning {
+		t.Errorf("the runtime is %s after the browser left, want %s", state.State, session.StateRunning)
 	}
-	return out
+	if !state.SessionAlive {
+		t.Error("the session is gone after the browser left; the terminal outlives its viewers")
+	}
+
+	// And the terminal still works with nobody watching. Output produced
+	// between a disconnect and a reconnect is still numbered, which is what the
+	// client that reconnects reads its snapshot's boundary against.
+	h.backend.deliver(t, name, []byte("still here\n"))
+	h.waitForSequence(t, id, before+1)
+}
+
+// TestTheDiagnosticSurfaceIsGone is §七十六 and §九十二's criterion that
+// /api/debug is deleted rather than switched off.
+//
+// Those endpoints existed so the runtime could be exercised before there was a
+// Web Terminal to exercise it with. There is one now, and a route that accepts
+// raw terminal input - or lists every session on the machine - is a liability
+// rather than a convenience: it is unauthenticated, it is not part of the
+// product, and a build that had it disabled still had it.
+//
+// The paths are enumerated rather than sampled, because the failure this guards
+// against is one handler left registered, and a test that checked the two
+// endpoints somebody remembered would not find it.
+func TestTheDiagnosticSurfaceIsGone(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
+	id, _ := h.registerProject(t, "app")
+	h.startRuntime(t, id)
+
+	paths := []string{
+		"/api/debug",
+		"/api/debug/",
+		"/api/debug/runtimes",
+		"/api/debug/reconcile",
+		"/api/debug/projects/" + id + "/runtime",
+		"/api/debug/projects/" + id + "/runtime/start",
+		"/api/debug/projects/" + id + "/runtime/stop",
+		"/api/debug/projects/" + id + "/runtime/output",
+		"/api/debug/projects/" + id + "/runtime/input",
+		"/api/debug/projects/" + id + "/runtime/resize",
+		"/api/debug/projects/" + id + "/terminal",
+	}
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		for _, path := range paths {
+			t.Run(method+" "+path, func(t *testing.T) {
+				h.wantError(t, h.call(method, path, ""), http.StatusNotFound, CodeNotFound)
+			})
+		}
+	}
+}
+
+// runtimeState reads a project's runtime as the API would describe it.
+func (h *harness) runtimeState(t *testing.T, projectID string) *session.Runtime {
+	t.Helper()
+	rt, err := h.runtime.Runtime(context.Background(), projectID)
+	if err != nil {
+		t.Fatalf("reading the runtime of %s failed: %v", projectID, err)
+	}
+	return rt
+}
+
+// waitForInput waits until the terminal has received exactly want.
+//
+// The assertion is equality rather than containment on purpose. A terminal has
+// no way to tell input from output, so the only thing a test can check about
+// typing is that what was typed is what arrived, in that order, with nothing
+// added or lost. Input crosses two goroutines on its way - the socket's reader
+// and the manager's - so a test that read it back immediately would be racing
+// one of them.
+func (h *harness) waitForInput(t *testing.T, projectID string, want []byte) {
+	t.Helper()
+	name := project.SessionNameFor(projectID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var got []byte
+	for time.Now().Before(deadline) {
+		if got = h.backend.receivedInput(name); bytes.Equal(got, want) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the terminal received %q, want %q", got, want)
+}
+
+// waitForSize waits until the terminal has been resized to exactly cols x rows.
+func (h *harness) waitForSize(t *testing.T, projectID string, cols, rows int) {
+	t.Helper()
+	name := project.SessionNameFor(projectID)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var gotCols, gotRows int
+	for time.Now().Before(deadline) {
+		if gotCols, gotRows, _ = h.backend.sizeOf(name); gotCols == cols && gotRows == rows {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the terminal was resized to %dx%d, want %dx%d", gotCols, gotRows, cols, rows)
+}
+
+// waitForSubscriptions waits until the server holds exactly want browser
+// subscriptions.
+//
+// The manager's own control subscription is not counted here: this is the
+// hub's count, which is the browsers'.
+func (h *harness) waitForSubscriptions(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	var got int
+	for time.Now().Before(deadline) {
+		if got = h.server.terminal.Stats().Subscriptions; got == want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the server holds %d browser subscriptions, want %d", got, want)
 }

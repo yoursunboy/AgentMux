@@ -20,6 +20,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
+	"github.com/kutonlagos/agentmux/internal/terminal"
 )
 
 // harness is a fully wired API server backed by a temp data directory and a
@@ -69,9 +70,6 @@ type harnessOptions struct {
 	// tmuxMissing is the third case on its own: an environment that could host
 	// a runtime with a tmux that is not installed in it.
 	tmuxMissing bool
-
-	// debugAPI turns on the diagnostic runtime endpoints.
-	debugAPI bool
 
 	// tmuxStatus, when set, makes this server's backend factory able to
 	// describe the tmux installation its runtimes will use. Left nil the
@@ -132,9 +130,6 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		// An empty environment, so a stray AGENTMUX_* variable in the
 		// developer's shell cannot change what the tests assert.
 		Environ: func(string) (string, bool) { return "", false },
-		Overrides: config.Overrides{
-			DebugAPI: o.debugAPI,
-		},
 	})
 	if err != nil {
 		t.Fatalf("config.Load returned an error: %v", err)
@@ -217,6 +212,23 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		}
 	})
 
+	// The terminal hub is the real one, not a stub. What the socket tests check
+	// is that a browser's bytes reach the manager and the manager's bytes reach
+	// the browser, and neither half of that is checked by a fake transport.
+	hub, err := terminal.NewHub(manager, terminal.HubOptions{Logger: discardLogger()})
+	if err != nil {
+		t.Fatalf("terminal.NewHub returned an error: %v", err)
+	}
+	// Closed before the manager, which is the order the process uses: a browser
+	// should learn the server is going away from a close frame rather than from
+	// its socket dying, because a socket dying is the one signal it cannot tell
+	// apart from a network that went away.
+	t.Cleanup(func() {
+		if err := hub.Close(); err != nil {
+			t.Errorf("closing the terminal hub failed: %v", err)
+		}
+	})
+
 	// A server with no agent configured must keep leaving the capability field
 	// out, which is what an installation with no Claude Code does. Handing it a
 	// resolver that reports nothing would put a `claude` object in the response
@@ -231,6 +243,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Projects:   service,
 		Discoverer: discoverer,
 		Runtime:    manager,
+		Terminal:   hub,
 		Logger:     discardLogger(),
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
 		WebDir:     "",

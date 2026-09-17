@@ -7,6 +7,9 @@ import {
   isRuntimeUp,
   statusGlyph,
 } from '../lib/format'
+import { useTerminalSession } from '../terminal/useTerminal'
+import { ProjectTerminal } from './ProjectTerminal'
+import { PromptBar } from './PromptBar'
 
 interface ProjectPanelProps {
   project: Project
@@ -28,13 +31,14 @@ interface ProjectPanelProps {
 }
 
 /**
- * ProjectPanel is the chrome around a project.
+ * ProjectPanel is the chrome around a project and, when there is one, its
+ * terminal.
  *
- * There is still no terminal here, and it does not pretend otherwise: the
- * runtime is real and persistent, but nothing streams its output to a browser
- * until the terminal view lands in Phase 4. What this panel offers is what the
- * server can actually do today - start and stop the session - and a plain
- * statement of what is not here yet.
+ * The terminal is only subscribed to while the runtime is up, and the panel
+ * says which of the two reasons it is not showing one rather than drawing an
+ * empty screen: a server that cannot host a terminal and a project whose
+ * terminal is stopped are different facts with different fixes, and a black
+ * rectangle would state neither.
  */
 export function ProjectPanel({
   project,
@@ -47,6 +51,9 @@ export function ProjectPanel({
   const up = isRuntimeUp(project.status)
   const transitioning = isRuntimeBusy(project.status)
   const controlsDisabled = busy || transitioning || !terminalAvailable
+  const watching = terminalAvailable && up
+  const session = useTerminalSession(project.id, watching)
+  const connected = session.status.state === 'open'
 
   return (
     <section className="panel" aria-label={`Project ${project.name}`}>
@@ -87,28 +94,30 @@ export function ProjectPanel({
         </div>
       </header>
 
-      <div className="panel__body">
-        <div className="panel__placeholder">
-          {terminalAvailable ? (
-            <>
-              <p className="panel__placeholder-title">Terminal UI coming in Phase 4</p>
-              <p className="panel__placeholder-text">
-                The session behind this button is real and outlives the server: it keeps running
-                while you reload the page, close the browser, or restart AgentMux. This build is
-                <strong> Phase 2</strong>, so starting it is all the UI can do — streaming the
-                terminal into this panel arrives in Phase 4, and running Claude Code in it in
-                Phase 3.
-              </p>
-            </>
-          ) : (
-            <>
-              <p className="panel__placeholder-title">Terminal runtime unavailable</p>
-              <p className="panel__placeholder-text">
-                {terminalBlocker || 'This server cannot host a terminal runtime.'}
-              </p>
-            </>
-          )}
-        </div>
+      <div className={`panel__body${watching ? ' panel__body--terminal' : ''}`}>
+        {watching ? (
+          <ProjectTerminal session={session} />
+        ) : (
+          <div className="panel__placeholder">
+            {!terminalAvailable ? (
+              <>
+                <p className="panel__placeholder-title">Terminal runtime unavailable</p>
+                <p className="panel__placeholder-text">
+                  {terminalBlocker || 'This server cannot host a terminal runtime.'}
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="panel__placeholder-title">This project’s terminal is stopped</p>
+                <p className="panel__placeholder-text">
+                  Start the runtime to see it here. The session behind it outlives this page: it
+                  keeps running while you reload, close the browser, or restart AgentMux, and its
+                  scrollback is still there when you come back.
+                </p>
+              </>
+            )}
+          </div>
+        )}
 
         <dl className="metadata">
           <div className="metadata__row">
@@ -145,16 +154,17 @@ export function ProjectPanel({
       </div>
 
       <footer className="panel__footer">
-        <input
-          className="panel__prompt"
-          type="text"
-          placeholder="Message Claude… (available in Phase 3)"
-          disabled
-          aria-label="Message Claude"
-        />
-        <button type="button" className="button" disabled title="Available in Phase 3">
-          Send
-        </button>
+        {/* The Prompt Bar writes to the terminal through the same messages a
+            keystroke does; it is disabled until there is a live one to write
+            to, rather than accepting text that would go nowhere.
+
+            Both halves are needed. The connection is the page's, not this
+            panel's - one socket serves every project - so an open connection
+            says nothing about whether *this* project has a terminal. Without
+            the second half, a panel whose runtime is stopped would offer an
+            enabled field while a socket was open for the project next to it,
+            and swallow whatever was typed into it. */}
+        <PromptBar session={session} disabled={!watching || !connected} />
       </footer>
     </section>
   )

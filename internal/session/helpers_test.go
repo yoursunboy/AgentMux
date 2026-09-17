@@ -319,6 +319,24 @@ func waitForPaneCommand(t *testing.T, b *TmuxBackend, name, want string) {
 	t.Fatalf("the foreground process of %q is %q, want %q", name, last, want)
 }
 
+// screenRows captures a session and returns the pane's rows as terminal bytes,
+// failing the test if the capture failed.
+//
+// Most of what a snapshot is asked about is what is on it: a marker the shell
+// printed, a colour escape that had to survive, a command that recalled its
+// history. Those tests read this. The ones that are about the snapshot *as a
+// screen* - its geometry, its cursor, which buffer it is on - assert on the
+// Screen itself, because that is the part a client has to get right and the
+// part a byte comparison cannot see.
+func screenRows(t *testing.T, b Backend, name string) []byte {
+	t.Helper()
+	s, err := b.Snapshot(context.Background(), name)
+	if err != nil {
+		t.Fatalf("Snapshot returned an error: %v", err)
+	}
+	return s.Data
+}
+
 // paneCommand reads a session's foreground process name.
 func paneCommand(t *testing.T, b *TmuxBackend, name string) string {
 	t.Helper()

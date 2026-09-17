@@ -563,10 +563,7 @@ func TestManagerStartAdoptsASurvivingSession(t *testing.T) {
 		t.Errorf("the runtime is %dx%d, want the surviving session's 90x25", rt.Cols, rt.Rows)
 	}
 
-	snapshot, err := backend.Snapshot(ctx, rt.Session)
-	if err != nil {
-		t.Fatalf("Snapshot returned an error: %v", err)
-	}
+	snapshot := screenRows(t, backend, rt.Session)
 	if !bytes.Contains(snapshot, []byte("amx-survivor")) {
 		t.Errorf("the adopted session lost the work it was holding; the pane holds:\n%s", snapshot)
 	}

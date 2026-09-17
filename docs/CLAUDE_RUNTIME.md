@@ -266,7 +266,9 @@ terminal the user owns, and the answer is the user's to give.
 
 This is a product decision, not a limitation of the implementation. A mux that auto-approved its
 agents would be a mux that runs arbitrary commands on the user's machine on the user's behalf without
-the user. Phase 4's terminal is the interface for answering those prompts.
+the user. The web terminal built in Phase 4 is the interface for answering those prompts: the prompt
+is on the screen as Claude drew it, and the answer is keystrokes sent back through the same input path
+a keyboard uses. Nothing in that path inspects the prompt or replies to it.
 
 The real-integration test `TestRealClaudeAnswersAPrompt` therefore asserts only that the agent is
 still running and that the terminal produced output; whether a file appeared is **logged**, not

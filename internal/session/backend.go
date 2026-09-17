@@ -114,9 +114,14 @@ type Backend interface {
 	// yours" must not implement this as anything broader.
 	KillServer(ctx context.Context) error
 
-	// Snapshot returns the session's current screen, escape sequences intact,
-	// for a client that needs to draw something before live output arrives.
-	Snapshot(ctx context.Context, name string) ([]byte, error)
+	// Snapshot returns the session's current screen, for a client that needs to
+	// draw something before live output arrives.
+	//
+	// It returns a Screen rather than bytes because a screen is not a byte
+	// stream: a client drawing one has to know how big it is, which buffer it
+	// is on, and where the cursor is. A bare byte slice would leave all three
+	// to be guessed, and every guess is a visibly wrong terminal.
+	Snapshot(ctx context.Context, name string) (Screen, error)
 
 	// Attach opens a live output stream for a session. The caller must Close
 	// the subscription. Several subscriptions to one session may be open at

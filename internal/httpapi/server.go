@@ -7,6 +7,7 @@
 package httpapi
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/terminal"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -52,6 +54,7 @@ type Server struct {
 	discoverer *project.Discoverer
 	runtime    *session.Manager
 	agent      AgentResolver
+	terminal   *terminal.Hub
 	log        *slog.Logger
 
 	startedAt time.Time
@@ -80,6 +83,12 @@ type Options struct {
 	// capability report. It is optional: a server with no agent configured
 	// reports that it has none, which is a legitimate configuration.
 	Agent AgentResolver
+
+	// Terminal carries browser sockets to the runtime. It is optional only so
+	// that tests of the REST surface do not have to build one; a server
+	// without it answers the real-time endpoint with an explanation rather
+	// than a panic.
+	Terminal *terminal.Hub
 
 	// Logger receives request and error records. Nil means slog.Default.
 	Logger *slog.Logger
@@ -117,6 +126,7 @@ func New(o Options) (*Server, error) {
 		discoverer: o.Discoverer,
 		runtime:    o.Runtime,
 		agent:      o.Agent,
+		terminal:   o.Terminal,
 		log:        o.Logger,
 		startedAt:  o.StartedAt,
 		webDir:     o.WebDir,
@@ -165,7 +175,9 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/start", s.handleStartAgent)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/stop", s.handleStopAgent)
 
-	s.registerDebugRoutes(mux)
+	// The one real-time endpoint. One socket per browser, carrying every
+	// project's terminal; see internal/terminal and docs/PROTOCOL.md.
+	mux.HandleFunc("GET /api/ws", s.handleWebSocket)
 
 	// Anything else under /api is an API error, not a page. Without this the
 	// SPA fallback would answer a mistyped endpoint with index.html and a
@@ -175,26 +187,6 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/", s.staticHandler())
 
 	return s.withRecovery(s.withRequestLog(s.withCORS(mux)))
-}
-
-// registerDebugRoutes adds the diagnostic endpoints when they are enabled.
-//
-// They are registered only when the configuration asks for them, so an
-// ordinary installation does not have a route that accepts raw terminal input.
-// Registering them and refusing inside the handler would leave the surface
-// present and one flag away from being live; this way it does not exist.
-func (s *Server) registerDebugRoutes(mux *http.ServeMux) {
-	if s.cfg == nil || !s.cfg.Server.DebugAPI {
-		return
-	}
-	s.log.Warn("the diagnostic runtime API is enabled",
-		"note", "these endpoints expose raw terminal input and output and are not a product API")
-
-	mux.HandleFunc("GET /api/debug/runtimes", s.handleDebugRuntimes)
-	mux.HandleFunc("POST /api/debug/reconcile", s.handleDebugReconcile)
-	mux.HandleFunc("GET /api/debug/projects/{id}/runtime/output", s.handleDebugRuntimeOutput)
-	mux.HandleFunc("POST /api/debug/projects/{id}/runtime/input", s.handleDebugRuntimeInput)
-	mux.HandleFunc("POST /api/debug/projects/{id}/runtime/resize", s.handleDebugRuntimeResize)
 }
 
 // handleUnknownAPI answers an unrouted API path.
@@ -242,6 +234,41 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
+}
+
+// Hijack lets a handler take the connection over, which is what a WebSocket
+// upgrade does.
+//
+// It has to be written out even though nothing in this file hijacks anything,
+// and the reason is a property of Go's embedding that is easy to be caught by:
+// a struct that embeds an interface gets only the methods that interface
+// declares. http.ResponseWriter has three, Hijack is not one of them, so
+// *statusRecorder does not implement http.Hijacker even though the writer it
+// wraps does. A WebSocket upgrade behind this wrapper therefore fails with
+// "response does not implement http.Hijacker" and answers 500 - a working
+// endpoint and an error status at the same time, which is the kind of thing
+// that costs an afternoon to find.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("httpapi: %T does not support hijacking", r.ResponseWriter)
+	}
+	conn, buf, err := hijacker.Hijack()
+	if err == nil && r.status == 0 {
+		// The request became a socket. Recording the switch is what keeps the
+		// request log honest: the alternative is a 200 for a request that was
+		// never answered as HTTP, and the duration that follows is the whole
+		// life of the connection, which is correct rather than a defect.
+		r.status = http.StatusSwitchingProtocols
+	}
+	return conn, buf, err
+}
+
+// Flush forwards a flush, for a handler that streams a response.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 // withRequestLog records method, route, status, and duration.

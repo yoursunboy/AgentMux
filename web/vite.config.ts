@@ -15,6 +15,12 @@ export default defineConfig({
       '/api': {
         target: AGENTMUX_SERVER,
         changeOrigin: false,
+        // The terminal endpoint is a WebSocket under the same prefix. Without
+        // this the dev server answers the upgrade request as an ordinary HTTP
+        // request and the browser's socket never opens - which looks exactly
+        // like a server that is not running, and sends anybody debugging it to
+        // the wrong process.
+        ws: true,
       },
     },
   },

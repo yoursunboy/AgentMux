@@ -6,34 +6,44 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 3**. The project model, the server foundation, the
-persistent session runtime, and the real Claude Code runtime exist and work. The terminal view does
-not exist yet.
+This repository is at **version 0.1.0, end of Phase 4**. The project model, the server foundation, the
+persistent session runtime, the real Claude Code runtime, and the web terminal all exist and work.
 
 | Works today | Does not exist yet |
 | --- | --- |
-| Server status and capability reporting | Any terminal view in the browser |
-| Projects Root configuration, Windows/WSL and Linux path mapping | WebSocket traffic of any kind |
-| Bounded discovery of project candidates | Prompts typed at Claude from the UI |
-| Register an existing project | Hooks, Waiting/Completed state detection |
-| Create a project, optionally with `git init` | CC Switch / provider switching |
-| SQLite metadata store with migrations | Controller / viewer roles |
-| Persistent tmux sessions that outlive the server | Codex, Gemini, OpenCode |
+| Server status and capability reporting | Controller / viewer roles, or any lease on typing |
+| Projects Root configuration, Windows/WSL and Linux path mapping | Claude Hooks, Waiting/Completed state detection |
+| Bounded discovery of project candidates | CC Switch / provider switching |
+| Register an existing project | Codex, Gemini, OpenCode |
+| Create a project, optionally with `git init` | The multi-project 1×3 / 2×3 grid |
+| SQLite metadata store with migrations | Multi-device control |
+| Persistent tmux sessions that outlive the server | Authentication |
 | Runtime start / stop / destroy, with reconciliation on restart | |
 | **One tmux server and socket per project**, so one project's runtime cannot take another's down | |
 | Raw byte-accurate input, real PTY resize, sequenced output | |
-| Phase 1 workspace UI (global bar, project panel, project manager) | |
-| Phase 2 runtime controls: running/stopped, start, stop | |
 | **The real Claude Code CLI, started in a project's own directory and observed from the process table** | |
 | **Claude survives a server restart; one project, one runtime, one Claude** | |
+| **A live terminal in the browser — xterm.js over `GET /api/ws`, real Claude Code TUI, raw ANSI and Unicode** | |
+| **Raw keyboard input, including Ctrl+C, and a Prompt Bar that shares the same input path** | |
+| **Reconnect and snapshot recovery: a fresh screen with the exact sequence where the stream resumes** | |
+| **Window resize, local scroll that is never yanked to the bottom, and touch keys on a tablet** | |
 
-The product is not described here as if it were finished. There is no terminal view — the runtime is
-real, and the panel says plainly that the terminal UI arrives in Phase 4 rather than drawing an empty
-rectangle. A project's runtime can host the real Claude Code CLI, but nothing streams its output to a
-browser yet, so starting one is an API call and its terminal is its own tmux pane. `provider.integrated`
-is false and the provider switch is a disabled control that says "Coming later". See
-`docs/ROADMAP.md` for the phase table, `docs/RUNTIME.md` for how the runtime
-works and what it does not do.
+The product is not described here as if it were finished. A project's runtime hosts the real Claude
+Code CLI, and its terminal is now in the browser: the bytes are the terminal's own, the keystrokes are
+the keyboard's own, and closing the tab leaves Claude running. What is missing is around the edge of
+that — no controller or viewer roles, so every browser that can reach the server can type; no
+authentication; and one project on screen at a time, because the grid is Phase 5.
+
+One thing about the development host rather than this build: the WSL Claude Code is installed but
+**not signed in**, so a terminal opened on it shows Claude Code's own sign-in screen rather than a
+conversation. That is Phase 3's outstanding item, and Phase 4 was specified to leave authentication
+alone — nothing was copied, faked, or worked around to hide it. Everything the terminal does is
+verified with a real shell in a real tmux session; the Claude TUI itself is verified as far as Claude's
+own sign-in screen, which is a real full-screen TUI and exercises the same paths.
+
+`provider.integrated` is false and the provider switch is a disabled control that says "Coming later".
+See `docs/ROADMAP.md` for the phase table, `docs/TERMINAL.md` for the terminal protocol, and
+`docs/RUNTIME.md` for how the runtime works and what it does not do.
 
 ## Requirements
 
@@ -147,7 +157,6 @@ knowing:
 | `-tmux-socket <name>` | **Deprecated, no effect.** Accepted and warned about, never silently reinterpreted. See below. |
 | `-config <file>` | Use a specific JSON configuration file. |
 | `-web-dir <dir>` | Serve the built frontend from this directory. |
-| `-debug-api` | Enable the diagnostic endpoints under `/api/debug`. Off by default; they accept raw terminal input and output. |
 | `-log-level`, `-log-format` | `debug`/`info`/`warn`/`error`, and `text`/`json`. |
 
 In the configuration file these are `terminal.tmuxBinary` and `terminal.tmuxSocketDir`; the
@@ -292,7 +301,7 @@ Workspace:
 └──────────────┴──────────────┴──────────────┘
 ```
 
-Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is the target. Today each panel shows the runtime's real state — running or stopped, with Start and Stop — and says that the terminal view arrives in Phase 4.
+Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is the target. Today one project panel is on screen at a time — its runtime's state, its Start and Stop controls, its live terminal, and its prompt bar — and the grid of six is Phase 5.
 
 ## Tests
 
@@ -307,21 +316,32 @@ them the way a user would. Nothing in either suite touches a real project direct
 writes outside a `t.TempDir()`.
 
 The session suite is different from the rest: it drives a **real tmux** on a socket of its own, so it
-needs tmux and it skips when tmux is not there. On Windows that means running it from inside WSL:
+needs tmux and it skips when tmux is not there. The terminal transport suite is different again: it
+opens real WebSocket connections against a real server, and one of its cases measures what happens to
+a client that stops reading in the middle of a burst. On Windows both mean running from inside WSL:
 
 ```bash
 # from WSL, with the repository on /mnt
 cd "/mnt/d/AI/Projects/2026 AgentMux/AgentMux"
 go test ./internal/session/
+go test ./internal/terminal/
 ```
 
-A Windows shell can cross-compile the test binary for the distribution when Go is not installed
-inside it:
+A Windows shell can cross-compile a test binary for the distribution when Go is not installed inside
+it:
 
 ```bash
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/session.test ./internal/session/
 wsl -d Ubuntu-24.04 -- /tmp/session.test -test.v
 ```
+
+**The browser is a test target too, and it is not covered by the two commands above.** A terminal that
+is correct over a socket can still be drawn wrong: the fidelity this phase promises is about pixels,
+Unicode widths and touch targets, and those need a real browser attached to a real xterm.js. The
+end-to-end suites drive headless Chrome against a running server, a running tmux session and the real
+frontend, and they live outside the repository because they need a browser and a fixture rather than
+because they are optional — `docs/ROADMAP.md` Phase 4 lists what they cover and `docs/TERMINAL.md` §6
+is where the fidelity limits they measure against are stated.
 
 ## Documentation reading order
 
@@ -329,13 +349,14 @@ wsl -d Ubuntu-24.04 -- /tmp/session.test -test.v
 2. `docs/PROJECT_MODEL.md`
 3. `docs/ARCHITECTURE.md`
 4. `docs/UI_SPEC.md`
-5. `docs/PROTOCOL.md`
+5. `docs/PROTOCOL.md` — the original client/server sketch, annotated with what was built
 6. `docs/ROADMAP.md`
 7. `docs/RUNTIME.md` — how sessions actually run, and what is known to be fragile
 8. `docs/API.md` — what this build actually serves
 9. `docs/CLAUDE_RUNTIME.md` — how the real Claude Code CLI is resolved, launched, observed and stopped
-9. `CLAUDE.md`
-10. `.claude/rules/`
+10. `docs/TERMINAL.md` — the terminal protocol, the snapshot boundary, and its fidelity limits
+11. `CLAUDE.md`
+12. `.claude/rules/`
 
 ## Development principle
 
@@ -360,5 +381,13 @@ inside that runtime: resolved by the code that launches it, started in the proje
 with no auto-approval flags added, observed from the process table rather than from the screen, and
 still running after the server it was started under has gone. See `docs/CLAUDE_RUNTIME.md`.
 
-Phase 4 is the WebSocket and the terminal view. Claude Hooks, state detection, notifications,
-provider switching, and additional AI tools are later milestones.
+Phase 4 completed that chain in the browser. The WebSocket carries the runtime's own bytes rather than
+a rendering of them, the terminal is a real xterm.js rather than a `<pre>`, and the terminal's owner is
+still tmux: a browser connecting, disconnecting or crashing does not touch the control connection, and
+the terminal survives the AgentMux server being restarted underneath it. The two things this phase
+deliberately did not do are the ones that would have made it a different phase — no controller or
+viewer roles, and no multi-project grid.
+
+Phase 5 expands the proven terminal into the multi-project 1×3 / 2×3 workspace grid with the Project
+Manager occupying the final slot. Claude Hooks, state detection, notifications, provider switching,
+and additional AI tools are later milestones.

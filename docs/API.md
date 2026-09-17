@@ -8,11 +8,12 @@ Base path: `/api`. The server binds `127.0.0.1:8787` by default and serves the b
 the same origin, so the browser only ever talks to one host.
 
 Two facts shape the whole document. The first is that **the server runs where the sessions run**: on
-Windows that means inside WSL, and `/api/server` says which side it is on. The second is that **there
-is still no terminal stream**. Sessions are real, input and output are real, and since Phase 3 a
-project's runtime can host the real Claude Code CLI — but the endpoints that carry raw terminal bytes
-are diagnostics under `/api/debug`, off by default, and the browser does not call them. Phase 4
-replaces them with a WebSocket.
+Windows that means inside WSL, and `/api/server` says which side it is on. The second is that **the
+terminal stream is not HTTP**. Sessions are real, input and output are real, and since Phase 3 a
+project's runtime can host the real Claude Code CLI — but the bytes that carry a terminal travel over
+the WebSocket at `/api/ws`, documented in `docs/TERMINAL.md`. This document covers the REST
+surface only, and the diagnostic endpoints that used to stand in for the terminal are gone: `/api/debug`
+is not routed, not flag-gated, and answers `404 not_found` on an ordinary build and on every other one.
 
 ## GET /api/server
 
@@ -596,138 +597,57 @@ behaves the same way.
 only `running` sees the truth, a client that reads both sees the whole truth, and neither is told a
 stop succeeded when it did not.
 
-## Diagnostic endpoints (`/api/debug`)
+## GET /api/ws
 
-**These are not a product API.** They exist because Phase 2 has no terminal stream, and the runtime
-has to be usable and verifiable by something. They are registered only when the server is started
-with `-debug-api`, so an ordinary installation has no route that accepts raw terminal input at all —
-registering them and refusing inside the handler would leave the surface present and one flag away
-from live. When the flag is absent the paths are not routed and answer `404 not_found`, exactly like
+**The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per
+browser, with subscriptions multiplexed on it, so watching a second project does not mean a second
+connection. The protocol is binary frames for terminal output and snapshots, JSON for control, and it
+is specified in full — frames, messages, error codes, limits and timings — in **`docs/TERMINAL.md`**.
+
+What belongs here, in the document of what this server serves, is the shape of the endpoint rather
+than its wire format:
+
+| | |
+| --- | --- |
+| URL | `GET /api/ws`, optionally `?v=<protocol>` |
+| Subprotocol | `agentmux.terminal.v1` |
+| A client names | a `projectId` it is subscribing to, and nothing else |
+| A client cannot name | a filesystem path, a session name, a socket, or a command |
+| Origin | checked against the request's own host and `server.allowedOrigins`; a missing `Origin` is allowed, because a browser always sends one |
+
+It is not a REST resource and has no JSON body: its failures are protocol errors on the connection
+(`docs/TERMINAL.md` §4.3) once it is open, and an ordinary HTTP status when the handshake itself is
+refused — `403 forbidden` for an Origin that is not allowed, `400 invalid_request` for a protocol
+version this server does not speak.
+
+Two properties are worth stating in this document because they are what a reader of the REST API would
+otherwise assume and be wrong about. **Nothing here accepts a command.** A browser sends raw
+keystrokes to a terminal it has already subscribed to, and they go to whatever is running in the pane
+exactly as typing would; there is no message that runs a program. And **nothing here can create or
+destroy a runtime.** Subscribing to a project that is not running is refused; starting one is
+`POST /api/projects/{id}/runtime/start` above.
+
+## The diagnostic endpoints are gone
+
+Phase 2 and Phase 3 exposed a set of off-by-default endpoints under `/api/debug` — raw terminal
+input, buffered output, a resize, a session listing, an on-demand reconcile. They existed because
+there was no terminal stream, and the runtime had to be exercisable by something.
+
+**Phase 4 deleted them.** Not gated them, not marked them debug-only: deleted. There is no
+`-debug-api` flag, no `AGENTMUX_DEBUG_API` environment variable, and no handler behind any
+`/api/debug/...` path. Every one of those paths answers `404 not_found` on every build, exactly like
 any other unknown path.
 
-They are unauthenticated, like the rest of the Phase 2 API, and they do not belong on a machine
-anyone else can reach. They are expected to be deleted or explicitly marked debug-only once Phase 4
-lands a real terminal; if they are still here unmarked after that, that is a bug.
+That is the honest shape of the change. A flag that registers the routes and refuses inside the
+handler leaves the surface present and one configuration line away from live, and a route that
+accepts raw terminal input and writes it into a session is not a thing to leave standing next to the
+real one. The terminal's input and output now travel over the WebSocket at `/api/ws`, where
+they are subject to a subscription that the server resolves from a `projectId` — see
+`docs/TERMINAL.md` for the protocol and `docs/PROTOCOL.md` for what the surface is meant to become.
 
-### POST /api/debug/projects/{id}/runtime/input
-
-Sends input to a session's terminal. Four fields, and which one you use is the whole question:
-
-- `keys` is a list of **command lines**, each typed into the shell and then run.
-- `text` is a string delivered as its UTF-8 bytes, with no carriage return.
-- `bytes` is a base64 string delivered exactly as given.
-- `enter` appends a carriage return to whichever of `text` or `bytes` was given.
-
-```json
-{ "keys": ["printf \"\\033[32mgreen\\033[0m 中文\\n\""] }
-```
-
-```json
-{ "bytes": "Aw==" }
-```
-
-Giving `text` and `bytes` in one body is a `400 invalid_request` rather than a guess. They are two
-fields, not a sequence, so their order is undefined, and an endpoint that silently picked one would
-send whoever wrote the call looking in the wrong place.
-
-The response is the runtime, so an input call doubles as a state check.
-
-`text` and `bytes` exist as separate fields on purpose. Text is what a person types; bytes are what a
-terminal receives, and a caller that wants to deliver an escape sequence, a control character, or a
-byte that is not valid UTF-8 has to be able to say so exactly. `Aw==` is a literal `0x03`, not a
-Ctrl-C that a text layer decided about. Merging them into one string field would quietly restrict the
-runtime to the subset of input that survives a round trip through JSON text, and the runtime has no
-concept of a prompt, a command, or a message — it carries bytes, and the endpoint is named for what
-it carries.
-
-### GET /api/debug/projects/{id}/runtime/output?since=<sequence>
-
-```json
-{
-  "projectId": "p_f6f7223e1d32eaecfe36",
-  "sequence": 3,
-  "chunks": [
-    {
-      "projectId": "p_f6f7223e1d32eaecfe36",
-      "sequence": 1,
-      "data": "cHJpbnRmICJcMDMzWzMybWdyZWVuXDAzM1swbSDUuK3mlodcbiINCg==",
-      "timestamp": "2026-09-17T21:31:43.601048118+08:00"
-    }
-  ]
-}
-```
-
-`chunks` are the chunks newer than `since`, oldest first, and `sequence` is the newest one included.
-Each chunk's `data` is base64 of the **exact bytes the terminal produced**. Nothing is stripped,
-trimmed, re-encoded, or normalised: ANSI escapes are in there, `\r` and `\n` are distinguished, a
-progress bar redrawn in place arrives as its own chunks in the order it was drawn, and invalid UTF-8
-stays invalid. A client that wants plain text does that conversion, on purpose, where it can see it
-happening.
-
-Output is buffered in memory and bounded. It is not written to SQLite, and it does not survive a
-server restart — the pane's own scrollback in tmux does, which is what a reconnecting client gets.
-
-### POST /api/debug/projects/{id}/runtime/resize
-
-```json
-{ "cols": 100, "rows": 30 }
-```
-
-This changes the real PTY, not a number in a record: a program inside the session that asks with
-`tput cols` reports the new width. A size that cannot be used returns `400 invalid_terminal_size`
-rather than being clamped to something that can.
-
-### GET /api/debug/runtimes
-
-Every session on AgentMux's socket, and every session on it that no project claims.
-
-```json
-{
-  "backend": "tmux",
-  "sessions": [
-    {
-      "name": "amx-p_b5492c6f2c2a15c70cc3",
-      "dir": "/tmp/amx-cap2/projects/no-runtime",
-      "cols": 120,
-      "rows": 30,
-      "createdAt": "2026-09-17T21:31:44+08:00"
-    }
-  ],
-  "orphans": [
-    {
-      "session": "amx-orphan77",
-      "dir": "/tmp/amx-cap2/projects",
-      "cols": 80,
-      "rows": 24,
-      "projectId": "orphan77"
-    }
-  ]
-}
-```
-
-### POST /api/debug/reconcile
-
-Runs the startup reconciliation on demand and reports what it found:
-
-```json
-{
-  "Running": ["p_b5492c6f2c2a15c70cc3"],
-  "Stopped": ["p_f6f7223e1d32eaecfe36"],
-  "Orphans": [
-    {
-      "session": "amx-orphan77",
-      "dir": "/tmp/amx-cap2/projects",
-      "cols": 80,
-      "rows": 24,
-      "projectId": "orphan77"
-    }
-  ]
-}
-```
-
-The keys are Go field names because the report is a Go struct being printed, and this is a
-diagnostic. It answers three questions that a restart has to answer, and the answer to all three is
-deliberately conservative:
+The one thing that was not deleted is reconciliation, which was never a debug concern: it runs on
+startup, as it must, and it reports what it found to the log. Its three answers are unchanged and are
+worth stating, because they are the whole of the restart policy:
 
 - **Running** — the record says the project has a runtime and the session is really there. Adopt it.
 - **Stopped** — the record exists and the session does not. Report `STOPPED` and **start nothing**. A
@@ -760,6 +680,7 @@ Every failure has the same shape:
 | `not_found` | 404 | No such endpoint. |
 | `path_not_accessible` | 403 | The directory exists but cannot be read. |
 | `path_outside_projects_root` | 403 | The path is not inside any configured Projects Root. |
+| `forbidden` | 403 | The request came from a place this server will not serve. Only the `/api/ws` handshake returns it, for an Origin that is neither the server's own nor in `server.allowedOrigins`. |
 | `project_already_registered` | 409 | That directory is already a project. |
 | `path_already_exists` | 409 | The create target exists and is not empty. |
 | `runtime_already_running` | 409 | Start was called for a runtime that is already running. |
@@ -791,13 +712,12 @@ client that saw `500` there would report a bug where the honest answer is "not o
 
 ## Not implemented
 
-There is no WebSocket, no terminal stream, no xterm.js, no prompt bar, and no provider switching.
-Resuming a Claude session, Hooks, controller leases, and Waiting/Completed state detection are all
-later phases; `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for them, and none of
+There is no provider switching, no controller or viewer role, no Claude Hooks and no Waiting/Completed
+state detection. `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for them, and none of
 them answers today.
 
-What this build does serve, beyond Phase 2, is the agent endpoints above and the `claude` field of
-`GET /api/server`: a project's runtime can host the real Claude Code CLI, started by the server, and
-the server reports honestly whether it is running. What it cannot do is show it to you — that is
-Phase 4, and `docs/ROADMAP.md` is where the next phase is defined. `docs/CLAUDE_RUNTIME.md` describes
-how the agent is resolved, launched, and observed.
+What this build serves, beyond the project model, is the runtime endpoints, the agent inside one, and
+the terminal: a project's runtime can host the real Claude Code CLI, started by the server, the server
+reports honestly whether it is running, and `GET /api/ws` shows it to you as the terminal it is.
+`docs/ROADMAP.md` is where the next phase is defined, `docs/CLAUDE_RUNTIME.md` describes how the agent
+is resolved, launched, and observed, and `docs/TERMINAL.md` is the terminal protocol.

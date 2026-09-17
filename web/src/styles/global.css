@@ -1,0 +1,685 @@
+/*
+ * AgentMux global styles.
+ *
+ * Dark first, dense, minimal chrome. The UI spec asks for a compact control
+ * room rather than an enterprise dashboard, so there is no card shadow, no
+ * gradient, and no second navigation bar.
+ *
+ * Colours are defined once as custom properties so a light scheme can override
+ * them without touching a single component rule.
+ */
+
+:root {
+  --bg: #0f1115;
+  --bg-raised: #161a21;
+  --bg-sunken: #0b0d11;
+  --border: #262c36;
+  --border-strong: #38404d;
+
+  --text: #e6e9ef;
+  --text-muted: #9aa4b2;
+  --text-faint: #6b7480;
+
+  --accent: #4f9cf9;
+  --accent-strong: #2f7fe0;
+  --online: #4ec9a0;
+  --warning: #e0b341;
+  --danger: #e5686b;
+
+  --radius: 6px;
+  --bar-height: 48px;
+  --gap: 8px;
+
+  --font-ui: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Mono', 'SF Mono', Menlo, Consolas, monospace;
+
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f5f7;
+    --bg-raised: #ffffff;
+    --bg-sunken: #eceef2;
+    --border: #d8dce3;
+    --border-strong: #b9c0cb;
+
+    --text: #1c2027;
+    --text-muted: #5a6473;
+    --text-faint: #858e9c;
+
+    --accent: #1f6feb;
+    --accent-strong: #1554b8;
+    --online: #1f8a63;
+    --warning: #9a6b00;
+    --danger: #c0393d;
+
+    color-scheme: light;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-text-size-adjust: 100%;
+}
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+  word-break: break-all;
+}
+
+/* --- Layout ------------------------------------------------------------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.workspace {
+  flex: 1;
+  display: grid;
+  gap: var(--gap);
+  padding: var(--gap);
+  /* Up to three panels per the UI spec: two project panels and the manager.
+     The grid collapses on its own at narrow widths. */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(260px, 320px);
+  align-items: stretch;
+  min-height: 0;
+}
+
+@media (max-width: 1100px) {
+  .workspace {
+    grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
+  }
+}
+
+@media (max-width: 780px) {
+  .workspace {
+    /* One panel per page on phones. */
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* --- Global bar --------------------------------------------------------- */
+
+.global-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--bar-height);
+  padding: 0 12px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.global-bar__group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.global-bar__state {
+  font-size: 12px;
+  line-height: 1;
+}
+.global-bar__state--online {
+  color: var(--online);
+}
+.global-bar__state--connecting {
+  color: var(--warning);
+}
+.global-bar__state--offline {
+  color: var(--danger);
+}
+
+.global-bar__label {
+  font-weight: 600;
+}
+
+.global-bar__divider {
+  color: var(--text-faint);
+}
+
+.global-bar__host,
+.global-bar__runtime {
+  color: var(--text-muted);
+}
+
+.global-bar__spacer {
+  flex: 1;
+}
+
+.global-bar__meta {
+  color: var(--text-faint);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.global-bar__provider {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
+}
+
+.global-bar__provider-name {
+  font-weight: 600;
+}
+
+.global-bar__switch {
+  background: var(--bg-sunken);
+  color: var(--text-faint);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+  cursor: not-allowed;
+}
+
+/* --- Panels ------------------------------------------------------------- */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  min-height: 40px;
+}
+
+.panel__header-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.panel__identity {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.panel__name {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel__status {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.panel__status--running {
+  color: var(--online);
+}
+
+.panel__body {
+  flex: 1;
+  min-height: 0;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.panel__body--scroll {
+  overflow-y: auto;
+}
+
+.panel__placeholder {
+  padding: 12px;
+  background: var(--bg-sunken);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius);
+}
+
+.panel__placeholder-title {
+  margin: 0 0 4px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.panel__placeholder-text {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 13px;
+  max-width: 60ch;
+}
+
+.panel__footer {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.panel__footer--manager {
+  justify-content: flex-end;
+}
+
+.panel__prompt {
+  flex: 1;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 7px 9px;
+  font: inherit;
+}
+
+.panel__prompt:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.panel--manager .panel__body {
+  gap: 12px;
+}
+
+/* --- Metadata list ------------------------------------------------------ */
+
+.metadata {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.metadata__row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.metadata dt {
+  color: var(--text-faint);
+}
+
+.metadata dd {
+  margin: 0;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+/* --- Project list ------------------------------------------------------- */
+
+.project-list,
+.candidate-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-list__item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 6px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.project-list__item:hover {
+  background: var(--bg-sunken);
+}
+
+.project-list__item.is-selected {
+  background: var(--bg-sunken);
+  border-color: var(--border-strong);
+}
+
+.project-list__name {
+  font-weight: 600;
+}
+
+.project-list__path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* --- Candidates --------------------------------------------------------- */
+
+.candidate {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 4px;
+}
+
+.candidate__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.candidate__collection {
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.candidate__name {
+  font-weight: 600;
+}
+
+.candidate__path,
+.candidate__markers {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.candidate__badge {
+  font-size: 11px;
+  color: var(--online);
+  white-space: nowrap;
+}
+
+/* --- Manager sections --------------------------------------------------- */
+
+.manager__section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.manager__section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.manager__section-header h3 {
+  margin: 0;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+/* --- Notices ------------------------------------------------------------ */
+
+.notice {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.notice--quiet {
+  color: var(--text-faint);
+}
+
+.notice--warning {
+  color: var(--warning);
+}
+
+.notice--error {
+  color: var(--danger);
+}
+
+.warnings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--warning);
+}
+
+/* --- Buttons ------------------------------------------------------------ */
+
+.button {
+  background: var(--bg-sunken);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.button--quiet {
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+.button--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.button--primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+.global-bar__retry {
+  background: transparent;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+/* --- Error banner ------------------------------------------------------- */
+
+.error-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-raised));
+  border-bottom: 1px solid var(--danger);
+}
+
+.error-banner__icon {
+  color: var(--danger);
+}
+
+.error-banner__body {
+  flex: 1;
+  min-width: 0;
+}
+
+.error-banner__message {
+  margin: 0;
+}
+
+.error-banner__detail {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.error-banner__detail code {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-faint);
+}
+
+.error-banner__actions {
+  display: flex;
+  gap: 6px;
+}
+
+/* --- Dialogs ------------------------------------------------------------ */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 6vh 16px 16px;
+  overflow-y: auto;
+  z-index: 100;
+}
+
+.dialog {
+  width: 100%;
+  max-width: 460px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog--wide {
+  max-width: 620px;
+}
+
+.dialog__title {
+  margin: 0;
+  font-size: 16px;
+}
+
+.dialog__form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.field__label {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.field__input {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 7px 9px;
+  font: inherit;
+}
+
+.field__input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.field__readonly {
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 7px 9px;
+  color: var(--text-muted);
+}
+
+.field__hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+/* --- Touch and focus ---------------------------------------------------- */
+
+@media (pointer: coarse) {
+  .button,
+  .project-list__item {
+    min-height: 40px;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

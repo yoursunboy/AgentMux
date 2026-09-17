@@ -1,0 +1,19 @@
+# AgentMux is developed on Windows and built and run inside WSL. Without a
+# declared normalisation the same file can land in the repository with CRLF on
+# one machine and LF on the other, which breaks shell scripts and produces
+# noisy diffs.
+#
+# Everything textual is stored with LF and checked out with LF, on every
+# platform. Go, TypeScript, SQL, and Markdown do not care; shell scripts and
+# tmux-adjacent files very much do.
+* text=auto eol=lf
+
+# Binary assets must never be line-ending converted.
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Lockfiles are generated; keep them out of diff review noise.
+web/package-lock.json -diff linguist-generated

@@ -1,0 +1,31 @@
+# Local Claude settings
+.claude/settings.local.json
+
+# Local/runtime data
+data/
+runtime/
+*.db
+*.db-shm
+*.db-wal
+
+# Frontend
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# Go
+bin/
+dist/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

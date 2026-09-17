@@ -82,8 +82,52 @@ func uniqueSocketDir(t *testing.T) string {
 	// Registered here rather than by the caller so that it runs after every
 	// cleanup the test registers later: t.Cleanup is last-in-first-out, and the
 	// server has to be gone before its directory can be removed.
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	//
+	// Removing the directory is not enough on its own. Several tests deliberately
+	// leave a server running - a stopped runtime keeps its session, and Close is
+	// supposed to leave sessions alone - so the server outlives the test that
+	// made it, and unlinking a socket file does not stop the process behind it.
+	// Without the sweep below the suite leaked one tmux server per socket
+	// directory, which on a machine that runs it repeatedly is dozens of
+	// processes holding dozens of sockets, all of them AgentMux's and none of
+	// them wanted.
+	//
+	// The sweep is scoped to this directory, so it can only reach servers this
+	// test created.
+	t.Cleanup(func() {
+		killServersIn(t, dir)
+		_ = os.RemoveAll(dir)
+	})
 	return dir
+}
+
+// killServersIn ends every tmux server holding a socket inside dir.
+//
+// It is deliberately narrow: it lists the directory rather than pattern-matching
+// process names, so it cannot reach a server the test did not create. A test
+// suite that kills tmux by name is a suite that eventually kills somebody's
+// editor session.
+func killServersIn(t *testing.T, dir string) {
+	t.Helper()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), socketFileSuffix) {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		b := NewTmuxBackend(TmuxOptions{
+			SocketPath: path,
+			Logger:     slog.New(slog.DiscardHandler),
+		})
+		// Errors are ignored on purpose. The socket may already be stale, or the
+		// server may already be gone, and a cleanup that fails the test it is
+		// cleaning up after is worse than a cleanup that does nothing.
+		_ = b.KillServer(context.Background())
+	}
 }
 
 // uniqueSocketPath returns a socket path no other test is using, for a backend

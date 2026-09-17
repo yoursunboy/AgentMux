@@ -57,11 +57,10 @@ export function makeServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo 
   return {
     appName: 'AgentMux',
     version: '0.1.0',
-    phase: 'Phase 1 - Project model and server foundation',
+    phase: 'Phase 2 - Persistent session runtime',
     status: 'online',
     startedAt: '2026-09-17T12:00:00Z',
     uptimeSeconds: 754,
-    installId: 'inst_test',
 
     host: 'windows',
     hostArch: 'amd64',
@@ -70,6 +69,12 @@ export function makeServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo 
     distro: 'Ubuntu-24.04',
     pathMapper: 'wsl',
 
+    // The common case on Windows: the server is on the host, so it cannot host
+    // a terminal. A test that wants the other case overrides these three.
+    environment: 'windows',
+    runtimeAvailable: false,
+    runtimeUnavailableReason: 'tmux runtime requires AgentMux Server to run inside WSL.',
+
     projectsRoot: 'D:\\AI\\Projects',
     projectsRoots: ['D:\\AI\\Projects'],
     discoveryDepth: 3,
@@ -77,9 +82,10 @@ export function makeServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo 
     dataDirectory: 'C:\\Users\\yours\\AppData\\Local\\AgentMux',
     databasePath: 'C:\\Users\\yours\\AppData\\Local\\AgentMux\\agentmux.db',
 
-    terminalRuntimeImplemented: false,
+    terminalRuntimeImplemented: true,
+    terminalBlocker: 'tmux runtime requires AgentMux Server to run inside WSL.',
 
-    dependencies: [{ name: 'git', available: true, required: false }],
+    dependencies: [{ name: 'git', available: true, required: false, probedIn: 'linux' }],
     provider: { tool: 'claude', integrated: false, status: 'not_integrated' },
     features: {
       projectRegistration: true,
@@ -92,4 +98,27 @@ export function makeServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo 
     warnings: [],
     ...overrides,
   }
+}
+
+/**
+ * A server that can host a terminal: tmux is installed where sessions run and
+ * the runtime is available. Tests that exercise the runtime controls start from
+ * this.
+ */
+export function makeTerminalReadyServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
+  return makeServerInfo({
+    environment: 'wsl',
+    runtimeAvailable: true,
+    runtimeUnavailableReason: '',
+    terminalBlocker: '',
+    features: {
+      projectRegistration: true,
+      projectCreation: true,
+      projectDiscovery: true,
+      gitInit: true,
+      terminal: true,
+      providerSwitch: false,
+    },
+    ...overrides,
+  })
 }

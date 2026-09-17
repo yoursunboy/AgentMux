@@ -3,7 +3,13 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from './App'
-import { makeCandidate, makeDiscovery, makeProject, makeServerInfo } from './test/fixtures'
+import {
+  makeCandidate,
+  makeDiscovery,
+  makeProject,
+  makeServerInfo,
+  makeTerminalReadyServerInfo,
+} from './test/fixtures'
 
 interface Route {
   status?: number
@@ -220,5 +226,75 @@ describe('App', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Create' }))
 
     expect(await screen.findByText(/a folder already exists at that path/)).toBeInTheDocument()
+  })
+
+  it('starts a runtime and takes the running state from the server, not from the click', async () => {
+    // The panel does not flip its own status: a session can be started from
+    // another tab or survive a server restart, so the server is the only
+    // truthful source for what is running.
+    let running = false
+    const project = makeProject({ name: 'AgentMux' })
+
+    routeFetch({
+      'GET /api/server': { body: makeTerminalReadyServerInfo() },
+      'GET /api/projects': () => ({
+        body: { projects: [{ ...project, status: running ? 'running' : 'stopped' }], count: 1 },
+      }),
+      [`POST /api/projects/${project.id}/runtime/start`]: () => {
+        running = true
+        return { body: { runtime: { projectId: project.id, state: 'RUNNING' } } }
+      },
+    })
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'AgentMux' })
+
+    const start = screen.getByRole('button', { name: 'Start runtime' })
+    expect(start).toBeEnabled()
+    await userEvent.click(start)
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Stop runtime' })).toBeEnabled())
+    expect(screen.getByRole('button', { name: 'Start runtime' })).toBeDisabled()
+  })
+
+  it('refuses to start a runtime the server says it cannot host', async () => {
+    // A Windows-native server reports the runtime as unavailable. Offering the
+    // control anyway would let a user press a button that cannot work, and hide
+    // the one sentence that says what to do about it.
+    const project = makeProject({ name: 'AgentMux' })
+    routeFetch({
+      'GET /api/server': { body: makeServerInfo() },
+      'GET /api/projects': { body: { projects: [project], count: 1 } },
+    })
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'AgentMux' })
+
+    expect(screen.getByRole('button', { name: 'Start runtime' })).toBeDisabled()
+    expect(screen.getAllByText(/requires AgentMux Server to run inside WSL/).length).toBeGreaterThan(0)
+  })
+
+  it('shows the runtime’s own reason when a start fails, inside WSL or out of tmux', async () => {
+    const project = makeProject({ name: 'AgentMux' })
+    routeFetch({
+      'GET /api/server': { body: makeTerminalReadyServerInfo() },
+      'GET /api/projects': { body: { projects: [project], count: 1 } },
+      [`POST /api/projects/${project.id}/runtime/start`]: {
+        status: 503,
+        body: {
+          error: {
+            code: 'runtime_unavailable',
+            message: 'Runtime unavailable: tmux is not installed in linux.',
+          },
+        },
+      },
+    })
+
+    render(<App />)
+    await screen.findByRole('heading', { name: 'AgentMux' })
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start runtime' }))
+
+    expect(await screen.findByText(/tmux is not installed in linux/)).toBeInTheDocument()
   })
 })

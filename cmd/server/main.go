@@ -1,9 +1,15 @@
 // Command server runs the AgentMux backend.
 //
-// Phase 1 scope: configuration, the metadata store, the collection-aware
-// project model, and the REST surface for managing projects. There is no
-// terminal runtime yet, and the server deliberately does not pretend
-// otherwise: GET /api/server reports terminalRuntimeImplemented false.
+// Phase 2 scope: everything from Phase 1, plus the persistent terminal
+// runtime. A project's session is a tmux session that outlives this process,
+// named after the project id, started in the project's runtime path. There is
+// still no Web Terminal: nothing streams a session's output to a browser, and
+// the UI offers start and stop rather than a terminal it cannot fill.
+//
+// On Windows the server belongs inside WSL. The runtime is tmux and the
+// programs it hosts are Linux processes, so a server started on the Windows
+// side has no runtime at all; it says so through GET /api/server rather than
+// reaching across the boundary one command at a time.
 package main
 
 import (
@@ -27,6 +33,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/httpapi"
 	"github.com/kutonlagos/agentmux/internal/logging"
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
@@ -99,8 +106,10 @@ func run(args []string) error {
 		logger.Info("schema is up to date", "schemaVersion", migration.Version)
 	}
 
-	installID, err := store.Settings().GetOrCreate(ctx, storage.SettingInstallID, newInstallID)
-	if err != nil {
+	// The identifier is created and kept in the settings table. It is not
+	// returned by the API: an unauthenticated endpoint should not hand out a
+	// value that is stable across every request from a machine.
+	if _, err := store.Settings().GetOrCreate(ctx, storage.SettingInstallID, newInstallID); err != nil {
 		return err
 	}
 
@@ -122,14 +131,51 @@ func run(args []string) error {
 		"pathMapper", systemInfo.PathMapper,
 	)
 
+	// The project service and the runtime manager each need the other: a
+	// project's status comes from its runtime, and a runtime is resolved from a
+	// project. The bridge is filled in on the next line, which is cheaper to
+	// read than either a constructor that takes an unbuilt collaborator or a
+	// setter that makes the wiring order a runtime precondition.
+	bridge := &runtimeBridge{}
 	projectService, err := project.NewService(project.Options{
 		Repository: store.Projects(),
 		Host:       adapter,
 		Logger:     logger,
+		Runtime:    bridge,
 	})
 	if err != nil {
 		return err
 	}
+
+	runtimes, err := session.NewManager(session.ManagerOptions{
+		Backend: session.NewTmuxBackend(session.TmuxOptions{
+			Socket: orDefault(cfg.Terminal.Socket, session.DefaultTmuxSocket),
+			Logger: logger,
+		}),
+		Projects:      projectService,
+		Store:         store.Runtimes(),
+		Shell:         cfg.Terminal.Shell,
+		Cols:          cfg.Terminal.Cols,
+		Rows:          cfg.Terminal.Rows,
+		HistoryChunks: cfg.Terminal.HistoryChunks,
+		HistoryBytes:  cfg.Terminal.HistoryBytes,
+		Logger:        logger,
+	})
+	if err != nil {
+		return err
+	}
+	bridge.manager = runtimes
+
+	// Closing the manager detaches every control client. It deliberately does
+	// not touch the sessions: a terminal that ended because the server was
+	// restarted would make the runtime pointless.
+	defer func() {
+		if err := runtimes.Close(); err != nil {
+			logger.Warn("could not close the runtime manager", "error", err)
+		}
+	}()
+
+	reconcileRuntimes(ctx, runtimes, logger)
 
 	discoverer, err := project.NewDiscoverer(project.DiscovererOptions{
 		Host:           adapter,
@@ -154,8 +200,8 @@ func run(args []string) error {
 		Host:       adapter,
 		Projects:   projectService,
 		Discoverer: discoverer,
+		Runtime:    runtimes,
 		Logger:     logger,
-		InstallID:  installID,
 		WebDir:     webDir,
 	})
 	if err != nil {
@@ -231,7 +277,11 @@ func loadConfig(args []string) (*config.Config, error) {
 		runtimeMode   = flags.String("runtime-mode", "", "runtime mode: auto, native, wsl")
 		runtimeDistro = flags.String("runtime-distro", "", "WSL distribution name")
 		webDir        = flags.String("web-dir", "", "directory holding the built frontend")
-		showVersion   = flags.Bool("version", false, "print the version and exit")
+		shell         = flags.String("shell", "", "shell a terminal session runs (default: the host's)")
+		tmuxSocket    = flags.String("tmux-socket", "", "tmux socket name for AgentMux sessions (default "+session.DefaultTmuxSocket+")")
+		debugAPI      = flags.Bool("debug-api", false,
+			"enable the diagnostic runtime API under /api/debug; it exposes raw terminal input and output")
+		showVersion = flags.Bool("version", false, "print the version and exit")
 
 		projectsRoots stringList
 	)
@@ -253,6 +303,7 @@ func loadConfig(args []string) (*config.Config, error) {
 		Defaults: config.Defaults{
 			ProjectsRoots: host.DefaultProjectsRoots(),
 			DataDir:       host.DefaultDataDir(),
+			TerminalShell: host.DefaultShell(),
 		},
 		Overrides: config.Overrides{
 			ConfigPath:    *configPath,
@@ -265,8 +316,63 @@ func loadConfig(args []string) (*config.Config, error) {
 			RuntimeMode:   *runtimeMode,
 			RuntimeDistro: *runtimeDistro,
 			WebDir:        *webDir,
+			TerminalShell: *shell,
+			TmuxSocket:    *tmuxSocket,
+			DebugAPI:      *debugAPI,
 		},
 	})
+}
+
+// runtimeBridge lets the project service ask the runtime manager for a
+// project's status while the runtime manager asks the project service to
+// resolve a project.
+//
+// The cycle is real and belongs to the domain, not to a mistake in the wiring:
+// a project's status is a fact about its runtime. Breaking it with a pointer
+// that is filled in immediately keeps both constructors honest - each takes
+// exactly what it needs - and keeps the manager's nil case safe, so a status
+// read before the manager exists answers "nothing to say" rather than panicking.
+type runtimeBridge struct {
+	manager *session.Manager
+}
+
+// ProjectStatus implements project.RuntimeState.
+func (b *runtimeBridge) ProjectStatus(projectID string) string {
+	if b.manager == nil {
+		return ""
+	}
+	return b.manager.ProjectStatus(projectID)
+}
+
+// reconcileRuntimes matches what the store remembers against what is actually
+// running, and reports the difference.
+//
+// It never starts anything. A session that survived is adopted so its output
+// can be read again; a project whose session is gone is reported stopped, and
+// resuming it is the user's decision rather than a side effect of a restart.
+// A session with no project behind it is reported and left alone, because it
+// may hold work somebody needs and killing it would be a guess.
+func reconcileRuntimes(ctx context.Context, runtimes *session.Manager, logger *slog.Logger) {
+	report, err := runtimes.Reconcile(ctx)
+	if err != nil {
+		// A failure here means the runtime state could not be established, not
+		// that the server cannot run: project management does not depend on a
+		// terminal, so this is reported and the server carries on.
+		logger.Error("could not reconcile the terminal runtimes", "error", err)
+		return
+	}
+	logger.Info("terminal runtimes reconciled",
+		"running", report.Running,
+		"stopped", report.Stopped,
+		"orphans", len(report.Orphans),
+	)
+	for _, orphan := range report.Orphans {
+		logger.Warn("a terminal session belongs to no registered project; it is left running",
+			"session", orphan.Session,
+			"projectId", orphan.ProjectID,
+			"dir", orphan.Dir,
+		)
+	}
 }
 
 // stringList collects a repeatable string flag.
@@ -307,6 +413,19 @@ func displayAddress(cfg *config.Config) string {
 func orNone(value string) string {
 	if strings.TrimSpace(value) == "" {
 		return "(none)"
+	}
+	return value
+}
+
+// orDefault returns value, or fallback when value is blank.
+//
+// It exists because the session package treats an empty socket as "the user's
+// own tmux socket", which is right for a library and wrong for a product: an
+// AgentMux session must not appear in an unrelated tmux session list. The
+// product default is applied here, at the one place that decides.
+func orDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
 	}
 	return value
 }

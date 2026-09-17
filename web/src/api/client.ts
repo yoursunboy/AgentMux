@@ -12,6 +12,7 @@ import type {
   DiscoveryResult,
   Project,
   RegisterProjectInput,
+  Runtime,
   ServerInfo,
 } from './types'
 
@@ -60,6 +61,22 @@ export const ErrorCodes = {
   notFoundHttp: 'not_found',
   internal: 'internal_error',
   invalidRequest: 'invalid_request',
+
+  // Runtime codes. They are separate from the project codes because they mean
+  // something different to a user: a project failure is about their folder, a
+  // runtime failure is about the terminal inside it.
+  runtimeUnavailable: 'runtime_unavailable',
+  runtimeBackendUnavailable: 'runtime_backend_unavailable',
+  runtimeNotFound: 'runtime_not_found',
+  runtimeAlreadyRunning: 'runtime_already_running',
+  runtimeNotRunning: 'runtime_not_running',
+  runtimeStartFailed: 'runtime_start_failed',
+  runtimeStopFailed: 'runtime_stop_failed',
+  runtimeDestroyFailed: 'runtime_destroy_failed',
+  runtimeInputFailed: 'runtime_input_failed',
+  runtimeResizeFailed: 'runtime_resize_failed',
+  runtimeBackendFailure: 'runtime_backend_failure',
+  invalidTerminalSize: 'invalid_terminal_size',
 } as const
 
 /** The JSON envelope a failing response carries. */
@@ -187,5 +204,61 @@ export async function createProject(
   return body.project
 }
 
+/**
+ * A project's terminal runtime.
+ *
+ * A project that has never had one is reported as stopped rather than as a
+ * missing resource, so a caller renders one shape instead of two.
+ */
+export async function fetchRuntime(projectId: string, signal?: AbortSignal): Promise<Runtime> {
+  const body = await request<{ runtime: Runtime }>(
+    `/projects/${encodeURIComponent(projectId)}/runtime`,
+    { signal: signal ?? null },
+  )
+  return body.runtime
+}
+
+/**
+ * Start a project's runtime. It is idempotent: starting a running runtime
+ * returns it unchanged rather than failing.
+ */
+export async function startRuntime(projectId: string, signal?: AbortSignal): Promise<Runtime> {
+  const body = await request<{ runtime: Runtime }>(
+    `/projects/${encodeURIComponent(projectId)}/runtime/start`,
+    { method: 'POST', signal: signal ?? null },
+  )
+  return body.runtime
+}
+
+/**
+ * Stop whatever is running in a project's runtime.
+ *
+ * The terminal survives, with its scrollback; only the work in it ends. Removing
+ * the session is `destroyRuntime`, which is a different and irreversible thing.
+ */
+export async function stopRuntime(projectId: string, signal?: AbortSignal): Promise<Runtime> {
+  const body = await request<{ runtime: Runtime }>(
+    `/projects/${encodeURIComponent(projectId)}/runtime/stop`,
+    { method: 'POST', signal: signal ?? null },
+  )
+  return body.runtime
+}
+
+/**
+ * Remove a project's terminal session and everything in it. Destructive: the
+ * session, its scrollback, and its record are all gone afterwards.
+ *
+ * Nothing in Phase 2 calls this from the UI. It is here because the endpoint
+ * exists and a client that cannot express it would be a client that has to be
+ * changed later.
+ */
+export async function destroyRuntime(projectId: string, signal?: AbortSignal): Promise<Runtime> {
+  const body = await request<{ runtime: Runtime }>(
+    `/projects/${encodeURIComponent(projectId)}/runtime`,
+    { method: 'DELETE', signal: signal ?? null },
+  )
+  return body.runtime
+}
+
 /** Re-exported so callers do not import from two modules for one concept. */
-export type { Candidate, DiscoveryResult, Project, ServerInfo }
+export type { Candidate, DiscoveryResult, Project, Runtime, ServerInfo }

@@ -20,20 +20,38 @@ import (
 
 // Status values reported for a project.
 //
-// Phase 1 has no terminal runtime, so every project is StatusStopped. The
-// runtime-backed values are declared now because they are part of the API
-// contract the frontend renders; they are never produced yet.
+// A project's status is never stored. It is computed from what the terminal
+// runtime knows at the moment of the read, so a project cannot be reported as
+// running by a server that has lost track of its session - which is exactly
+// what a stored status would do after a crash.
 const (
 	StatusStopped      = "stopped"
+	StatusStarting     = "starting"
 	StatusRunning      = "running"
+	StatusStopping     = "stopping"
 	StatusReconnecting = "reconnecting"
+	StatusError        = "error"
+	StatusOrphan       = "orphan"
 )
+
+// RuntimeState reports what the terminal runtime knows about a project.
+//
+// The project model needs one thing from the runtime and nothing else, so this
+// is one method wide. Declaring it here rather than importing the runtime
+// keeps the dependency pointing one way: the runtime knows about projects,
+// projects know only that somebody can answer this question.
+type RuntimeState interface {
+	// ProjectStatus returns the project status for a project, or "" when the
+	// runtime has nothing to say about it - which is the ordinary case for a
+	// project whose terminal has never been started.
+	ProjectStatus(projectID string) string
+}
 
 // Project is a registered development directory managed by AgentMux.
 //
 // Runtime metadata (canonical PTY size, output sequence, controller lease)
-// deliberately does not appear here. It belongs to the session layer and
-// arrives in Phase 2.
+// deliberately does not appear here. It belongs to the session layer and is
+// reached through RuntimeState.
 type Project struct {
 	// ID is the stable identity. It never changes, including on rename.
 	ID string `json:"id"`
@@ -52,7 +70,7 @@ type Project struct {
 	// project, or "" when it is a direct child of its Projects Root.
 	CollectionPath string `json:"collectionPath"`
 
-	// Status is derived, not stored. Phase 1 always reports StatusStopped.
+	// Status is derived, never stored. It comes from the runtime.
 	Status string `json:"status"`
 
 	// PinnedSlot reserves a workspace panel position. Nil means unpinned.
@@ -66,13 +84,29 @@ type Project struct {
 	LastOpenedAt *time.Time `json:"lastOpenedAt"`
 }
 
+// SessionPrefix is the namespace every AgentMux runtime session name carries.
+//
+// It exists so that AgentMux can tell its own sessions apart from any others
+// sharing a tmux server: a name outside this namespace is not AgentMux's to
+// report, interrupt, or destroy.
+const SessionPrefix = "amx-"
+
+// SessionNameFor is the one place a session name is spelled.
+//
+// Everything that creates, looks up, or reclaims a session calls this rather
+// than building the string itself, because two spellings of the same name are
+// two different sessions, and the failure that produces - a project whose
+// terminal is running but unreachable - is invisible until it matters.
+func SessionNameFor(projectID string) string {
+	return SessionPrefix + projectID
+}
+
 // SessionName is the runtime session identifier for this project.
 //
 // The name is derived from the stable ID, never from the display name, so
-// that renaming a project cannot orphan a running session. Phase 2 creates
-// sessions with this name; Phase 1 only fixes the rule.
+// that renaming a project cannot orphan a running session.
 func (p *Project) SessionName() string {
-	return "amx-" + p.ID
+	return SessionNameFor(p.ID)
 }
 
 // String renders a project for logs without exposing anything sensitive.

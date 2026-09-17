@@ -6,23 +6,28 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 1**. The project model and the server foundation
-exist and work; the terminal does not exist yet.
+This repository is at **version 0.1.0, end of Phase 2**. The project model, the server foundation,
+and the persistent session runtime exist and work. The terminal view does not exist yet.
 
 | Works today | Does not exist yet |
 | --- | --- |
-| Server status and capability reporting | Any terminal or session runtime |
-| Projects Root configuration, Windows/WSL and Linux path mapping | tmux, session start/stop, terminal output |
+| Server status and capability reporting | Any terminal view in the browser |
+| Projects Root configuration, Windows/WSL and Linux path mapping | WebSocket traffic of any kind |
 | Bounded discovery of project candidates | Claude Code launch, prompts, Hooks |
-| Register an existing project | WebSocket traffic of any kind |
-| Create a project, optionally with `git init` | CC Switch / provider switching |
-| SQLite metadata store with migrations | Controller / viewer roles |
-| Phase 1 workspace UI (global bar, project panel, project manager) | Codex, Gemini, OpenCode |
+| Register an existing project | CC Switch / provider switching |
+| Create a project, optionally with `git init` | Controller / viewer roles |
+| SQLite metadata store with migrations | Codex, Gemini, OpenCode |
+| Persistent tmux sessions that outlive the server | |
+| Runtime start / stop / destroy, with reconciliation on restart | |
+| Raw byte-accurate input, real PTY resize, sequenced output | |
+| Phase 1 workspace UI (global bar, project panel, project manager) | |
+| Phase 2 runtime controls: running/stopped, start, stop | |
 
-The product is not described here as if it were finished. `GET /api/server` reports
-`terminalRuntimeImplemented: false` and `provider.integrated: false`, the UI renders no terminal, and
-the provider switch is a disabled control that says "Coming later" rather than a working one. See
-`docs/ROADMAP.md` for the phase table.
+The product is not described here as if it were finished. There is no terminal view — the runtime is
+real, and the panel says plainly that the terminal UI arrives in Phase 4 rather than drawing an empty
+rectangle. `provider.integrated` is false and the provider switch is a disabled control that says
+"Coming later". See `docs/ROADMAP.md` for the phase table and `docs/RUNTIME.md` for how the runtime
+works and what it does not do.
 
 ## Requirements
 
@@ -37,10 +42,15 @@ To build the frontend:
 - Node.js 22 or newer with npm;
 - no global tooling: everything is a project devDependency.
 
-Optional, and only relevant later:
+For the session runtime:
 
-- WSL2 with a distribution, for the Windows + WSL runtime mode;
-- tmux and the Claude Code CLI, from Phase 2 and Phase 3.
+- tmux, on the same side of the WSL boundary as the server.
+
+**The AgentMux server runs where the sessions run.** On Windows that means inside WSL: tmux, the
+shell a session hosts, and later the coding agent are all Linux processes, and a Windows-native
+server cannot own them. Start the server from inside the distribution — see below. A server started
+on Windows still serves the project model and reports the runtime as unavailable, with the reason in
+`GET /api/server`.
 
 ## Running it
 
@@ -77,6 +87,32 @@ cd web && npm run build
 
 Then open `http://127.0.0.1:8787`.
 
+### Windows: run the server inside WSL
+
+The server is a Go binary and runs anywhere Go does, but a session runtime is a Linux process tree.
+On Windows, start the server inside the distribution:
+
+```bash
+# from WSL
+cd "/mnt/d/AI/Projects/2026 AgentMux/AgentMux"
+go build -o bin/agentmux-server ./cmd/server
+./bin/agentmux-server -projects-root "/mnt/d/AI/Projects" -web-dir web/dist
+```
+
+Or, from Windows, without leaving PowerShell:
+
+```powershell
+wsl -d Ubuntu-24.04 -- ./bin/agentmux-server -projects-root /mnt/d/AI/Projects -web-dir web/dist
+```
+
+Both are the same thing: the process that owns tmux is the process inside Linux. Pick your
+distribution with `-d`; AgentMux never assumes a name, and `-runtime-distro` records the choice for
+the paths it reports.
+
+The Projects Root is spelled for the side the server runs on. A WSL server wants
+`/mnt/d/AI/Projects`; a Windows server wants `D:\AI\Projects`. AgentMux maps between them for
+display, so a project registered from either side shows the same directory.
+
 ## Configuration
 
 Flags override the configuration file, which overrides the platform defaults. The flags worth
@@ -89,9 +125,16 @@ knowing:
 | `-host`, `-port` | Listen address. Default `127.0.0.1:8787`. |
 | `-runtime-mode <mode>` | `auto`, `native`, or `wsl`. |
 | `-runtime-distro <name>` | The WSL distribution to use. |
+| `-shell <path>` | The shell a terminal session runs. Defaults to the host's. |
+| `-tmux-socket <name>` | The tmux socket AgentMux sessions live on. Default `agentmux`. |
 | `-config <file>` | Use a specific JSON configuration file. |
 | `-web-dir <dir>` | Serve the built frontend from this directory. |
+| `-debug-api` | Enable the diagnostic endpoints under `/api/debug`. Off by default; they accept raw terminal input and output. |
 | `-log-level`, `-log-format` | `debug`/`info`/`warn`/`error`, and `text`/`json`. |
+
+`-tmux-socket` is worth knowing about: AgentMux runs its sessions on its own socket, so
+`tmux ls` in your shell does not show them and your own tmux work is never touched by Destroy.
+`tmux -L agentmux ls` does.
 
 **The Projects Root is the one setting that matters.** AgentMux never invents one and never scans
 outside the configured roots. The default on Windows is `D:\AI\Projects`. On Linux it is
@@ -114,8 +157,13 @@ The default data directory is `%AppData%\AgentMux` on Windows and `$XDG_CONFIG_H
 is written into your project folders: AgentMux reads them and records their paths, and the only write
 it ever performs is the directory you explicitly ask it to create.
 
-The schema is `projects`, `settings`, and `schema_migrations`. There is no runtime table yet,
-because there is no runtime state yet.
+The schema is `projects`, `settings`, `project_runtime`, and `schema_migrations`.
+
+`project_runtime` holds only what has to survive a restart: which backend, which session name, the
+last known state, the canonical terminal size, and when it changed. It is not a log and not a buffer.
+Terminal output lives in tmux's own scrollback and in memory for as long as the server is running;
+nothing about it is written to SQLite, because a database row per chunk of terminal output would be
+a write-amplifying copy of something tmux already keeps.
 
 ## Recommended local folder layout
 
@@ -211,8 +259,7 @@ Workspace:
 └──────────────┴──────────────┴──────────────┘
 ```
 
-Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is the target; today each panel states that the terminal is not available and shows the
-project as the server has it recorded.
+Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is the target. Today each panel shows the runtime's real state — running or stopped, with Start and Stop — and says that the terminal view arrives in Phase 4.
 
 ## Tests
 
@@ -223,7 +270,25 @@ cd web && npm test     # frontend (vitest)
 
 The backend tests exercise real SQLite databases in temporary directories, real host adapters, and a
 fully wired HTTP server through `httptest`. The frontend tests render the real components and drive
-them the way a user would. Nothing in either suite touches a real project directory.
+them the way a user would. Nothing in either suite touches a real project directory, and nothing
+writes outside a `t.TempDir()`.
+
+The session suite is different from the rest: it drives a **real tmux** on a socket of its own, so it
+needs tmux and it skips when tmux is not there. On Windows that means running it from inside WSL:
+
+```bash
+# from WSL, with the repository on /mnt
+cd "/mnt/d/AI/Projects/2026 AgentMux/AgentMux"
+go test ./internal/session/
+```
+
+A Windows shell can cross-compile the test binary for the distribution when Go is not installed
+inside it:
+
+```bash
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go test -c -o /tmp/session.test ./internal/session/
+wsl -d Ubuntu-24.04 -- /tmp/session.test -test.v
+```
 
 ## Documentation reading order
 
@@ -233,9 +298,10 @@ them the way a user would. Nothing in either suite touches a real project direct
 4. `docs/UI_SPEC.md`
 5. `docs/PROTOCOL.md`
 6. `docs/ROADMAP.md`
-7. `docs/API.md` — what this build actually serves
-8. `CLAUDE.md`
-9. `.claude/rules/`
+7. `docs/RUNTIME.md` — how sessions actually run, and what is known to be fragile
+8. `docs/API.md` — what this build actually serves
+9. `CLAUDE.md`
+10. `.claude/rules/`
 
 ## Development principle
 
@@ -251,8 +317,10 @@ Browser
 → real Claude Code terminal
 ```
 
-with reliable reconnect behavior and safe multi-device control. Phase 1 deliberately stops one step
-short of it: the folder model, the store, and the management API are proven first, because a terminal
-attached to the wrong directory is worse than no terminal.
+with reliable reconnect behavior and safe multi-device control. Phase 1 proved the folder model, the
+store, and the management API first, because a terminal attached to the wrong directory is worse than
+no terminal. Phase 2 proved the persistent runtime — sessions that outlive the server, byte-accurate
+input, a real PTY — without putting a terminal in the browser yet, because a terminal view over a
+runtime that loses output is worse than no terminal view.
 
 CC Switch integration, Claude Hooks, state detection, notifications, and additional AI tools are later milestones.

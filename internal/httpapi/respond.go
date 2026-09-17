@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
 )
 
 // Error codes produced by the HTTP layer itself. Codes produced by the project
@@ -77,7 +78,7 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 // filesystem path in an error body is noise to a user and can leak more about
 // the host than the client needs.
 func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
-	code := project.CodeOf(err)
+	code := codeOf(err)
 	if code == "" {
 		if log != nil {
 			log.Error("request failed", "error", err)
@@ -91,13 +92,33 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 	if status >= http.StatusInternalServerError && log != nil {
 		log.Error("request failed", "code", code, "error", err)
 	}
+	writeError(w, status, code, messageFor(err, code), detailsOf(err))
+}
 
-	var projectErr *project.Error
-	details := map[string]any(nil)
-	if errors.As(err, &projectErr) {
-		details = projectErr.Details
+// codeOf returns the stable code carried by err, whichever layer produced it.
+//
+// Two packages define codes - the project model and the runtime - and both are
+// passed through to the client unchanged, so a client switches on one
+// vocabulary across the whole API. The HTTP layer adds only the codes for
+// failures it produces itself.
+func codeOf(err error) string {
+	if code := project.CodeOf(err); code != "" {
+		return code
 	}
-	writeError(w, status, code, messageFor(err, code), details)
+	return session.CodeOf(err)
+}
+
+// detailsOf returns the structured context attached to err, if any.
+func detailsOf(err error) map[string]any {
+	var projectErr *project.Error
+	if errors.As(err, &projectErr) {
+		return projectErr.Details
+	}
+	var sessionErr *session.Error
+	if errors.As(err, &sessionErr) {
+		return sessionErr.Details
+	}
+	return nil
 }
 
 // messageFor returns the user-facing message for a failure.
@@ -105,6 +126,10 @@ func messageFor(err error, code string) string {
 	var projectErr *project.Error
 	if errors.As(err, &projectErr) && projectErr.Message != "" {
 		return projectErr.Message
+	}
+	var sessionErr *session.Error
+	if errors.As(err, &sessionErr) && sessionErr.Message != "" {
+		return sessionErr.Message
 	}
 	switch code {
 	case project.CodeStorageFailure:
@@ -114,20 +139,30 @@ func messageFor(err error, code string) string {
 	}
 }
 
-// statusForCode maps a project-model error code to an HTTP status.
+// statusForCode maps a service error code to an HTTP status.
 //
 // The mapping is explicit rather than derived from a prefix, so that adding a
 // code forces a decision about what it means to a client.
+//
+// Some codes are deliberately shared between the two layers and appear here
+// once: project.CodeInvalidInput and session.CodeInvalidInput are both
+// "invalid_input", project.CodeStorageFailure and session.CodeStorageFailure
+// are both "storage_failure", and project.CodeNotFound and
+// session.CodeProjectNotFound are both "project_not_found". That is the point
+// of the shared vocabulary - a client that switches on "project_not_found" does
+// not need to know which layer produced it.
 func statusForCode(code string) int {
 	switch code {
 	case project.CodeInvalidInput,
 		project.CodeInvalidName,
 		project.CodeNotADirectory,
-		project.CodePathIsProjectsRoot:
+		project.CodePathIsProjectsRoot,
+		session.CodeInvalidSize:
 		return http.StatusBadRequest
 
 	case project.CodePathNotFound,
-		project.CodeNotFound:
+		project.CodeNotFound,
+		session.CodeNotFound:
 		return http.StatusNotFound
 
 	case project.CodePathNotAccessible,
@@ -135,19 +170,35 @@ func statusForCode(code string) int {
 		return http.StatusForbidden
 
 	case project.CodeAlreadyRegistered,
-		project.CodeTargetExists:
+		project.CodeTargetExists,
+		// The project is fine; its runtime is already in the state the caller
+		// asked for, or is in one that makes the call meaningless. That is a
+		// conflict with the current state, not a bad request and not a missing
+		// resource.
+		session.CodeAlreadyRunning,
+		session.CodeNotRunning:
 		return http.StatusConflict
 
 	case project.CodeRuntimePathMappingFailed:
 		return http.StatusUnprocessableEntity
 
-	case project.CodeGitUnavailable:
+	case project.CodeGitUnavailable,
+		// runtime_unavailable is the structural case: this server cannot host a
+		// terminal runtime at all, whatever the user does with tmux. 503 rather
+		// than 500 because the service is genuinely unavailable rather than
+		// broken, and because the message says how to fix it.
+		session.CodeUnavailable,
+		session.CodeBackendUnavailable:
 		return http.StatusServiceUnavailable
 
-	case project.CodeGitInitFailed:
-		return http.StatusInternalServerError
-
-	case project.CodeStorageFailure:
+	case project.CodeGitInitFailed,
+		project.CodeStorageFailure,
+		session.CodeStartFailed,
+		session.CodeStopFailed,
+		session.CodeDestroyFailed,
+		session.CodeInputFailed,
+		session.CodeResizeFailed,
+		session.CodeBackendFailure:
 		return http.StatusInternalServerError
 
 	default:

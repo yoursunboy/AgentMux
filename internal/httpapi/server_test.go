@@ -17,6 +17,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
 )
 
@@ -32,22 +33,65 @@ type harness struct {
 	root    string
 	dataDir string
 	store   *storage.Store
+
+	// backend is the session backend the server's runtime manager talks to. It
+	// is a test double; see fakeBackend.
+	backend *fakeBackend
+
+	// runtime is the same manager the server holds, kept here so a test can
+	// read the sequence numbers and states the handlers produced.
+	runtime *session.Manager
+}
+
+// harnessOptions describes the environment a test wants its server to believe
+// it is running in.
+//
+// The runtime environment is pinned rather than detected, so that the suite
+// asserts the same things on Windows and inside WSL. A test that asked the real
+// host adapter whether tmux is installed would pass or fail depending on the
+// machine running it, which is the opposite of what a test is for. The real
+// question - is tmux there, and does a session really survive a restart - is
+// answered by the integration run, not here.
+type harnessOptions struct {
+	// prepare populates the Projects Root before the server is built.
+	prepare func(root string)
+
+	// runtimeAvailable says whether this server's environment can host a
+	// terminal runtime. The default, false, is the Windows-native case: a
+	// server that can manage projects and cannot host a session.
+	//
+	// When it is true the tmux probe is pinned as available too, because "this
+	// environment can host a runtime" means both, and a test that wanted them
+	// to disagree would be testing a state that does not exist.
+	runtimeAvailable bool
+
+	// tmuxMissing is the third case on its own: an environment that could host
+	// a runtime with a tmux that is not installed in it.
+	tmuxMissing bool
+
+	// debugAPI turns on the diagnostic runtime endpoints.
+	debugAPI bool
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	return newHarnessWith(t, nil)
+	return newHarnessOpts(t, harnessOptions{})
 }
 
 // newHarnessWith builds a harness whose Projects Root is pre-populated by
 // prepare, which receives the root path.
 func newHarnessWith(t *testing.T, prepare func(root string)) *harness {
 	t.Helper()
+	return newHarnessOpts(t, harnessOptions{prepare: prepare})
+}
+
+func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
+	t.Helper()
 
 	root := t.TempDir()
 	dataDir := t.TempDir()
-	if prepare != nil {
-		prepare(root)
+	if o.prepare != nil {
+		o.prepare(root)
 	}
 
 	cfg, err := config.Load(config.LoadOptions{
@@ -55,6 +99,9 @@ func newHarnessWith(t *testing.T, prepare func(root string)) *harness {
 		// An empty environment, so a stray AGENTMUX_* variable in the
 		// developer's shell cannot change what the tests assert.
 		Environ: func(string) (string, bool) { return "", false },
+		Overrides: config.Overrides{
+			DebugAPI: o.debugAPI,
+		},
 	})
 	if err != nil {
 		t.Fatalf("config.Load returned an error: %v", err)
@@ -72,10 +119,24 @@ func newHarnessWith(t *testing.T, prepare func(root string)) *harness {
 	if _, err := store.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
+	// main.go creates the installation id on every start. Doing the same here
+	// keeps the harness honest about what a running server's database contains,
+	// which is what lets a test assert the value is stored and not returned.
+	if _, err := store.Settings().GetOrCreate(context.Background(), storage.SettingInstallID,
+		func() (string, error) { return "inst_test", nil }); err != nil {
+		t.Fatalf("could not create the installation id: %v", err)
+	}
 
-	adapter, err := host.New(host.Options{Mode: config.RuntimeModeNative, Roots: []string{root}})
+	real, err := host.New(host.Options{Mode: config.RuntimeModeNative, Roots: []string{root}})
 	if err != nil {
 		t.Fatalf("host.New returned an error: %v", err)
+	}
+	// Everything about the host is real except the facts the tests choose:
+	// whether a terminal runtime can run here, and whether tmux is installed.
+	adapter := pinnedHost{
+		Adapter:          real,
+		runtimeAvailable: o.runtimeAvailable,
+		tmuxAvailable:    o.runtimeAvailable && !o.tmuxMissing,
 	}
 
 	service, err := project.NewService(project.Options{
@@ -94,13 +155,29 @@ func newHarnessWith(t *testing.T, prepare func(root string)) *harness {
 		t.Fatalf("project.NewDiscoverer returned an error: %v", err)
 	}
 
+	backend := newFakeBackend()
+	manager, err := session.NewManager(session.ManagerOptions{
+		Backend:  backend,
+		Projects: service,
+		Store:    store.Runtimes(),
+		Logger:   discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("session.NewManager returned an error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := manager.Close(); err != nil {
+			t.Errorf("closing the runtime manager failed: %v", err)
+		}
+	})
+
 	server, err := New(Options{
 		Config:     cfg,
 		Host:       adapter,
 		Projects:   service,
 		Discoverer: discoverer,
+		Runtime:    manager,
 		Logger:     discardLogger(),
-		InstallID:  "inst_test",
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
 		WebDir:     "",
 		Now:        func() time.Time { return time.Date(2026, time.September, 17, 12, 0, 30, 0, time.UTC) },
@@ -108,7 +185,15 @@ func newHarnessWith(t *testing.T, prepare func(root string)) *harness {
 	if err != nil {
 		t.Fatalf("httpapi.New returned an error: %v", err)
 	}
-	return &harness{t: t, server: server, root: root, dataDir: dataDir, store: store}
+	return &harness{
+		t:       t,
+		server:  server,
+		root:    root,
+		dataDir: dataDir,
+		store:   store,
+		backend: backend,
+		runtime: manager,
+	}
 }
 
 // discardLogger keeps request records out of the test output, so a failure is
@@ -221,9 +306,6 @@ func TestServerInfoReportsTheFoundation(t *testing.T) {
 	if info.Status != "online" {
 		t.Errorf("status = %q, want %q", info.Status, "online")
 	}
-	if info.InstallID != "inst_test" {
-		t.Errorf("installId = %q, want the value the server was built with", info.InstallID)
-	}
 	if info.ProjectsRoot != h.root {
 		t.Errorf("projectsRoot = %q, want %q", info.ProjectsRoot, h.root)
 	}
@@ -244,18 +326,21 @@ func TestServerInfoReportsTheFoundation(t *testing.T) {
 	}
 }
 
-// TestServerInfoDoesNotClaimATerminal is the honesty check. A client must be
-// able to disable the terminal before Phase 2 exists, rather than rendering an
-// empty pane.
+// TestServerInfoDoesNotClaimATerminal is the honesty check. A build that
+// contains the runtime still must not claim a terminal works on a host that
+// cannot run one, and the provider switch must stay off until it is integrated.
 func TestServerInfoDoesNotClaimATerminal(t *testing.T) {
 	h := newHarness(t)
 	info := decode[serverInfoResponse](t, h.call(http.MethodGet, "/api/server", ""))
 
-	if info.TerminalRuntimeImplemented {
-		t.Error("terminalRuntimeImplemented is true, but no runtime exists in Phase 1")
+	if !info.TerminalRuntimeImplemented {
+		t.Error("terminalRuntimeImplemented is false, but Phase 2 contains the runtime")
+	}
+	if info.RuntimeAvailable {
+		t.Error("runtimeAvailable is true on a host pinned to the Windows-native case")
 	}
 	if info.Features["terminal"] {
-		t.Error("features.terminal is true, but no runtime exists in Phase 1")
+		t.Error("features.terminal is true, but this server cannot host a terminal")
 	}
 	if info.Provider.Integrated {
 		t.Error("provider.integrated is true, but CC Switch is not integrated")
@@ -266,6 +351,13 @@ func TestServerInfoDoesNotClaimATerminal(t *testing.T) {
 	for _, feature := range []string{"projectRegistration", "projectCreation", "projectDiscovery"} {
 		if !info.Features[feature] {
 			t.Errorf("features.%s is false, but Phase 1 implements it", feature)
+		}
+	}
+	// The controller features belong to a later phase and must stay off, so the
+	// UI does not offer a control that has nothing behind it.
+	for _, feature := range []string{"providerSwitch", "claudeHooks", "controllerTransfer"} {
+		if info.Features[feature] {
+			t.Errorf("features.%s is true, but it is not implemented yet", feature)
 		}
 	}
 }
@@ -1000,6 +1092,7 @@ func TestStaticHandlerServesTheBuildAndFallsBackToIndex(t *testing.T) {
 		Host:       h.server.host,
 		Projects:   h.server.projects,
 		Discoverer: h.server.discoverer,
+		Runtime:    h.runtime,
 		Logger:     discardLogger(),
 		WebDir:     webDir,
 	})
@@ -1064,6 +1157,7 @@ func TestNewRequiresItsCollaborators(t *testing.T) {
 		Host:       h.server.host,
 		Projects:   h.server.projects,
 		Discoverer: h.server.discoverer,
+		Runtime:    h.runtime,
 	}
 
 	tests := []struct {
@@ -1074,6 +1168,10 @@ func TestNewRequiresItsCollaborators(t *testing.T) {
 		{"no host adapter", func(o *Options) { o.Host = nil }},
 		{"no project service", func(o *Options) { o.Projects = nil }},
 		{"no discoverer", func(o *Options) { o.Discoverer = nil }},
+		// A server without a runtime manager cannot answer a single runtime
+		// request, so it must be refused at construction rather than turning
+		// into a panic inside a handler.
+		{"no runtime manager", func(o *Options) { o.Runtime = nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

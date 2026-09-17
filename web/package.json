@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "AgentMux web client (Phase 1: project manager only; no terminal runtime yet).",
+  "description": "AgentMux web client (Phase 2: project manager and runtime controls; no terminal view yet).",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",

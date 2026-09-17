@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,12 @@ type providerStatus struct {
 
 // serverInfoResponse is the body of GET /api/server. It contains no secrets:
 // no credentials, tokens, or API keys, and no provider configuration.
+//
+// The installation identifier is deliberately not here. It is stored, and it
+// stays in the settings table, but it is not something a client needs and it is
+// not something an unauthenticated endpoint should hand out: an identifier that
+// is stable across every request from a machine is a tracking token whether or
+// not it is called a credential.
 type serverInfoResponse struct {
 	AppName string `json:"appName"`
 	Version string `json:"version"`
@@ -38,16 +45,23 @@ type serverInfoResponse struct {
 	StartedAt     string `json:"startedAt"`
 	UptimeSeconds int64  `json:"uptimeSeconds"`
 
-	// InstallID is an opaque identifier for this installation, not a
-	// credential.
-	InstallID string `json:"installId,omitempty"`
-
 	Host        string `json:"host"`
 	HostArch    string `json:"hostArch"`
 	RuntimeMode string `json:"runtimeMode"`
 	RuntimeOS   string `json:"runtimeOs"`
 	Distro      string `json:"distro,omitempty"`
 	PathMapper  string `json:"pathMapper"`
+
+	// Environment is where the server process itself is running, which on
+	// Windows is not where the runtime runs.
+	Environment string `json:"environment"`
+
+	// RuntimeAvailable reports whether a persistent terminal runtime can
+	// execute here at all, and RuntimeUnavailableReason says what to do about
+	// it when it cannot. A client must not render a terminal, or offer to start
+	// one, while this is false.
+	RuntimeAvailable         bool   `json:"runtimeAvailable"`
+	RuntimeUnavailableReason string `json:"runtimeUnavailableReason,omitempty"`
 
 	// ProjectsRoot is the first configured root: the default target for a new
 	// project. ProjectsRoots is the full ordered list.
@@ -60,9 +74,19 @@ type serverInfoResponse struct {
 	ConfigFile    string `json:"configFile,omitempty"`
 	WebDirectory  string `json:"webDirectory,omitempty"`
 
-	// TerminalRuntimeImplemented is false until Phase 2. A client must not
-	// render a terminal it cannot fill.
+	// TerminalRuntimeImplemented reports whether this build contains the
+	// runtime at all. It is a statement about the software, while
+	// RuntimeAvailable is a statement about the machine: a build with the
+	// runtime installed on a Windows host that is not WSL has this true and
+	// that false, and both facts matter.
 	TerminalRuntimeImplemented bool `json:"terminalRuntimeImplemented"`
+
+	// TerminalBlocker is why a terminal cannot be offered here, in one field,
+	// and is empty when it can. It is the warning below, promoted: a client
+	// that had to find the right sentence in a list of warnings would be a
+	// second place the diagnosis is reconstructed, and the first place it
+	// would get wrong is the machine that has two problems at once.
+	TerminalBlocker string `json:"terminalBlocker,omitempty"`
 
 	Dependencies []host.Dependency `json:"dependencies"`
 	Provider     providerStatus    `json:"provider"`
@@ -86,6 +110,13 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		firstRoot = roots[0]
 	}
 
+	dependencies := s.host.CheckDependencies(ctx)
+	tmuxAvailable := false
+	if dep, ok := findDependency(dependencies, "tmux"); ok {
+		tmuxAvailable = dep.Available
+	}
+	terminalReady := info.RuntimeAvailable && tmuxAvailable && version.TerminalRuntimeImplemented
+
 	now := s.now()
 	response := serverInfoResponse{
 		AppName: version.AppName,
@@ -95,7 +126,6 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 
 		StartedAt:     s.startedAt.UTC().Format(time.RFC3339),
 		UptimeSeconds: int64(now.Sub(s.startedAt).Seconds()),
-		InstallID:     s.installID,
 
 		Host:        string(info.HostOS),
 		HostArch:    info.HostArch,
@@ -103,6 +133,10 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		RuntimeOS:   string(info.RuntimeOS),
 		Distro:      info.Distro,
 		PathMapper:  info.PathMapper,
+
+		Environment:              string(info.Environment),
+		RuntimeAvailable:         info.RuntimeAvailable,
+		RuntimeUnavailableReason: info.RuntimeUnavailableReason,
 
 		ProjectsRoot:   firstRoot,
 		ProjectsRoots:  roots,
@@ -114,7 +148,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		WebDirectory:  s.webDir,
 
 		TerminalRuntimeImplemented: version.TerminalRuntimeImplemented,
-		Dependencies:               s.host.CheckDependencies(ctx),
+		Dependencies:               dependencies,
 		Provider: providerStatus{
 			Tool:       "claude",
 			Integrated: false,
@@ -125,12 +159,28 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 			"projectCreation":     true,
 			"projectDiscovery":    true,
 			"gitInit":             true,
-			"terminal":            false,
-			"providerSwitch":      false,
-			"claudeHooks":         false,
-			"controllerTransfer":  false,
+
+			// The runtime is a feature of the build, a property of the machine,
+			// and a property of what is installed on it. All three have to hold
+			// before a client may offer to start one, and the reason when they
+			// do not is reported as a warning rather than left to be guessed.
+			"terminal": terminalReady,
+
+			"providerSwitch":     false,
+			"claudeHooks":        false,
+			"controllerTransfer": false,
 		},
 		Warnings: append([]string(nil), s.cfg.Warnings...),
+	}
+
+	// A runtime that cannot execute is worth saying in the warnings list,
+	// because that is what the UI already renders as a banner. The reason is
+	// the one a user can act on: which side of the boundary to start the server
+	// on, or which environment is missing tmux.
+	blocker := runtimeBlocker(info, dependencies, terminalReady)
+	response.TerminalBlocker = blocker
+	if blocker != "" {
+		response.Warnings = append(response.Warnings, blocker)
 	}
 	if response.ProjectsRoots == nil {
 		response.ProjectsRoots = []string{}
@@ -142,6 +192,56 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		response.Warnings = []string{}
 	}
 	writeJSON(w, s.log, http.StatusOK, response)
+}
+
+// runtimeBlocker explains why the terminal runtime is not ready, or "" when it
+// is.
+//
+// The three cases are kept apart because they have three different fixes, and a
+// user who is told the wrong one will spend their time on the wrong thing: a
+// build without the runtime needs a different AgentMux, a server on the wrong
+// side of the WSL boundary needs to be started inside the distribution, and a
+// missing tmux needs installing - but only in the environment the probe
+// actually looked in, which is not always the one the user is typing in.
+func runtimeBlocker(info host.SystemInfo, deps []host.Dependency, ready bool) string {
+	if ready {
+		return ""
+	}
+	if !version.TerminalRuntimeImplemented {
+		return "This build of AgentMux has no terminal runtime."
+	}
+	if !info.RuntimeAvailable {
+		if reason := strings.TrimSpace(info.RuntimeUnavailableReason); reason != "" {
+			return reason
+		}
+		return "The terminal runtime is not available in this environment."
+	}
+
+	dep, ok := findDependency(deps, "tmux")
+	if !ok {
+		// The host says a runtime can run here but the probe list does not
+		// mention tmux at all, which means the two disagree. Say so rather than
+		// inventing a diagnosis.
+		return "The terminal runtime could not be confirmed: tmux was not probed for."
+	}
+	where := strings.TrimSpace(dep.ProbedIn)
+	if where == "" {
+		where = "the runtime environment"
+	}
+	return fmt.Sprintf(
+		"Runtime unavailable: tmux is not installed in %s, where terminal sessions run. "+
+			"Install it there (for example: sudo apt install tmux) and reload this page. "+
+			"AgentMux will not install it for you.", where)
+}
+
+// findDependency looks a probe result up by program name.
+func findDependency(deps []host.Dependency, name string) (host.Dependency, bool) {
+	for _, dep := range deps {
+		if dep.Name == name {
+			return dep, true
+		}
+	}
+	return host.Dependency{}, false
 }
 
 // projectListResponse is the body of GET /api/projects.

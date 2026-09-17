@@ -49,6 +49,30 @@ export function GlobalBar({ info, loading, error, onRetry }: GlobalBarProps) {
         </>
       )}
 
+      {info && (
+        <>
+          <span className="global-bar__divider" aria-hidden="true">
+            |
+          </span>
+          {info.features.terminal ? (
+            <span className="global-bar__terminal" title="Terminal sessions can run on this server">
+              Terminal ready
+            </span>
+          ) : (
+            // The reason is the server's own, and it is the one that says
+            // whether to start the server inside WSL or to install tmux. It is
+            // shown in full in the warnings banner above; here it is the
+            // tooltip, so the bar stays one line.
+            <span
+              className="global-bar__terminal global-bar__terminal--unavailable"
+              title={info.runtimeUnavailableReason || 'This server cannot host a terminal runtime.'}
+            >
+              Runtime unavailable
+            </span>
+          )}
+        </>
+      )}
+
       <div className="global-bar__spacer" />
 
       {info && (

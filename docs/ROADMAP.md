@@ -8,10 +8,13 @@ As of version 0.1.0:
 | --- | --- | --- |
 | Phase 0 — Foundation and documentation | **Done** | Workspace, `CLAUDE.md`, `.claude/rules/`, docs, environment checks. |
 | Phase 1 — Project model and server foundation | **Done** | Config, SQLite, HostAdapter, discovery, register/create API, server status, Phase 1 UI. |
-| Phase 2 and later | Not started | No session runtime, no tmux, no terminal, no provider integration. |
+| Phase 2 — Persistent session runtime | **Done** | `SessionBackend` + `TmuxBackend`, runtime manager, persistence and reconciliation, runtime API, Phase 2 UI. No WebSocket, no real terminal view. |
+| Phase 3 and later | Not started | No Claude Code launch, no xterm.js, no provider integration. |
 
-What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: false`, the
-provider reports `integrated: false`, and the UI renders no terminal. Nothing in the running product
+What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
+`features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
+is actually installed there. The UI offers Start/Stop runtime and says plainly that the terminal view
+arrives in Phase 4. The provider still reports `integrated: false`. Nothing in the running product
 claims to do more than the table above.
 
 ## Phase 0 — Foundation and documentation
@@ -55,6 +58,12 @@ Do not assume first-level directories are projects.
 
 ## Phase 2 — Persistent session runtime
 
+Status: **done**. See `docs/RUNTIME.md` for the design and `docs/API.md` for the endpoints.
+
+Goal:
+
+A terminal that outlives the server, in the project's own directory, with byte-exact input and output.
+
 Deliver:
 
 - SessionBackend interface;
@@ -66,6 +75,25 @@ Deliver:
 - multiple isolated sessions.
 
 Use shell/test processes first.
+
+What was built:
+
+- `internal/session` — `Backend`, `Subscription`, `TmuxBackend`, and the `Manager` that owns session
+  naming, canonical size, bounded output history, sequence numbers, and reconciliation.
+- Live output over **tmux control mode**, chosen over `capture-pane` polling for the reasons in
+  `docs/RUNTIME.md` §2. `%output` payloads are decoded as bytes; UTF-8 arrives unescaped.
+- The server runs **inside WSL**; a Windows-native server reports the runtime as unavailable rather
+  than proxying. Dependency probes run in the runtime environment and report `probedIn`.
+- `project_runtime` table (migration `0002`) holding only what survives a restart: backend, session
+  name, intent, canonical size, timestamps. No output, no lease, no viewer, no `is_running` flag.
+- Reconciliation on startup: Case A rediscovered as `RUNNING`, Case B reported `STOPPED` and **not**
+  auto-started, Case C recorded as an orphan and **left running**.
+- Runtime API: `GET`/`POST start`/`POST stop`/`DELETE` under `/api/projects/{id}/runtime`.
+- Off-by-default diagnostic endpoints under `/api/debug`, to be deleted in Phase 4.
+- Frontend: Start/Stop runtime controls and an honest "Terminal UI coming in Phase 4".
+
+Not built, deliberately: Claude Code launch, any WebSocket, any real terminal view, controller/viewer
+roles, prompt bar, Claude Hooks.
 
 ## Phase 3 — Claude runtime
 

@@ -58,8 +58,16 @@ export function describeStatus(status: ProjectStatus): string {
   switch (status) {
     case 'running':
       return 'Running'
+    case 'starting':
+      return 'Starting'
+    case 'stopping':
+      return 'Stopping'
     case 'reconnecting':
       return 'Reconnecting'
+    case 'error':
+      return 'Error'
+    case 'orphan':
+      return 'Orphaned session'
     default:
       return 'Stopped'
   }
@@ -72,9 +80,35 @@ export function statusGlyph(status: ProjectStatus): string {
       return '●' // filled circle
     case 'reconnecting':
       return '◌' // dotted circle
+    case 'starting':
+    case 'stopping':
+      return '◍' // half-filled: a transition, not a resting point
+    case 'error':
+      return '▲'
+    case 'orphan':
+      return '◆'
     default:
       return '○' // hollow circle
   }
+}
+
+/**
+ * isRuntimeUp reports whether a runtime is in a state where stopping it means
+ * something.
+ *
+ * A reconnecting runtime counts as up: the session is alive and work is running
+ * in it, and what is being re-established is AgentMux's view of its output.
+ */
+export function isRuntimeUp(status: ProjectStatus): boolean {
+  return status === 'running' || status === 'reconnecting'
+}
+
+/**
+ * isRuntimeBusy reports whether a runtime is mid-transition, where neither
+ * starting nor stopping it is a meaningful request.
+ */
+export function isRuntimeBusy(status: ProjectStatus): boolean {
+  return status === 'starting' || status === 'stopping'
 }
 
 /**
@@ -143,6 +177,21 @@ export function describeError(error: unknown): string {
     }
     case ErrorCodes.runtimePathMappingFailed:
       return `${error.message} Check the runtime mode and WSL mount configuration on the server.`
+    // The runtime refusals carry the server's own explanation, which is the one
+    // that says whether to start the server inside WSL or to install tmux - the
+    // two have different fixes and guessing between them wastes the user's time.
+    case ErrorCodes.runtimeUnavailable:
+    case ErrorCodes.runtimeBackendUnavailable:
+      return error.message
+    case ErrorCodes.runtimeNotRunning:
+      return `${error.message} Start the runtime, then try again.`
+    case ErrorCodes.runtimeAlreadyRunning:
+      return `${error.message} It is already running.`
+    case ErrorCodes.runtimeStartFailed:
+      return `${error.message} Check the server log, and that the project's folder still exists.`
+    case ErrorCodes.runtimeStopFailed:
+    case ErrorCodes.runtimeDestroyFailed:
+      return `${error.message} The session may still be running; check the server log.`
     case ErrorCodes.storageFailure:
       return 'The AgentMux metadata store could not complete the request. Check the server log.'
     case ErrorCodes.internal:

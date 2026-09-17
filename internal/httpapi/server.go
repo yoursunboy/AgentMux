@@ -25,6 +25,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -38,10 +39,10 @@ type Server struct {
 	host       host.Adapter
 	projects   *project.Service
 	discoverer *project.Discoverer
+	runtime    *session.Manager
 	log        *slog.Logger
 
 	startedAt time.Time
-	installID string
 	webDir    string
 
 	handler http.Handler
@@ -50,20 +51,21 @@ type Server struct {
 	now func() time.Time
 }
 
-// Options configures a Server. Config, Host, Projects, and Discoverer are
-// required.
+// Options configures a Server. Config, Host, Projects, Discoverer, and Runtime
+// are required.
 type Options struct {
 	Config     *config.Config
 	Host       host.Adapter
 	Projects   *project.Service
 	Discoverer *project.Discoverer
 
+	// Runtime is the terminal runtime manager. It is required: a server without
+	// one cannot answer a single runtime request, and a nil field would turn
+	// that into a panic in a handler instead of an explanation.
+	Runtime *session.Manager
+
 	// Logger receives request and error records. Nil means slog.Default.
 	Logger *slog.Logger
-
-	// InstallID identifies this installation. It is an opaque identifier, not
-	// a credential.
-	InstallID string
 
 	// StartedAt is when the process started. Zero means time.Now.
 	StartedAt time.Time
@@ -87,6 +89,8 @@ func New(o Options) (*Server, error) {
 		return nil, errors.New("httpapi: project Service is required")
 	case o.Discoverer == nil:
 		return nil, errors.New("httpapi: Discoverer is required")
+	case o.Runtime == nil:
+		return nil, errors.New("httpapi: runtime Manager is required")
 	}
 
 	s := &Server{
@@ -94,9 +98,9 @@ func New(o Options) (*Server, error) {
 		host:       o.Host,
 		projects:   o.Projects,
 		discoverer: o.Discoverer,
+		runtime:    o.Runtime,
 		log:        o.Logger,
 		startedAt:  o.StartedAt,
-		installID:  o.InstallID,
 		webDir:     o.WebDir,
 		now:        o.Now,
 	}
@@ -127,6 +131,16 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/projects/register", s.handleRegisterProject)
 	mux.HandleFunc("GET /api/projects/{id}", s.handleGetProject)
 
+	// The runtime of one project. The operations are nested under the runtime
+	// because that is the resource they act on: the session is what is started,
+	// stopped, or removed, and a project is not.
+	mux.HandleFunc("GET /api/projects/{id}/runtime", s.handleGetRuntime)
+	mux.HandleFunc("POST /api/projects/{id}/runtime/start", s.handleStartRuntime)
+	mux.HandleFunc("POST /api/projects/{id}/runtime/stop", s.handleStopRuntime)
+	mux.HandleFunc("DELETE /api/projects/{id}/runtime", s.handleDestroyRuntime)
+
+	s.registerDebugRoutes(mux)
+
 	// Anything else under /api is an API error, not a page. Without this the
 	// SPA fallback would answer a mistyped endpoint with index.html and a
 	// confusing 200.
@@ -135,6 +149,26 @@ func (s *Server) routes() http.Handler {
 	mux.Handle("/", s.staticHandler())
 
 	return s.withRecovery(s.withRequestLog(s.withCORS(mux)))
+}
+
+// registerDebugRoutes adds the diagnostic endpoints when they are enabled.
+//
+// They are registered only when the configuration asks for them, so an
+// ordinary installation does not have a route that accepts raw terminal input.
+// Registering them and refusing inside the handler would leave the surface
+// present and one flag away from being live; this way it does not exist.
+func (s *Server) registerDebugRoutes(mux *http.ServeMux) {
+	if s.cfg == nil || !s.cfg.Server.DebugAPI {
+		return
+	}
+	s.log.Warn("the diagnostic runtime API is enabled",
+		"note", "these endpoints expose raw terminal input and output and are not a product API")
+
+	mux.HandleFunc("GET /api/debug/runtimes", s.handleDebugRuntimes)
+	mux.HandleFunc("POST /api/debug/reconcile", s.handleDebugReconcile)
+	mux.HandleFunc("GET /api/debug/projects/{id}/runtime/output", s.handleDebugRuntimeOutput)
+	mux.HandleFunc("POST /api/debug/projects/{id}/runtime/input", s.handleDebugRuntimeInput)
+	mux.HandleFunc("POST /api/debug/projects/{id}/runtime/resize", s.handleDebugRuntimeResize)
 }
 
 // handleUnknownAPI answers an unrouted API path.

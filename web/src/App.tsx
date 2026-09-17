@@ -1,6 +1,14 @@
 import { useCallback, useState } from 'react'
 
-import { ApiError, ErrorCodes, createProject, discoverProjects, registerProject } from './api/client'
+import {
+  ApiError,
+  ErrorCodes,
+  createProject,
+  discoverProjects,
+  registerProject,
+  startRuntime,
+  stopRuntime,
+} from './api/client'
 import type { Candidate, DiscoveryResult, Project } from './api/types'
 import { ErrorBanner } from './components/ErrorBanner'
 import { GlobalBar } from './components/GlobalBar'
@@ -35,6 +43,8 @@ export function App() {
   const [discovery, setDiscovery] = useState<DiscoveryResult | null>(null)
   const [discoveryLoading, setDiscoveryLoading] = useState(false)
   const [discoveryError, setDiscoveryError] = useState<Error | null>(null)
+
+  const [runtimeBusy, setRuntimeBusy] = useState(false)
 
   const scan = useCallback(async () => {
     setDiscoveryLoading(true)
@@ -121,6 +131,35 @@ export function App() {
     refreshProjects()
   }, [reloadServer, refreshProjects])
 
+  /**
+   * runRuntimeAction drives one runtime request and folds its outcome back into
+   * the page.
+   *
+   * The project list is refreshed afterwards rather than the panel patching its
+   * own copy, because the runtime state is the server's to report: a session can
+   * be started from a previous tab, outlive this page entirely, or be stopped by
+   * a restart, and a panel that kept its own answer would drift from all three.
+   */
+  const runRuntimeAction = useCallback(
+    async (projectId: string, action: 'start' | 'stop') => {
+      setRuntimeBusy(true)
+      setPageError(null)
+      try {
+        await (action === 'start' ? startRuntime(projectId) : stopRuntime(projectId))
+      } catch (error) {
+        reportFailure('none', error)
+      } finally {
+        setRuntimeBusy(false)
+        refreshProjects()
+        // The server's own view of whether a terminal can run here can change
+        // while the page is open - tmux installed, the server restarted - and a
+        // failed start is exactly when it is worth asking again.
+        reloadServer()
+      }
+    },
+    [refreshProjects, reloadServer, reportFailure],
+  )
+
   return (
     <div className="app">
       <GlobalBar
@@ -154,7 +193,17 @@ export function App() {
 
       <main className="workspace">
         {selected ? (
-          <ProjectPanel project={selected} />
+          <ProjectPanel
+            project={selected}
+            // All three facts the server folds into features.terminal: the
+            // build has the runtime, the server is on the right side of the
+            // WSL boundary, and tmux is installed where sessions run.
+            terminalAvailable={server.data?.features.terminal === true}
+            terminalBlocker={server.data?.terminalBlocker ?? ''}
+            busy={runtimeBusy}
+            onStartRuntime={() => void runRuntimeAction(selected.id, 'start')}
+            onStopRuntime={() => void runRuntimeAction(selected.id, 'stop')}
+          />
         ) : (
           <section className="panel panel--empty" aria-label="No project selected">
             <div className="panel__body">

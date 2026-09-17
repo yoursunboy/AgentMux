@@ -27,6 +27,7 @@ type Service struct {
 	now     func() time.Time
 	newID   func() (string, error)
 	log     *slog.Logger
+	runtime RuntimeState
 }
 
 // Options configures a Service. Only Repository and Host are required.
@@ -45,6 +46,11 @@ type Options struct {
 
 	// Logger receives project lifecycle events. Nil means slog.Default.
 	Logger *slog.Logger
+
+	// Runtime reports what the terminal runtime knows about a project, which
+	// is where a project's status comes from. Nil means no runtime is wired
+	// up, and every project is reported as stopped.
+	Runtime RuntimeState
 }
 
 // NewService builds a Service.
@@ -62,6 +68,7 @@ func NewService(o Options) (*Service, error) {
 		now:     o.Now,
 		newID:   o.NewID,
 		log:     o.Logger,
+		runtime: o.Runtime,
 	}
 	if s.gitInit == nil {
 		s.gitInit = ExecGitInit
@@ -85,7 +92,7 @@ func (s *Service) List(ctx context.Context, filter ListFilter) ([]*Project, erro
 		return nil, err
 	}
 	for _, p := range projects {
-		withDerivedStatus(p)
+		s.withDerivedStatus(p)
 	}
 	return projects, nil
 }
@@ -99,7 +106,7 @@ func (s *Service) Get(ctx context.Context, id string) (*Project, error) {
 	if err != nil {
 		return nil, mapNotFound(err, id)
 	}
-	return withDerivedStatus(p), nil
+	return s.withDerivedStatus(p), nil
 }
 
 // RegisterInput describes an explicit registration of an existing directory.
@@ -131,7 +138,7 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (*Project, err
 	}
 
 	if existing, err := s.repo.GetByHostPath(ctx, hostPath); err == nil {
-		withDerivedStatus(existing)
+		s.withDerivedStatus(existing)
 		return nil, newError(CodeAlreadyRegistered, "%s is already registered as %q", hostPath, existing.Name).
 			withDetail("hostPath", existing.HostPath).
 			withDetail("projectId", existing.ID).
@@ -413,13 +420,21 @@ func (s *Service) buildProject(hostPath, name string) (*Project, error) {
 
 // withDerivedStatus fills in fields that are computed rather than stored.
 //
-// Phase 1 has no terminal runtime, so every project is stopped. When the
-// SessionBackend lands, this is the single place that changes.
-func withDerivedStatus(p *Project) *Project {
+// Status comes from the terminal runtime and only from the terminal runtime.
+// There is deliberately no fallback to a stored value: a status read from the
+// database would keep claiming a project was running after the session behind
+// it had died, and a stale "running" is worse than a wrong "stopped" because
+// it invites a user to type into a terminal that does not exist.
+func (s *Service) withDerivedStatus(p *Project) *Project {
 	if p == nil {
 		return nil
 	}
 	p.Status = StatusStopped
+	if s.runtime != nil {
+		if status := s.runtime.ProjectStatus(p.ID); status != "" {
+			p.Status = status
+		}
+	}
 	return p
 }
 

@@ -38,6 +38,9 @@ const (
 	EnvRuntimeDistro = EnvPrefix + "RUNTIME_DISTRO"
 	EnvWSLMountRoot  = EnvPrefix + "WSL_MOUNT_ROOT"
 	EnvWebDir        = EnvPrefix + "WEB_DIR"
+	EnvTerminalShell = EnvPrefix + "TERMINAL_SHELL"
+	EnvTmuxSocket    = EnvPrefix + "TMUX_SOCKET"
+	EnvDebugAPI      = EnvPrefix + "DEBUG_API"
 )
 
 // Runtime modes. "auto" lets the HostAdapter decide from the host platform.
@@ -69,6 +72,7 @@ type Config struct {
 	Storage  StorageConfig  `json:"storage"`
 	Projects ProjectsConfig `json:"projects"`
 	Runtime  RuntimeConfig  `json:"runtime"`
+	Terminal TerminalConfig `json:"terminal"`
 	Logging  LoggingConfig  `json:"logging"`
 	Web      WebConfig      `json:"web"`
 
@@ -113,6 +117,15 @@ type ServerConfig struct {
 	// AllowedOrigins lists extra browser origins permitted by CORS, on top of
 	// the always-allowed loopback origins. Empty means loopback only.
 	AllowedOrigins []string `json:"allowedOrigins"`
+
+	// DebugAPI enables the diagnostic endpoints under /api/debug.
+	//
+	// It is off by default and is not a product API: those endpoints exist so
+	// that the terminal runtime can be exercised end to end before there is a
+	// Web Terminal to exercise it with, and they are expected to be deleted
+	// once Phase 4 provides a real one. Leaving them on in an ordinary
+	// installation would expose raw terminal input and output over HTTP.
+	DebugAPI bool `json:"debugApi"`
 }
 
 // StorageConfig configures the metadata store.
@@ -150,6 +163,42 @@ type RuntimeConfig struct {
 	WSLMountRoot string `json:"wslMountRoot"`
 }
 
+// TerminalConfig configures the terminal runtime itself, as opposed to where it
+// executes.
+//
+// Every field is optional. An empty or zero value means the runtime's own
+// default, which is applied by the session package rather than duplicated here:
+// a socket name or a canonical size written down twice is a socket name or a
+// canonical size that will eventually disagree with itself.
+type TerminalConfig struct {
+	// Socket is the tmux socket name sessions are created on. A dedicated
+	// socket is what keeps AgentMux's sessions out of a user's own tmux, and
+	// what makes them enumerable without guessing which of somebody's windows
+	// belong to an agent.
+	Socket string `json:"socket"`
+
+	// Shell is the shell a session runs when no command is given. Empty means
+	// the host's default shell, which is injected by the caller because it is
+	// the one platform-dependent value here.
+	Shell string `json:"shell"`
+
+	// Cols and Rows are the canonical terminal geometry. Zero means the
+	// runtime's default.
+	//
+	// A session needs a size before any client exists. Letting the first client
+	// to attach decide would make the terminal's size a side effect of who
+	// clicked first, and would resize a program that had already drawn itself.
+	Cols int `json:"canonicalCols"`
+	Rows int `json:"canonicalRows"`
+
+	// HistoryChunks and HistoryBytes bound the output AgentMux keeps in memory
+	// per runtime, so that a reconnecting client can be given what it missed.
+	// Zero means the runtime's default. This is not the session's scrollback:
+	// that lives in tmux and is bounded by the tmux history limit.
+	HistoryChunks int `json:"historyChunks"`
+	HistoryBytes  int `json:"historyBytes"`
+}
+
 // LoggingConfig configures structured logging.
 type LoggingConfig struct {
 	Level  string `json:"level"`
@@ -170,6 +219,11 @@ type Defaults struct {
 	DataDir       string
 	ServerHost    string
 	ServerPort    int
+
+	// TerminalShell is the shell a session runs when the configuration names
+	// none. It is injected rather than read inside this package because it is
+	// the one value here that depends on the platform.
+	TerminalShell string
 }
 
 // Overrides are values supplied on the command line. Zero values are ignored.
@@ -184,6 +238,9 @@ type Overrides struct {
 	RuntimeMode   string
 	RuntimeDistro string
 	WebDir        string
+	TerminalShell string
+	TmuxSocket    string
+	DebugAPI      bool
 }
 
 // LoadOptions controls Load. The function hooks are injectable so the loader
@@ -311,10 +368,11 @@ func defaultsFrom(d Defaults) *Config {
 			MaxScanDirs:    DefaultMaxScanDirs,
 			ScanTimeoutSec: DefaultScanTimeoutSec,
 		},
-		Runtime: RuntimeConfig{Mode: RuntimeModeAuto, WSLMountRoot: DefaultWSLMountRoot},
-		Logging: LoggingConfig{Level: DefaultLogLevel, Format: DefaultLogFormat},
-		Web:     WebConfig{Dir: DefaultWebDir},
-		DataDir: d.DataDir,
+		Runtime:  RuntimeConfig{Mode: RuntimeModeAuto, WSLMountRoot: DefaultWSLMountRoot},
+		Terminal: TerminalConfig{Shell: strings.TrimSpace(d.TerminalShell)},
+		Logging:  LoggingConfig{Level: DefaultLogLevel, Format: DefaultLogFormat},
+		Web:      WebConfig{Dir: DefaultWebDir},
+		DataDir:  d.DataDir,
 	}
 }
 
@@ -348,6 +406,15 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	if v, ok := env(EnvWebDir); ok && strings.TrimSpace(v) != "" {
 		cfg.Web.Dir = strings.TrimSpace(v)
 	}
+	if v, ok := env(EnvTerminalShell); ok && strings.TrimSpace(v) != "" {
+		cfg.Terminal.Shell = strings.TrimSpace(v)
+	}
+	if v, ok := env(EnvTmuxSocket); ok && strings.TrimSpace(v) != "" {
+		cfg.Terminal.Socket = strings.TrimSpace(v)
+	}
+	if v, ok := env(EnvDebugAPI); ok {
+		cfg.Server.DebugAPI = parseBool(v)
+	}
 }
 
 func applyOverrides(cfg *Config, o Overrides) {
@@ -376,6 +443,28 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 	if v := strings.TrimSpace(o.WebDir); v != "" {
 		cfg.Web.Dir = v
+	}
+	if v := strings.TrimSpace(o.TerminalShell); v != "" {
+		cfg.Terminal.Shell = v
+	}
+	if v := strings.TrimSpace(o.TmuxSocket); v != "" {
+		cfg.Terminal.Socket = v
+	}
+	// A boolean flag can only turn the diagnostic endpoints on, never off: they
+	// are off unless something asks for them, so there is nothing to override.
+	if o.DebugAPI {
+		cfg.Server.DebugAPI = true
+	}
+}
+
+// parseBool reads a boolean environment value. Anything unrecognised is false,
+// so a typo disables a feature rather than silently enabling one.
+func parseBool(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -426,6 +515,16 @@ func normalize(cfg *Config) {
 	}
 	if strings.TrimSpace(cfg.Web.Dir) == "" {
 		cfg.Web.Dir = DefaultWebDir
+	}
+	// The terminal's own defaults are applied by the runtime, so only trimming
+	// happens here. A value that survives as "" means "the runtime decides".
+	cfg.Terminal.Socket = strings.TrimSpace(cfg.Terminal.Socket)
+	cfg.Terminal.Shell = strings.TrimSpace(cfg.Terminal.Shell)
+	if cfg.Terminal.Cols < 0 {
+		cfg.Terminal.Cols = 0
+	}
+	if cfg.Terminal.Rows < 0 {
+		cfg.Terminal.Rows = 0
 	}
 }
 

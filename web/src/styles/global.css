@@ -161,8 +161,13 @@ code {
 }
 
 .global-bar__host,
-.global-bar__runtime {
+.global-bar__runtime,
+.global-bar__terminal {
   color: var(--text-muted);
+}
+
+.global-bar__terminal--unavailable {
+  color: var(--warning);
 }
 
 .global-bar__spacer {
@@ -249,6 +254,32 @@ code {
 
 .panel__status--running {
   color: var(--online);
+}
+
+.panel__status--starting,
+.panel__status--stopping {
+  color: var(--warning);
+}
+
+.panel__status--error {
+  color: var(--danger);
+}
+
+.panel__status--orphan {
+  color: var(--warning);
+}
+
+.panel__runtime {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.panel__runtime-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
 }
 
 .panel__body {

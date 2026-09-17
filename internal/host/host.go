@@ -77,6 +77,20 @@ type SystemInfo struct {
 	RuntimeOS   Kind        `json:"runtimeOs"`
 	Distro      string      `json:"distro,omitempty"`
 	PathMapper  string      `json:"pathMapper"`
+
+	// Environment is where the server process itself is running. It is
+	// reported separately from RuntimeMode because on Windows the server and
+	// the runtime are genuinely different places.
+	Environment Environment `json:"environment"`
+
+	// RuntimeAvailable reports whether a persistent terminal runtime can
+	// execute here at all. When it is false the reason says what to do about
+	// it, and no part of AgentMux may claim a terminal works.
+	RuntimeAvailable bool `json:"runtimeAvailable"`
+
+	// RuntimeUnavailableReason is the actionable explanation for
+	// RuntimeAvailable being false, and is empty when it is true.
+	RuntimeUnavailableReason string `json:"runtimeUnavailableReason,omitempty"`
 }
 
 // Dependency is the result of probing for one external program.
@@ -86,9 +100,15 @@ type Dependency struct {
 	Path      string `json:"path,omitempty"`
 
 	// Required records whether AgentMux needs this program for the current
-	// phase. Everything is optional in Phase 1; tmux becomes required in
-	// Phase 2 and the AI CLI in Phase 3.
+	// phase. tmux is required from Phase 2; the AI CLI becomes required in
+	// Phase 3.
 	Required bool `json:"required"`
+
+	// ProbedIn names the environment this probe actually inspected, for
+	// example "linux" or "wsl:Ubuntu-24.04". It exists so that a user reading
+	// the output knows which machine's PATH answered, which is the difference
+	// between "tmux is missing" and "tmux is missing from the wrong PATH".
+	ProbedIn string `json:"probedIn,omitempty"`
 
 	// Note explains what the program is used for.
 	Note string `json:"note,omitempty"`
@@ -105,6 +125,15 @@ type Adapter interface {
 
 	// Mode is where terminal sessions will execute.
 	Mode() RuntimeMode
+
+	// Environment is where the server process itself is running.
+	Environment() Environment
+
+	// RuntimeSupport reports whether a persistent terminal runtime can
+	// execute here, and why not when it cannot. A false result is a
+	// statement about the environment, not a failed probe, and no caller may
+	// offer a terminal when it is false.
+	RuntimeSupport() (bool, string)
 
 	// Info describes the environment. Detection failures degrade to empty
 	// fields rather than failing the call.

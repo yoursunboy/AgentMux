@@ -26,10 +26,18 @@ POST /api/projects/:id/controller/release
 Implementation status: the first five are implemented, and `GET /api/projects/:id` was added to read
 one project. See `docs/API.md` for the request and response shapes this build actually serves.
 
-The remaining endpoints arrive with the session runtime (Phase 2) and the controller (Phase 5). They
-are listed here because they are the agreed target, not because they answer today: a request to any
-of them returns `404 not_found`. Sections 4 to 13 describe the WebSocket protocol, none of which is
-implemented yet — the server opens no WebSocket in this build.
+The runtime endpoints took a different shape than the sketch above when Phase 2 built them. Where
+this section says `POST /api/projects/:id/start` and `.../stop`, the server serves
+`POST /api/projects/:id/runtime/start`, `.../runtime/stop`, `DELETE /api/projects/:id/runtime`, and
+`GET /api/projects/:id/runtime`. The nesting is the point: these verbs act on the project's *runtime*,
+and naming them `:id/start` left "start what?" open — the same word was being used for opening a
+project in the UI, starting a session, and starting the program inside it. `POST :id/open` is not
+implemented and is not planned as an endpoint; opening a project is a client-side view change, not a
+server-side event, and giving it a route would make the server own something it has no state for.
+
+Sections 4 to 13 describe the WebSocket protocol, none of which is implemented yet — the server opens
+no WebSocket in this build, and the Phase 2 endpoints listed above are REST. The controller endpoints
+are Phase 5. A request to any unimplemented route returns `404 not_found`.
 
 ## 3. Project registration payload
 

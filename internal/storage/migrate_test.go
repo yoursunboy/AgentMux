@@ -10,6 +10,19 @@ import (
 	"github.com/kutonlagos/agentmux/migrations"
 )
 
+// latestVersion is the highest embedded migration version, read from the
+// migrations themselves rather than written down here. A hard-coded number
+// turns every later phase into a test edit, which trains a reader to update
+// the expectation without reading it.
+func latestVersion(t *testing.T) int {
+	t.Helper()
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All returned an error: %v", err)
+	}
+	return all[len(all)-1].Version
+}
+
 // TestMigrateAppliesTheInitialSchema pins the first migration's identity. The
 // version is part of the on-disk contract: changing it would make every
 // existing database re-run the schema.
@@ -23,17 +36,31 @@ func TestMigrateAppliesTheInitialSchema(t *testing.T) {
 	if len(result.Applied) != 0 {
 		t.Errorf("a second Migrate applied %v, want nothing", result.Applied)
 	}
-	if result.Version != 1 {
-		t.Errorf("Version = %d, want 1", result.Version)
+	if want := latestVersion(t); result.Version != want {
+		t.Errorf("Version = %d, want %d", result.Version, want)
 	}
 
-	// The first call happened inside newTestStore; check it is recorded once.
+	// The migrations ran inside newTestStore; check each is recorded once.
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All returned an error: %v", err)
+	}
 	var count int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("could not count applied migrations: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("schema_migrations holds %d rows, want 1", count)
+	if count != len(all) {
+		t.Errorf("schema_migrations holds %d rows, want %d", count, len(all))
+	}
+	// Version 1 is the initial schema, and it must stay version 1: changing it
+	// would make every existing database try to create its tables again.
+	var initial int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM schema_migrations WHERE version = 1`).Scan(&initial); err != nil {
+		t.Fatalf("could not check the initial schema's version: %v", err)
+	}
+	if initial != 1 {
+		t.Error("the initial schema is not recorded at version 1")
 	}
 }
 
@@ -48,12 +75,17 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 	defer store.Close()
 
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All returned an error: %v", err)
+	}
+
 	first, err := store.Migrate(context.Background())
 	if err != nil {
 		t.Fatalf("the first Migrate returned an error: %v", err)
 	}
-	if len(first.Applied) != 1 {
-		t.Fatalf("the first Migrate applied %v, want the initial schema", first.Applied)
+	if len(first.Applied) != len(all) {
+		t.Fatalf("the first Migrate applied %v, want all %d migrations", first.Applied, len(all))
 	}
 	if !strings.HasSuffix(first.Applied[0], "initial_schema") {
 		t.Errorf("the first migration is %q, want the initial schema", first.Applied[0])
@@ -89,16 +121,33 @@ func TestSchemaVersionBeforeAndAfter(t *testing.T) {
 	if _, err := store.Migrate(context.Background()); err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
-	if version, err = store.SchemaVersion(context.Background()); err != nil || version != 1 {
-		t.Errorf("SchemaVersion() = %d, %v after migrating, want 1", version, err)
+	want := latestVersion(t)
+	if version, err = store.SchemaVersion(context.Background()); err != nil || version != want {
+		t.Errorf("SchemaVersion() = %d, %v after migrating, want %d", version, err, want)
 	}
 }
 
-// TestMigrateCreatesOnlyThePhaseOneTables records the deliberate narrowness of
-// the schema. A runtime table added early would be read and written with
-// placeholder values long before the session layer can honour them.
-func TestMigrateCreatesOnlyThePhaseOneTables(t *testing.T) {
+// TestMigrateCreatesTheExpectedTables records the shape of the schema.
+//
+// The Phase 1 assertion that project_runtime must not exist yet is gone
+// because the table now has a real writer. The reason it was withheld is worth
+// keeping in mind for the next table: a schema added early is read and written
+// with placeholder values long before the layer that gives it meaning exists,
+// and those placeholders outlive the phase that excused them.
+func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 	store := newTestStore(t)
+
+	tables := tableNames(t, store)
+
+	want := []string{"project_runtime", "projects", "schema_migrations", "settings"}
+	if strings.Join(tables, ",") != strings.Join(want, ",") {
+		t.Errorf("tables = %v, want %v", tables, want)
+	}
+}
+
+// tableNames lists the tables in the database, without SQLite's own.
+func tableNames(t *testing.T, store *Store) []string {
+	t.Helper()
 
 	rows, err := store.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
 	if err != nil {
@@ -120,11 +169,7 @@ func TestMigrateCreatesOnlyThePhaseOneTables(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("reading the table list failed: %v", err)
 	}
-
-	want := []string{"projects", "schema_migrations", "settings"}
-	if strings.Join(tables, ",") != strings.Join(want, ",") {
-		t.Errorf("tables = %v, want %v", tables, want)
-	}
+	return tables
 }
 
 // TestHostPathIndexIsUniqueAndCaseInsensitive proves the schema enforces the

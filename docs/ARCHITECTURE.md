@@ -5,18 +5,18 @@
 ```text
 iPad / Phone / PC
         │
-        │ HTTPS + WebSocket
+        │ HTTPS + WebSocket      (WebSocket is Phase 4; Phase 2 is REST only)
         ▼
 ┌─────────────────────────────┐
-│       AgentMux Server       │
+│       AgentMux Server       │   runs inside WSL on Windows (see §7)
 │                             │
-│ Project Manager             │
-│ Session Manager             │
-│ Terminal Manager            │
-│ Controller Manager          │
-│ Provider Adapter            │
-│ Host Adapter                │
-│ Storage                     │
+│ Project Manager             │   internal/project        — built
+│ Session Manager             │   internal/session        — built in Phase 2
+│ Terminal Manager            │   part of session.Manager — sequence, history
+│ Controller Manager          │   Phase 6, not stubbed
+│ Provider Adapter            │   Phase 8, not stubbed
+│ Host Adapter                │   internal/host           — built
+│ Storage                     │   internal/storage        — built
 └──────────────┬──────────────┘
                │
                ▼
@@ -27,8 +27,12 @@ iPad / Phone / PC
        ┌───────┼───────┐
        ▼       ▼       ▼
    Project A Project B Project C
-     Claude    Claude    Claude
+    (shell)   (shell)   (shell)     Claude Code arrives in Phase 3
 ```
+
+The server's own process is the one that owns tmux, which is why the box above is inside the runtime
+environment rather than beside it. Everything above `SessionBackend` is transport-agnostic; everything
+below it is tmux's.
 
 ## 2. Project vs Collection
 
@@ -77,9 +81,18 @@ Owns:
 - project-to-session mapping;
 - starting/stopping/recovering sessions.
 
+Implemented in `internal/session` as `Manager`, sitting between the HTTP handlers and the backend.
+It holds every policy decision — what a session is called, where it runs, how big it is, what is
+written down, how a project's status is derived — and the HTTP layer calls it rather than the backend.
+Reconciliation on startup is here too.
+
+Not yet owned here: controller leases, viewer lists, and scroll positions. Those are properties of
+live connections and belong to Phase 4's WebSocket layer.
+
 ### SessionBackend
 
-Abstract runtime interface.
+Abstract runtime interface. The one boundary through which AgentMux creates, talks to, and destroys a
+terminal that outlives it (`internal/session/backend.go`).
 
 V0.1:
 
@@ -95,6 +108,14 @@ SSHBackend
 DockerBackend
 ```
 
+The interface is `Name`, `Available`, `Create`, `Exists`, `Inspect`, `List`, `Launch`, `SendInput`,
+`Resize`, `Stop`, `Destroy`, `Snapshot`, `Attach`, `Close`. It is deliberately not shaped around
+tmux's command set, and deliberately knows nothing about projects, HTTP, or prompts: it is handed a
+name, a directory, and a size, and it carries bytes.
+
+Full description, including the byte-fidelity contract and the tmux control-mode design:
+`docs/RUNTIME.md`.
+
 ### Terminal Manager
 
 Owns:
@@ -106,6 +127,11 @@ Owns:
 - viewer subscriptions;
 - controller ID/lease;
 - input routing.
+
+In Phase 2 the parts that exist — canonical size, output stream, output sequence, bounded in-memory
+history — live inside the session manager's per-runtime state (`internal/session/buffer.go`). Viewer
+subscriptions exist as `Backend.Attach`; multiple subscribers to one session each receive the same
+bytes. Controller leases, viewer roles, and scroll are Phase 6 and are not stubbed.
 
 ### Controller Manager
 
@@ -214,13 +240,36 @@ Windows 11
 
 AgentMux must not require VS Code.
 
-Where the server actually runs: this diagram shows the target, with the server inside the runtime
-where tmux and the CLI live. The Phase 1 server runs on the Windows host instead, and reaches the
-runtime only through the HostAdapter, which maps every host path to its runtime path. That choice
-keeps a drive letter out of the business logic and lets `runtime.mode: native` run the same code on a
-Linux host. It is a deliberate starting point, not a settled answer: when the session runtime lands
-in Phase 2, the process that owns tmux has to be the one inside WSL, and this section is where that
-decision is recorded.
+**The server runs inside the distribution.** The process that owns tmux is the one inside WSL:
+
+```text
+Windows host                     WSL2 distribution
+────────────                     ─────────────────
+project files on D:  ←→ drvfs    /mnt/d/...
+VS Code GUI                      AgentMux Server (linux/amd64)
+browser                 ──────▶  ├─ tmux server, socket "agentmux"
+                                 │  └─ pty per project session
+                                 └─ runtime dependencies
+```
+
+The rejected alternative was a Windows-native server that calls `wsl.exe tmux ...` per operation. It
+would put the PTY, the session lifecycle, and the ANSI byte stream on the far side of a process
+boundary from the code that owns them, require a second copy of session state that can disagree with
+the first, and split `SessionBackend` into two implementations of the same thing, only one of which
+would be exercised day to day.
+
+Windows keeps what is genuinely Windows': the files on `D:`, the VS Code GUI, the launch of the
+distribution, and — later — a launcher.
+
+A Windows-native server still runs and still manages projects, discovery, and the UI. It reports
+`runtimeAvailable: false` with an actionable reason and serves no terminal. It does not silently
+proxy. Dependency probes run in the runtime environment, not on the Windows host PATH, and
+`GET /api/server` reports where each probe looked in `dependencies[].probedIn`.
+
+The distribution name is detected at runtime (`WSL_DISTRO_NAME`, or `-runtime-distro`), never
+hardcoded.
+
+Details, including the tmux bootstrap sequence and the control-mode wire format: `docs/RUNTIME.md`.
 
 ## 8. Linux runtime
 
@@ -232,34 +281,48 @@ Linux
   └─ Claude Code CLI
 ```
 
+Linux and Windows+WSL share one code path: the server is a Linux process in both, and it talks to a
+local tmux over a private socket. `runtime.mode: native` is the same `TmuxBackend` with a different
+HostAdapter.
+
 ## 9. Terminal transport
 
 ```text
-Claude
-→ tmux pane
-→ tmux integration/control layer
-→ Terminal Manager
-→ WebSocket
-→ xterm.js
+pty inside tmux
+→ tmux control mode ("tmux -C", %output records)
+→ controlStream decoder (bytes, not text)
+→ session.Manager: sequence, bounded history, subscriptions
+→ (Phase 4: WebSocket)
+→ (Phase 4: xterm.js)
 ```
 
-Clients never attach directly to tmux.
+Clients never attach directly to tmux, and — from Phase 4 — never touch a tmux socket at all.
+
+Phase 2 implements the first three stages and stops there. There is no WebSocket and no xterm.js.
+The reason output is taken from tmux's control mode rather than from `capture-pane` on a timer is
+recorded in `docs/RUNTIME.md` §2: polling cannot see scrollback or anything between ticks, and it
+re-encodes the screen as text, losing the difference between a carriage return and a newline.
 
 ## 10. Terminal state
 
-Server-side:
+Server-side, per runtime:
 
 ```text
 projectId
+sessionName        (amx-{projectId})
+state              (STOPPED/STARTING/RUNNING/STOPPING/ERROR/ORPHAN)
 canonicalCols
 canonicalRows
-outputSequence
-historyBuffer
-controllerId
-controllerLease
-connectedViewers
+outputSequence     (monotonic, per runtime)
+historyBuffer      (bounded: N chunks, M bytes)
 lastActivity
 ```
+
+Implemented in Phase 2.
+
+Not implemented, and not stubbed: `controllerId`, `controllerLease`, `connectedViewers`. A viewer
+subscription exists as `Backend.Attach` — several may be open at once and each receives the same
+bytes — but there is no roster, no lease, and no notion of who may type. That is Phase 6.
 
 Client-local:
 
@@ -270,6 +333,8 @@ zoom
 followOutput
 grid/focus/fullscreen
 ```
+
+All Phase 4 or later, and all held by the client, not the server.
 
 ## 11. WebSocket model
 
@@ -291,6 +356,12 @@ provider.changed
 
 Batch high-volume output.
 
+**Not implemented in Phase 2.** No WebSocket endpoint exists and nothing streams to a browser. What
+Phase 2 does provide is the data model that makes it possible: every output chunk carries a
+monotonic `sequence` per runtime, and a bounded history is kept, so a reconnecting client can be given
+what it missed rather than a redraw of the current screen. Introducing the sequence after the fact is
+much harder than starting with it.
+
 ## 12. Reconnection
 
 Browser disconnect must not affect runtime sessions.
@@ -301,6 +372,14 @@ client reconnects
 → receives snapshot/history
 → resumes live output
 ```
+
+**The stronger version of this is already true in Phase 2, one level down.** The AgentMux server
+itself can stop and restart without affecting a session: tmux owns the PTYs, and it is a separate
+process. On startup the server reconciles what it has recorded against what the backend actually has
+and answers Case A/B/C accordingly — see §13 and `docs/RUNTIME.md` §6. A project whose session
+survived is reported `RUNNING` again, without the user's work having been interrupted.
+
+The browser-facing half of this flow — subscribe, snapshot, resume — is Phase 4.
 
 ## 13. Persistence
 
@@ -317,11 +396,16 @@ collections (optional)
 
 A separate `collections` table is optional; collection path may initially be stored on Project records.
 
-What Phase 1 creates: `projects`, `settings`, and `schema_migrations` (the migration bookkeeping
-table). There is no `project_runtime` table and no `collections` table. Collection membership is a
-column on `projects`, which is why registering an existing project is a single insert and finding a
-project's collection needs no join. `project_runtime` arrives with the session runtime in Phase 2,
-when there is runtime state worth writing down.
+Created so far: `projects`, `settings`, `schema_migrations` (the migration bookkeeping table), and —
+from Phase 2 — `project_runtime`. Collection membership is a column on `projects`, which is why
+registering an existing project is a single insert and finding a project's collection needs no join.
+
+`project_runtime` stores only what cannot be answered after a restart: the owning backend, the session
+name, the user's intent, the canonical size, and the timestamps. It stores **no terminal output at any
+granularity**, no controller lease, no viewer, no scroll position, and no `is_running` boolean —
+liveness is asked of the runtime, which is the only thing that knows. The full list of what is stored
+and what is deliberately not is the header of `migrations/0002_project_runtime.sql` and
+`docs/RUNTIME.md` §6.
 
 Migrations are embedded SQL files applied in order and recorded by name, so a future schema change
 is a new numbered file rather than an edit to an applied one.

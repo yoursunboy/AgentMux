@@ -61,8 +61,61 @@ const HERE = path.dirname(fileURLToPath(import.meta.url))
 const REPO_WINDOWS = path.resolve(HERE, '..', '..')
 const SERVER_BINARY = path.join(REPO_WINDOWS, 'bin', 'e2e', 'agentmux-server')
 
-/** The order suites run in: cheapest and most fundamental first. */
-const ALL_SUITES = ['transport', 'terminal', 'recovery', 'tablet', 'workspace']
+/**
+ * How hard the fixture tries to get a Claude up, and how long each attempt is
+ * given.
+ *
+ * Retried rather than typed once, because the failure this covers is a startup
+ * one: when this host loses an instance it is within the first seconds, before
+ * any screen is drawn, and the pane is left at the prompt it was started from -
+ * which is a state another attempt can start from. Measured on this host, a
+ * Claude alone in a session draws its theme picker inside twenty-five seconds
+ * every time, so forty is generous per attempt and three attempts are still
+ * less than the ninety a single attempt was given before.
+ */
+const CLAUDE_ATTEMPTS = 3
+const CLAUDE_START_TIMEOUT_MS = 40_000
+
+/** The socket of a fixture project's tmux session, before there is a fixture object. */
+const sockOf = (entry) => `${RUN_DIR}/data/tmux/${entry.id}.sock`
+
+/** startClaude types the CLI into a project's session, at its shell prompt. */
+function startClaude(entry) {
+  const sock = sockOf(entry)
+  wsl(`tmux -S ${sock} send-keys -t amx-${entry.id} -l 'claude'`)
+  wsl(`tmux -S ${sock} send-keys -t amx-${entry.id} Enter`)
+}
+
+/**
+ * claudeUp is the suites' own rule, spelled here for the same reason `wsl` is:
+ * the harness cannot be imported before there is a fixture for it to read. A
+ * session showing Claude has no shell prompt at the end of it - see `claudeIsUp`
+ * in `lib/harness.mjs`, which is the one the suites use and the one this has to
+ * agree with.
+ */
+function claudeUp(entry) {
+  const text = wsl(`tmux -S ${sockOf(entry)} capture-pane -p -t amx-${entry.id}`)
+  return !text.includes(`${entry.name}$`) && text.trim() !== ''
+}
+
+/** waitForClaude polls that rule, and says whether it held before the deadline. */
+async function waitForClaude(entry, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (claudeUp(entry)) return true
+    if (Date.now() >= deadline) return false
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+  }
+}
+
+/**
+ * The order suites run in: cheapest and most fundamental first.
+ *
+ * `controller` is last because it is the most expensive of them: it drives two
+ * browser contexts at once, waits out a control grace and restarts the server
+ * underneath its own fixture. Nothing after it would benefit from that.
+ */
+const ALL_SUITES = ['transport', 'terminal', 'recovery', 'tablet', 'workspace', 'controller']
 
 /**
  * The fixtures, and the role each one plays.
@@ -235,6 +288,27 @@ async function api(pathname, init = {}) {
 async function provision() {
   wsl(`rm -rf ${RUN_DIR} && mkdir -p ${RUN_DIR}/root ${RUN_DIR}/data`)
 
+  // A short control grace, for two checks in the controller suite.
+  //
+  // The production default is thirty seconds, which is the right answer for a
+  // person whose tablet slept and the wrong answer for a suite: a run that
+  // sleeps half a minute to watch a lease lapse is a run nobody keeps. What the
+  // checks are about is the shape - suspended, held for a while, then either
+  // resumed or released - and eight seconds shows that shape as truthfully as
+  // thirty does. The default itself is asserted in the terminal package's own
+  // tests.
+  //
+  // Eight rather than three, because one of the two checks is a client that has
+  // to reconnect on its own. A severed socket is retried on a growing delay
+  // (`web/src/terminal/backoff.ts`: a quarter second, then a half, then a
+  // second), so a controller that is genuinely disconnected and comes back takes
+  // several seconds to do it - and a grace shorter than that would test the
+  // lapse where it meant to test the resume.
+  //
+  // Written as the config file rather than as a flag because it *is* a
+  // configuration value, and because this is the path an operator would use.
+  wsl(`cat > ${RUN_DIR}/data/config.json`, JSON.stringify({ server: { controlGraceSeconds: 8 } }))
+
   for (const fixture of FIXTURES) {
     // A marker file, so a project directory looks like the thing discovery
     // looks for rather than an empty folder that happens to be there.
@@ -269,9 +343,24 @@ async function provision() {
   // Claude, in the two projects that are meant to host it. Typed rather than
   // launched, which is how the product does it and what makes the agent a child
   // of the pane rather than of the server.
+  //
+  // One at a time, and each one waited for before the next is typed. Typing both
+  // and moving on is a race twice over, and both halves of it were measured: the
+  // suites ask whether Claude is up the moment they start, so a fixture that
+  // returns before the screen is drawn can only answer "not yet"; and two
+  // instances starting in the same second are more than this host keeps, which
+  // is the Known Issue in `docs/WORKSPACE.md` and the reason the workspace suite
+  // can report keeping one of two alive. Staggered, "Claude is up" becomes
+  // something the fixture establishes rather than a coin flip the suite reports
+  // afterwards as a skip.
   for (const entry of projects.filter((project) => project.role === 'claude')) {
-    wsl(`tmux -S ${RUN_DIR}/data/tmux/${entry.id}.sock send-keys -t amx-${entry.id} -l 'claude'`)
-    wsl(`tmux -S ${RUN_DIR}/data/tmux/${entry.id}.sock send-keys -t amx-${entry.id} Enter`)
+    let up = false
+    for (let attempt = 1; attempt <= CLAUDE_ATTEMPTS && !up; attempt += 1) {
+      startClaude(entry)
+      up = await waitForClaude(entry, CLAUDE_START_TIMEOUT_MS)
+      if (!up) console.log(`    ${entry.name}: attempt ${attempt} did not come up`)
+    }
+    console.log(`    ${entry.name}: Claude ${up ? 'is up' : 'did not come up'}`)
   }
 
   const fixtures = {

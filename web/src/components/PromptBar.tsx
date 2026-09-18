@@ -40,6 +40,15 @@ interface PromptBarProps {
   /** Whether there is a connected terminal to send to. */
   disabled: boolean
   /**
+   * Why this field cannot be typed into, when the reason is not the obvious one.
+   *
+   * The default assumption is a runtime that has not been started. Being a
+   * viewer is the other way this field is disabled, and it is a different fact
+   * with a different remedy - one of which the person can act on from here and
+   * the other of which they cannot - so it is stated rather than guessed at.
+   */
+  disabledReason?: string
+  /**
    * Compact is the grid's shape: one line, no hint row, a send button that
    * fits beside the field.
    *
@@ -51,13 +60,14 @@ interface PromptBarProps {
   compact?: boolean
 }
 
-export function PromptBar({ session, disabled, compact = false }: PromptBarProps) {
+export function PromptBar({ session, disabled, disabledReason, compact = false }: PromptBarProps) {
   const [text, setText] = useState('')
   const areaRef = useRef<HTMLTextAreaElement | null>(null)
 
   const bytes = useMemo(() => encoder.encode(text).length, [text])
   const tooLong = bytes > MAX_PROMPT_BYTES
   const canSend = !disabled && !tooLong && text.trim() !== ''
+  const blocked = disabled && disabledReason ? disabledReason : ''
 
   const send = useCallback(() => {
     const trimmed = text.replace(/\s+$/, '')
@@ -100,7 +110,9 @@ export function PromptBar({ session, disabled, compact = false }: PromptBarProps
         onKeyDown={onKeyDown}
         rows={1}
         placeholder={
-          disabled ? 'Message Claude… (start the runtime first)' : 'Message Claude… ⏎ sends'
+          disabled
+            ? `Message Claude… (${disabledReason ?? 'start the runtime first'})`
+            : 'Message Claude… ⏎ sends'
         }
         disabled={disabled}
         aria-label="Message Claude"
@@ -118,7 +130,7 @@ export function PromptBar({ session, disabled, compact = false }: PromptBarProps
         ) : (
           <>
             <span className="prompt-bar__hint" aria-live="polite">
-              {tooLong ? `Too long: ${bytes} bytes, the limit is ${MAX_PROMPT_BYTES}.` : ''}
+              {tooLong ? `Too long: ${bytes} bytes, the limit is ${MAX_PROMPT_BYTES}.` : blocked}
             </span>
             <button type="button" className="button" onClick={send} disabled={!canSend}>
               Send

@@ -273,6 +273,11 @@ for something a person rarely wants back.
 
 ## 12. Known multi-device limitation
 
+> **Resolved in Phase 6.** What is described below is why Phase 6 exists, and it
+> is kept as the record of what Phase 5 was rather than as a description of the
+> product now. A client is a viewer until it asks for the lease;
+> `docs/MULTI_DEVICE.md` is the model.
+
 Phase 5 makes a workspace visible on several devices. It does not make it safe
 for them to type at once.
 
@@ -290,3 +295,20 @@ of them controls input and resize.
 Until then: the workspace is as safe as the network it is on. It has no
 authentication of its own, and `docs/ARCHITECTURE.md` §14 says the same thing
 about the terminal.
+
+## 13. Known issues
+
+**This host does not reliably keep two Claude processes alive at once.** Both
+Claude-hosting projects are started by the browser suite's fixture, and whether
+the second survives its first seconds is a property of the machine rather than of
+AgentMux: measured, one of the two is sometimes gone before it has drawn a screen.
+The suites report what they actually found rather than asserting what they hoped
+for — the workspace suite says `this host kept 1 of 2 Claude processes alive` and
+skips the one check that needs both, and the terminal suite skips its three
+Claude-facing checks with the reason.
+
+The fixture starts them one at a time and types into a project that has not come
+up again rather than giving up on it (`CLAUDE_ATTEMPTS` in `web/e2e/run.mjs`),
+which is what turns most of these into a slower green run: the retry shows in the
+run's own output as `attempt 1 did not come up` followed by the project coming up
+on the next one. What it cannot fix is a host that will not keep both.

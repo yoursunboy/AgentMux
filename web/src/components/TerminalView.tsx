@@ -38,6 +38,19 @@ interface TerminalViewProps {
    */
   interactive: boolean
   /**
+   * Whether this browser's own box decides how large the terminal is.
+   *
+   * It is the same authority as `interactive`, one level down: a terminal has
+   * one pty and therefore one shape, and it is the controller's that wins. A
+   * viewer is sent the screen as it is - a phone watching the project somebody
+   * at a desk is working in is watching a terminal that is not the shape of the
+   * phone - so a viewer must not fit its own terminal to its own element. Doing
+   * that pulls the pty's rows down into the viewer's scrollback and leaves the
+   * box showing the empty part of the screen below them, which is a viewer
+   * looking at a terminal that appears to have nothing in it.
+   */
+  mayResize: boolean
+  /**
    * The terminal's text size in pixels.
    *
    * It is a prop rather than a constant because the display modes differ in
@@ -129,7 +142,7 @@ function themeFromDocument(): Record<string, string> {
   }
 }
 
-export function TerminalView({ session, interactive, fontSize }: TerminalViewProps) {
+export function TerminalView({ session, interactive, mayResize, fontSize }: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   /** The fit addon, kept so a font change can re-measure against it. */
@@ -139,6 +152,15 @@ export function TerminalView({ session, interactive, fontSize }: TerminalViewPro
   const measureRef = useRef<(() => TerminalSize) | null>(null)
   /** Whether new output should bring the viewport back to the bottom. */
   const followingRef = useRef(true)
+  /**
+   * Whether this browser may set the terminal's shape, read inside the effect.
+   *
+   * It is a ref for the reason every other authority decision here is: the
+   * measurement is taken from a ResizeObserver and a resize event, which run
+   * outside any render and would otherwise close over the value the terminal
+   * was built with.
+   */
+  const mayResizeRef = useRef(mayResize)
 
   const [following, setFollowing] = useState(true)
   const [unread, setUnread] = useState(false)
@@ -188,13 +210,22 @@ export function TerminalView({ session, interactive, fontSize }: TerminalViewPro
      *
      * It is the only place a size is produced, so the debounce in the scheduler
      * sees every change and no change is measured twice by two code paths.
+     *
+     * The fit is the whole of what a controller's browser contributes to the
+     * pty's shape, and it is not made at all for a viewer. A viewer's terminal
+     * is as large as the terminal is, which the server said when it sent the
+     * screen; measuring the box on top of that would be this browser overruling
+     * the shape it was handed. What a viewer reports is therefore the size the
+     * terminal already has, which the scheduler finds nothing new in.
      */
     const measure = (): TerminalSize => {
-      try {
-        fitAddon.fit()
-      } catch {
-        // A hidden element has no size to fit to. The next measurement, taken
-        // when it is visible, is the one that counts.
+      if (mayResizeRef.current) {
+        try {
+          fitAddon.fit()
+        } catch {
+          // A hidden element has no size to fit to. The next measurement, taken
+          // when it is visible, is the one that counts.
+        }
       }
       return clampSize(term.cols, term.rows)
     }
@@ -229,11 +260,48 @@ export function TerminalView({ session, interactive, fontSize }: TerminalViewPro
         // Size first, then draw. The screen was rendered for this geometry, so
         // writing it into a differently shaped terminal wraps it wrongly and no
         // later output can repair that.
-        if (cols > 0 && rows > 0 && (term.cols !== cols || term.rows !== rows)) {
-          term.resize(cols, rows)
+        if (cols > 0 && rows > 0) {
+          // The shape the terminal now has, whoever chose it. For a controller
+          // it is the one this browser asked for, echoed back; for a viewer it
+          // is the only shape the screen ever comes in. Recording it is what
+          // stops the resize below being measured as news and sent as a resize
+          // the server would refuse.
+          scheduler.adopt({ cols, rows })
+          if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows)
         }
-        markUnread()
         term.write(payload)
+        // And then the viewport, which is the half of this that is easy to
+        // leave undone - and was left undone.
+        //
+        // A snapshot *is* the present. It is what the pane is showing now, and
+        // the contract `Screen.Render` documents is that a client which writes
+        // one is then showing exactly what the pane is showing. But a terminal
+        // that has scrollback of its own - which every terminal here has as soon
+        // as it has scrolled - can take the snapshot into its screen rows while
+        // its viewport sits somewhere above them, and then the page is painting
+        // the terminal's history while tmux is painting its screen. Measured in
+        // the recovery suite: a reconnected Claude tab drawing "Welcome to
+        // Claude Code v2.1.274" while the pane held the theme picker that came
+        // after it, with twelve of the pane's fourteen rows on the page but not
+        // one of them in the right place. That is not a client a frame behind;
+        // it is one looking at the wrong part of the terminal, and it stays
+        // there until something scrolls it.
+        //
+        // Unconditionally, rather than only when this browser was following the
+        // output. The snapshot has just replaced the screen, so a scroll
+        // position held from before it points at rows that are no longer
+        // underneath it. Reading scrollback deliberately is a real thing to
+        // want, and it is not what this would interrupt: nothing else here moves
+        // the viewport, and a snapshot arrives only when a connection is
+        // established or a screen is asked for again - both of which are
+        // moments at which the live screen is what was asked for.
+        term.scrollToBottom()
+        followingRef.current = true
+        setFollowing(true)
+        // Nothing is waiting to be read either, for the same reason: the count
+        // is of lines that arrived while the viewport was up, and the viewport
+        // is not up any more.
+        setUnread(false)
       },
       resize(cols, rows) {
         // The server's answer is the truth, not the request: the backend may
@@ -363,6 +431,24 @@ export function TerminalView({ session, interactive, fontSize }: TerminalViewPro
     // and never arrive.
     term.options.disableStdin = !interactive
   }, [interactive])
+
+  useEffect(() => {
+    const wasResizing = mayResizeRef.current
+    mayResizeRef.current = mayResize
+    if (mayResize === wasResizing) return
+    if (!mayResize) return
+
+    // Being given the keyboard is also being given the shape. Until now this
+    // browser has been drawing whatever the terminal is; from here the terminal
+    // is whatever this browser's box is, and that is a real change to the pty
+    // that the person who just asked for control is owed at once. The scheduler
+    // is told to forget the size it had recorded, because the recorded size is
+    // the one the server chose and the measurement below would otherwise have
+    // to differ from it by luck to be sent at all.
+    schedulerRef.current?.forget()
+    const measure = measureRef.current
+    if (measure) schedulerRef.current?.request(measure())
+  }, [mayResize])
 
   useEffect(() => {
     const term = termRef.current

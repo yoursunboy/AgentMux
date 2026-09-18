@@ -2,9 +2,10 @@
 
 This document is the original design sketch for the client/server surface, kept because it is what
 the phases were planned against. **`docs/TERMINAL.md` is the reference for what was actually built** —
-the real endpoint, the real message names, the real frame layout. Where the two disagree, this
-document says so in place rather than being rewritten to match, because the disagreements are the
-interesting part.
+the real endpoint, the real message names, the real frame layout — and **`docs/MULTI_DEVICE.md` is
+the reference for control**, which was sketched here in §8 and §9 and designed in full in Phase 6.
+Where the two disagree, this document says so in place rather than being rewritten to match, because
+the disagreements are the interesting part.
 
 ## 1. Transport
 
@@ -47,14 +48,22 @@ Phase 3 added the third level of that nesting:
 `GET /api/projects/:id/runtime/agent` and `POST .../agent/start` and `.../agent/stop`. An agent's
 identity is the runtime it is in, so it is addressed through it rather than as an object of its own.
 
-**Phase 4 implemented sections 4 to 13**, with two exceptions and several deliberate departures from
-the sketch. The endpoint is `GET /api/ws`, one socket per browser, and `docs/TERMINAL.md` documents it
-in full: the client and server message tables, the binary frame layout, the snapshot boundary, the
-limits, and the error codes. What follows is the sketch, annotated with what it became.
+**Phase 6 did not implement the two controller endpoints, and the reason is the same one that made
+`:id/open` a view change.** Control is a fact about a *connection*: a lease is held by a client
+because it has a socket open, it is suspended when that socket drops, and it is released when the
+client goes away. `POST /api/projects/:id/controller/acquire` names neither the socket nor the
+client, so a client asking with it would be asking for a lease it has no way to hold — and every
+HTTP request would arrive from a different connection, which the server has no reason to treat as
+the same device. Control therefore travels on the WebSocket, where the connection is the thing
+making the request: `control.request`, `control.release`, `control.accept`, `control.reject` out;
+`control.granted`, `control.denied`, `control.revoked`, `control.expired`, `control.changed` back.
+`docs/MULTI_DEVICE.md` is the reference for them.
 
-The two exceptions are the controller sections, §8 and §9, which are Phase 6 and are still not
-implemented: there is no roster, no lease, and no notion of who may type. The departures are called
-out in §4, §5 and §11.
+**Phase 4 implemented sections 4 to 13**, with two exceptions and several deliberate departures from
+the sketch. The exceptions — §8 and §9, the controller sections — were Phase 6 and are implemented
+now. The endpoint is `GET /api/ws`, one socket per browser, and `docs/TERMINAL.md` documents it in
+full: the client and server message tables, the binary frame layout, the snapshot boundary, the
+limits, and the error codes. What follows is the sketch, annotated with what it became.
 
 ## 3. Project registration payload
 
@@ -103,7 +112,7 @@ Server → Client:
 ```text
 server.status          not implemented
 project.status         not implemented
-controller.changed     Phase 6
+controller.changed     as built: "control.changed"
 terminal.snapshot      as built: a binary frame, type 0x02
 terminal.output        as built: a binary frame, type 0x01
 terminal.resized       as built: "resized"
@@ -112,6 +121,10 @@ error                  as built: "error"
 hello                  as built: sent first on every connection
 unsubscribed           as built: acknowledges the end of a subscription
 pong                   as built: answers "ping"
+control.granted        as built: this device has the lease
+control.denied         as built: this device will not
+control.revoked        as built: this device lost it
+control.expired        as built: it was suspended and nobody came back for it
 ```
 
 Client → Server:
@@ -121,21 +134,42 @@ project.subscribe      as built: "subscribe"
 project.unsubscribe    as built: "unsubscribe"
 terminal.input         as built: "input"
 terminal.resize        as built: "resize"
-controller.acquire     Phase 6
-controller.release     Phase 6
+controller.acquire     as built: "control.request"
+controller.release     as built: "control.release"
+control.accept         as built: answer a request with the lease
+control.reject         as built: answer a request with a refusal
 resync                 as built: ask for a fresh screen
 ping                   as built: application-level liveness
 ```
 
 The `terminal.` prefix was dropped from the names that shipped, and the reason is that with the
-prefix gone the messages read as what they are — a flat namespace of seven verbs, all of which are
+prefix gone the messages read as what they are — a flat namespace of verbs, all of which are
 about a terminal, since that is the only thing this socket carries. A prefix that every member of a
-namespace shares is a word that carries no information.
+namespace shares is a word that carries no information. Phase 6 kept the same shape and added a
+second, equally flat family under `control.`, which is where the sketch's `controller.acquire` and
+`controller.release` landed.
 
 Three messages are new relative to the sketch: `hello`, which states the protocol version before
 anything else; `unsubscribed`, so a client tearing down a terminal can distinguish that from a stream
 that quietly stopped; and `resync`, which is the recovery request the sketch's §11 implies but does
 not name.
+
+Phase 6 added six more, and they are worth reading as one design rather than as six names. A request
+has an answer — `control.granted` or `control.denied` — and the answer goes to the asker alone,
+because a refusal is a fact about one device. A *change* has no addressee: `control.changed` carries
+the whole roster and is sent to every subscriber, because a viewer that does not know who is typing
+cannot say so, and a controller that does not know how many are watching cannot say that either.
+`control.revoked` and `control.expired` are the two ways a lease ends without the holder asking, and
+they are separate messages because they call for different words on screen: one is "somebody else has
+it now", the other is "you were away too long". They also travel differently, and for the same
+reason. `control.revoked` goes to the device that lost the lease, which is still connected and needs
+to be told. `control.expired` is broadcast, because the device it is about is the one that did not
+come back — the people who need to hear it are the ones still watching a terminal whose owner has
+gone.
+
+There is no message that asks "am I the controller". The roster states who holds it, and a client
+compares that with its own identifier — a field that only ever repeated the client's own answer would
+be a second place for the two to disagree.
 
 ## 6. Terminal output
 
@@ -160,21 +194,37 @@ Prompt Bar and raw terminal keyboard share one controller-validated pipeline.
 
 Server rejects Viewer input.
 
-**The pipeline is shared as written; the validation is not there yet.** Both the terminal's keyboard
-and the Prompt Bar send `input` messages, and a prompt is that message with a trailing carriage
-return — there is one way into a terminal, not two. What does not exist is a controller: every
-subscription is equal, and any subscriber may type. Rejecting Viewer input requires a notion of who
-is a viewer, which is Phase 6's lease and not something this phase could have half-built.
+**The pipeline is shared as written, and as of Phase 6 the validation is there.** Both the terminal's
+keyboard and the Prompt Bar send `input` messages, and a prompt is that message with a trailing
+carriage return — there is one way into a terminal, not two. The server now has a notion of who may
+type: a client holds a project's lease or it does not, an `input` for a project it does not hold is
+refused with `not_controller` about `input`, and the refusal names that message so a client with
+several subscriptions knows which one was refused. `docs/MULTI_DEVICE.md` §6 is the reference.
 
-What *is* enforced: input is only accepted for a project the connection has already subscribed to
-(`not_subscribed`), it is size-limited, and there is no message that runs a command. A browser can
-send keystrokes to a terminal it is watching, exactly as typing into it would.
+What was already enforced, and still is: input is only accepted for a project the connection has
+already subscribed to (`not_subscribed`), it is size-limited, and there is no message that runs a
+command.
 
 ## 8. Controller acquisition
 
 Atomic server-side operation.
 
 The server is authoritative.
+
+**Implemented as written.** Acquisition is decided under the hub's lock, so two devices asking in the
+same instant produce one lease and one refusal rather than two grants — which is the only thing that
+makes "one controller" a fact rather than a hope. `internal/terminal/control_test.go` races them.
+
+What the sketch does not say, and what the product needed, is that a device does not simply *take*
+control. It asks for it: `control.request`. If nobody holds the project's lease the server grants it
+on the spot (`control.granted`, reason `available`), which is the case the sketch describes. If
+somebody does hold it, the request is queued and put in front of that person, who answers with
+`control.accept` or `control.reject` — a transfer is a handshake between two devices that both know
+about it, never a lease pushed at somebody. The interface says *Request control* everywhere, and
+never *Take Control*, because on a project somebody else is typing into, taking is not what happens.
+
+A client never becomes the controller by arriving, by reconnecting, or by being the only one left.
+`docs/MULTI_DEVICE.md` §5 has the rules and §12 the four transfer cases.
 
 ## 9. Controller lease
 
@@ -189,6 +239,24 @@ Temporary disconnect grace:
 
 approximately 10 seconds.
 
+**Implemented with the same shape, a different number, and no storage at all.** The lease is
+identified by the client's identifier and lives in memory; `leaseExpiresAt` is set only while the
+lease is *suspended*, which is the disconnected case, and is empty the rest of the time — a lease
+held by a device that is connected does not expire, because there is no reason to take a terminal
+away from somebody who is looking at it.
+
+The grace is thirty seconds, not ten (`terminal.DefaultControlGrace`, configurable through
+`server.controlGraceSeconds`). §八 of the phase directive gave thirty as the example and the product
+documentation says thirty; a person whose tablet slept on a train should find their terminal where
+they left it, and ten seconds does not survive a tunnel.
+
+Nothing about the lease is written to disk. §十九 of the directive asks for that, and the reason is
+that the alternative is a database that has to be reconciled against reality every time the server
+starts — a lease is a fact about a running process and stops being true when that process stops. A
+restarted server therefore knows nothing, and what it must not do is invent an owner: see §三十三 and
+`docs/MULTI_DEVICE.md` §10. What a roster row carries is one identifier, a device label derived
+server-side from the User-Agent, and a timestamp. Never an address, never anything typed.
+
 ## 10. Terminal resize
 
 Only Controller resize requests are accepted.
@@ -200,6 +268,13 @@ canonical size — there is one pty, so there is one size — and the server the
 subscriber of that project the new size, not only the client that asked. Each client draws at the
 size it was told rather than the size it requested, which is what stops a client and the server from
 answering each other's sizes forever. Requests are clamped to bounds rather than refused.
+
+**Phase 6 supplied the exception.** A resize from a client that does not hold the project's lease is
+refused with `not_controller` about `resize` and never reaches the pty, so the geometry follows the
+keyboard: one device decides how wide the terminal is, and everybody else draws what it decided.
+That is what makes a viewer that reshapes its own window a change to its own screen and to nothing
+else — §二十八, verified in `web/e2e/suites/controller.mjs` by reading the pty's size rather than the
+screen's.
 
 A client is also expected to suppress resizes caused by a tablet's on-screen keyboard, which shrinks
 the visual viewport without changing the layout one. That is a client rule; the server cannot tell
@@ -258,5 +333,5 @@ provider.changed
 
 Never include credentials.
 
-Still reserved and still unimplemented — Phase 8. Nothing in Phase 4 or Phase 5
+Still reserved and still unimplemented — Phase 8. Nothing in Phase 4, Phase 5 or Phase 6
 touched the provider path.

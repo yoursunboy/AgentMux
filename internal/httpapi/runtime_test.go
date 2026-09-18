@@ -1070,6 +1070,45 @@ func (c *terminalConn) subscribe(projectID string, cols, rows int) {
 	})
 }
 
+// takeControl asks for a project's lease and waits until it is granted.
+//
+// It is what every client that types or resizes has to do first. A browser that
+// has just connected is a viewer, whatever it intends to become.
+func (c *terminalConn) takeControl(projectID string) {
+	c.t.Helper()
+	c.send(map[string]any{"type": terminal.MsgControlRequest, "projectId": projectID})
+	var granted struct {
+		Type    string `json:"type"`
+		Reason  string `json:"reason"`
+		Control struct {
+			Controller *struct {
+				ClientID string `json:"clientId"`
+				Device   string `json:"device"`
+			} `json:"controller"`
+		} `json:"control"`
+	}
+	if err := json.Unmarshal(c.nextControl(terminal.MsgControlGranted), &granted); err != nil {
+		c.t.Fatalf("the control grant did not decode: %v", err)
+	}
+	if granted.Reason != "available" {
+		c.t.Fatalf("the grant gave reason %q, want %q", granted.Reason, "available")
+	}
+	if granted.Control.Controller == nil || granted.Control.Controller.ClientID == "" {
+		c.t.Fatalf("the grant names no controller: %+v", granted.Control)
+	}
+}
+
+// resize states the size the client's viewport has.
+func (c *terminalConn) resize(projectID string, cols, rows int) {
+	c.t.Helper()
+	c.send(map[string]any{
+		"type":      terminal.MsgResize,
+		"projectId": projectID,
+		"cols":      cols,
+		"rows":      rows,
+	})
+}
+
 // close ends the connection, as closing a browser tab does.
 func (c *terminalConn) close() { _ = c.conn.Close() }
 
@@ -1144,10 +1183,15 @@ func TestTheTerminalSocketAnswersTheSubprotocolABrowserOffers(t *testing.T) {
 // question with a knowable answer, and the answer is not "guess". A stale tab
 // left open across a server upgrade has to be told it is stale rather than fed
 // bytes it will mis-draw.
+//
+// Version 1 is in the list rather than the current version, and it is the
+// interesting one: it is the version a tab left open across the Phase 6 upgrade
+// is speaking, and it is refused because a version 1 client would be shown a
+// terminal it believes it can type into. See ProtocolVersion.
 func TestTheTerminalSocketRefusesAProtocolItDoesNotSpeak(t *testing.T) {
 	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
 
-	for _, version := range []string{"0", "2", "99", "latest"} {
+	for _, version := range []string{"0", "1", "99", "latest"} {
 		t.Run(version, func(t *testing.T) {
 			h.wantError(t,
 				h.call(http.MethodGet, terminal.Endpoint+"?"+terminal.ProtocolParam+"="+version, ""),
@@ -1299,10 +1343,10 @@ func TestTheTerminalSocketOnlyServesRegisteredProjects(t *testing.T) {
 // as one exchange.
 //
 // A browser connects, subscribes to a project, is sent the screen that is
-// already there, is sent what the terminal produces next, types into it, and
-// resizes it. Each step is checked against the backend the manager is driving,
-// so a frame that arrived without the corresponding input reaching the terminal
-// - or the reverse - fails here.
+// already there, takes control of it, states its viewport size, is sent what
+// the terminal produces next, and types into it. Each step is checked against
+// the backend the manager is driving, so a frame that arrived without the
+// corresponding input reaching the terminal - or the reverse - fails here.
 func TestABrowserGetsAWorkingTerminal(t *testing.T) {
 	h := newHarnessOpts(t, harnessOptions{runtimeAvailable: true})
 	id, _ := h.registerProject(t, "app")
@@ -1312,40 +1356,24 @@ func TestABrowserGetsAWorkingTerminal(t *testing.T) {
 	conn := h.dialTerminal(t, nil)
 	conn.hello()
 
-	// Subscribing carries the size the browser's viewport already has, so the
-	// terminal is resized once - before the snapshot - instead of the client
-	// drawing a screen at the old size and then reflowing it.
-	conn.subscribe(id, 100, 30)
+	// Watching comes first, and control after it. A browser that has just
+	// connected is a viewer, and a client can only ask to control a terminal it
+	// is already watching - which is the ordering the whole of this phase is,
+	// and the reason this test now takes control instead of simply typing.
+	conn.subscribe(id, 0, 0)
 
-	// The size reaches the terminal, and the acknowledgement comes back to the
-	// subscriber that asked as well as to any other viewer: there is one pty,
-	// so there is one size, and a second tab rendering its own idea of it would
-	// draw a terminal that does not match the program inside.
-	var ack struct {
-		Type string `json:"type"`
-		Cols int    `json:"cols"`
-		Rows int    `json:"rows"`
-	}
-	if err := json.Unmarshal(conn.nextControl(terminal.MsgResized), &ack); err != nil {
-		t.Fatalf("the resize acknowledgement did not decode: %v", err)
-	}
-	if ack.Cols != 100 || ack.Rows != 30 {
-		t.Errorf("the terminal was resized to %dx%d, want the 100x30 the browser asked for", ack.Cols, ack.Rows)
-	}
-	if cols, rows, ok := h.backend.sizeOf(name); !ok || cols != 100 || rows != 30 {
-		t.Errorf("the backend was asked for %dx%d (set=%v), want 100x30", cols, rows, ok)
-	}
-
-	// Then the screen. A client that started from an empty terminal would show
-	// a blank window until something happened to print, which on a Claude Code
+	// The screen. A client that started from an empty terminal would show a
+	// blank window until something happened to print, which on a Claude Code
 	// session is a long and alarming blank.
 	snapshot := conn.nextFrame(terminal.FrameSnapshot)
 	if snapshot.ProjectID != id {
 		t.Errorf("the snapshot names project %q, want %q", snapshot.ProjectID, id)
 	}
-	if snapshot.Cols != 100 || snapshot.Rows != 30 {
-		t.Errorf("the snapshot is %dx%d, want the 100x30 the terminal now is",
-			snapshot.Cols, snapshot.Rows)
+	// The screen is drawn at the size the terminal actually is, which is the
+	// size the program inside is drawing for.
+	if cols, rows, ok := h.backend.sizeOf(name); ok && (snapshot.Cols != cols || snapshot.Rows != rows) {
+		t.Errorf("the snapshot is %dx%d, want the terminal's %dx%d",
+			snapshot.Cols, snapshot.Rows, cols, rows)
 	}
 	if !bytes.Contains(snapshot.Payload, []byte("\x1b[")) {
 		t.Errorf("the snapshot stripped the pane's escape sequences: %q", snapshot.Payload)
@@ -1354,6 +1382,32 @@ func TestABrowserGetsAWorkingTerminal(t *testing.T) {
 		t.Errorf("the snapshot's boundary is %d..%d, want a single number: a screen is "+
 			"a statement about the whole terminal, not a range of chunks",
 			snapshot.FirstSequence, snapshot.LastSequence)
+	}
+
+	// Control. A viewer draws a terminal it cannot type into; this is the
+	// browser asking to stop being one, and being granted it because nobody
+	// else had it.
+	conn.takeControl(id)
+
+	// Now that it holds the lease, the browser states the size its viewport
+	// has. The size reaches the terminal, and the acknowledgement comes back to
+	// the client that asked as well as to any other viewer: there is one pty, so
+	// there is one size, and a second tab rendering its own idea of it would
+	// draw a terminal that does not match the program inside.
+	var ack struct {
+		Type string `json:"type"`
+		Cols int    `json:"cols"`
+		Rows int    `json:"rows"`
+	}
+	conn.resize(id, 100, 30)
+	if err := json.Unmarshal(conn.nextControl(terminal.MsgResized), &ack); err != nil {
+		t.Fatalf("the resize acknowledgement did not decode: %v", err)
+	}
+	if ack.Cols != 100 || ack.Rows != 30 {
+		t.Errorf("the terminal was resized to %dx%d, want the 100x30 the browser asked for", ack.Cols, ack.Rows)
+	}
+	if cols, rows, ok := h.backend.sizeOf(name); !ok || cols != 100 || rows != 30 {
+		t.Errorf("the backend was asked for %dx%d (set=%v), want 100x30", cols, rows, ok)
 	}
 
 	// What the terminal produces next arrives as output, byte for byte. The

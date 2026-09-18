@@ -15,13 +15,31 @@
  */
 
 /** The protocol version this client speaks. */
-export const PROTOCOL_VERSION = 1
+export const PROTOCOL_VERSION = 2
 
 /** The only real-time endpoint the server serves. One socket per browser. */
 export const ENDPOINT = '/api/ws'
 
 /** The query parameter a client uses to state the version it speaks. */
 export const PROTOCOL_PARAM = 'v'
+
+/**
+ * The query parameter a client uses to state which browser session it is.
+ *
+ * It is what makes a reload a reconnection rather than a new device: the server
+ * holds a lease for a client, not for a socket, and the only way it can know
+ * that the tab coming back is the one that left is for the tab to say so.
+ */
+export const CLIENT_ID_PARAM = 'client'
+
+/** The first two characters of a client identifier. */
+export const CLIENT_ID_PREFIX = 'c_'
+
+/** How many random characters follow the prefix. */
+export const CLIENT_ID_RANDOM_CHARACTERS = 16
+
+/** The longest client identifier the server accepts. */
+export const MAX_CLIENT_ID_LENGTH = 64
 
 /**
  * The WebSocket subprotocol name.
@@ -31,7 +49,7 @@ export const PROTOCOL_PARAM = 'v'
  * fails the connection, so a server that did not list it would refuse every
  * browser while still answering every other client.
  */
-export const SUBPROTOCOL = 'agentmux.terminal.v1'
+export const SUBPROTOCOL = 'agentmux.terminal.v2'
 
 /** Client message types: browser to server. */
 export const Msg = {
@@ -41,6 +59,10 @@ export const Msg = {
   resize: 'resize',
   resync: 'resync',
   ping: 'ping',
+  controlRequest: 'control.request',
+  controlRelease: 'control.release',
+  controlAccept: 'control.accept',
+  controlReject: 'control.reject',
 } as const
 
 /** Server message types: server to browser. */
@@ -50,6 +72,11 @@ export const ServerMsg = {
   resized: 'resized',
   error: 'error',
   pong: 'pong',
+  controlGranted: 'control.granted',
+  controlDenied: 'control.denied',
+  controlRevoked: 'control.revoked',
+  controlExpired: 'control.expired',
+  controlChanged: 'control.changed',
 } as const
 
 /**
@@ -68,6 +95,47 @@ export const TerminalErrorCode = {
   inputTooLarge: 'input_too_large',
   streamUnstable: 'stream_unstable',
   internal: 'internal',
+  /**
+   * notController means the message needed the project's control lease and this
+   * client does not hold it. It is what a viewer's keystroke or resize is
+   * refused with, and `about` names the message type that failed.
+   *
+   * It is a refusal to draw, not a failure to report: a viewer whose keystroke
+   * was refused is looking at a terminal somebody else is typing into, and the
+   * answer is to stop offering a keyboard rather than to show an error.
+   */
+  notController: 'not_controller',
+  /**
+   * notPending means an accept or a reject named a client that has not asked.
+   * A transfer is between two clients that both know about it.
+   */
+  notPending: 'not_pending',
+} as const
+
+/**
+ * Why a control message was sent.
+ *
+ * Each one is a copy of a constant in `internal/terminal/authority.go`. A client
+ * reads them to decide what to say: `rejected` and `controller_exists` are both
+ * refusals and call for different sentences.
+ */
+export const ControlReason = {
+  /** The project was free and is now yours. */
+  available: 'available',
+  /** You already hold it; asking again is not an error. */
+  held: 'held',
+  /** Somebody holds it and has been told you are waiting. */
+  queued: 'queued',
+  /** Somebody holds it. The lease is not free, suspended or not. */
+  controllerExists: 'controller_exists',
+  /** The queue is full; nobody else can be added to it. */
+  tooManyRequests: 'too_many_requests',
+  /** The controller handed it to you. */
+  transferred: 'transferred',
+  /** You gave it up, or somebody gave up yours. */
+  released: 'released',
+  /** The controller declined your request. */
+  rejected: 'rejected',
 } as const
 
 /** Limits. Each one is a copy of a limit the server enforces. */
@@ -80,16 +148,142 @@ export const MIN_ROWS = 5
 export const MAX_COLS = 500
 export const MAX_ROWS = 300
 
+/**
+ * validClientId reports whether an identifier has the shape the server accepts.
+ *
+ * It is the same check `internal/terminal/device.go` makes, written here so that
+ * the browser can tell whether what it has stored is still usable before it
+ * offers it. A value that fails it is not an error to report: the client asks
+ * for a new identity by sending nothing, and the server issues one.
+ *
+ * It is a shape check, not a permission. Nothing about holding this identifier
+ * makes a client trusted - `docs/MULTI_DEVICE.md` §11 is explicit that it is
+ * never a credential - and two clients that choose the same one are two clients
+ * that will fight over a lease, not one client that has been let in.
+ */
+export function validClientId(id: string): boolean {
+  if (id.length <= CLIENT_ID_PREFIX.length || id.length > MAX_CLIENT_ID_LENGTH) return false
+  if (!id.startsWith(CLIENT_ID_PREFIX)) return false
+  return /^[a-z0-9]+$/.test(id.slice(CLIENT_ID_PREFIX.length))
+}
+
+/**
+ * newClientId invents a browser session identifier.
+ *
+ * Randomness comes from the platform's cryptographic source rather than from
+ * `Math.random`, which is seeded per page and is guessable. The identifier is
+ * not a secret - see `validClientId` - but it is the name a lease is held under,
+ * and two tabs that happened to collide would be two tabs sharing a keyboard.
+ */
+export function newClientId(): string {
+  const bytes = new Uint8Array(CLIENT_ID_RANDOM_CHARACTERS / 2)
+  crypto.getRandomValues(bytes)
+  let out = CLIENT_ID_PREFIX
+  for (const byte of bytes) out += byte.toString(16).padStart(2, '0')
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // Server messages
 
 export interface HelloMessage {
   type: 'hello'
   protocol: number
+  /** The browser session this socket belongs to. */
   clientId: string
+  /** This socket. One client has many over its life. */
+  connectionId: string
+  /**
+   * The server's reading of the handshake's User-Agent.
+   *
+   * It is derived server-side rather than sent by this browser, because it is
+   * shown to other people: a device label a client could choose would be free
+   * text from a browser on somebody else's screen.
+   */
+  device: string
   server: string
   version: string
 }
+
+/** controlHolder names whoever holds a project's lease. */
+export interface ControlHolder {
+  clientId: string
+  device: string
+}
+
+/** controlPending names a client waiting for a project's lease. */
+export interface ControlPending {
+  clientId: string
+  device: string
+}
+
+/**
+ * The roster: who is in charge of a project, and who is waiting.
+ *
+ * It is carried by every message in the control family, including the ones
+ * directed at a single client, so that a client has exactly one thing to apply
+ * and cannot end up with a roster that disagrees with the message that brought
+ * it. `viewers` is counted for the recipient - the connections watching this
+ * project other than this recipient's own and other than the controller's - so
+ * the number a person reads is the number of *other* people watching.
+ */
+export interface ControlView {
+  /** Null when nobody holds the lease. */
+  controller: ControlHolder | null
+  /**
+   * True while the controller's connection is gone and its lease is being held
+   * for it. The lease is not free: a request during this window is refused.
+   */
+  suspended: boolean
+  /** When a suspended lease lapses, in RFC 3339. Empty unless suspended. */
+  expiresAt: string
+  /** How many other connections are watching this project. */
+  viewers: number
+  /** The clients waiting for control. */
+  pending: ControlPending[]
+}
+
+export interface ControlGrantedMessage {
+  type: 'control.granted'
+  projectId: string
+  reason: string
+  control: ControlView
+}
+
+export interface ControlDeniedMessage {
+  type: 'control.denied'
+  projectId: string
+  reason: string
+  /** The server's own sentence, when the reason needs explaining. */
+  message?: string
+  control: ControlView
+}
+
+export interface ControlRevokedMessage {
+  type: 'control.revoked'
+  projectId: string
+  reason: string
+  control: ControlView
+}
+
+export interface ControlExpiredMessage {
+  type: 'control.expired'
+  projectId: string
+  control: ControlView
+}
+
+export interface ControlChangedMessage {
+  type: 'control.changed'
+  projectId: string
+  control: ControlView
+}
+
+export type ControlMessage =
+  | ControlGrantedMessage
+  | ControlDeniedMessage
+  | ControlRevokedMessage
+  | ControlExpiredMessage
+  | ControlChangedMessage
 
 export interface UnsubscribedMessage {
   type: 'unsubscribed'
@@ -121,6 +315,7 @@ export type ServerMessage =
   | ResizedMessage
   | ErrorMessage
   | PongMessage
+  | ControlMessage
 
 /**
  * decodeServerMessage parses one control message.
@@ -130,6 +325,11 @@ export type ServerMessage =
  * re-establishes, which is the same answer it gives a malformed frame - and it
  * is deliberately not an exception, because a parse failure here is a thing
  * that happens on the wire rather than a programming error.
+ *
+ * The control roster is left as it arrived, to be read by `decodeControlView`.
+ * Decoding it here would mean either a partial roster or a message this
+ * function rejects on behalf of a caller that might not have needed the field
+ * that was wrong.
  */
 export function decodeServerMessage(text: string): ServerMessage | null {
   let parsed: unknown
@@ -143,6 +343,80 @@ export function decodeServerMessage(text: string): ServerMessage | null {
   if (typeof type !== 'string') return null
   if (!Object.values(ServerMsg).includes(type as ServerMessage['type'])) return null
   return parsed as ServerMessage
+}
+
+/**
+ * decodeControlView reads a roster from a control message.
+ *
+ * It returns null for anything that is not a roster this client can draw, and
+ * the caller treats that as a connection it cannot trust - the same answer it
+ * gives a message that is not protocol at all. Drawing a roster assembled from
+ * the fields that happened to parse is the failure this exists to prevent: a
+ * header that says somebody else is typing into the terminal when they are not
+ * is worse than a terminal that says it is reconnecting.
+ */
+export function decodeControlView(raw: unknown): ControlView | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const view = raw as Record<string, unknown>
+  if (typeof view.suspended !== 'boolean') return null
+  if (typeof view.viewers !== 'number' || !Number.isFinite(view.viewers)) return null
+
+  let controller: ControlHolder | null = null
+  if (view.controller !== null && view.controller !== undefined) {
+    controller = decodeHolder(view.controller)
+    if (!controller) return null
+  }
+
+  const pending: ControlPending[] = []
+  if (view.pending !== undefined) {
+    if (!Array.isArray(view.pending)) return null
+    for (const entry of view.pending) {
+      const holder = decodeHolder(entry)
+      if (!holder) return null
+      pending.push(holder)
+    }
+  }
+
+  return {
+    controller,
+    suspended: view.suspended,
+    expiresAt: typeof view.expiresAt === 'string' ? view.expiresAt : '',
+    viewers: view.viewers,
+    pending,
+  }
+}
+
+/** decodeHolder reads the two fields a controller and a waiting client share. */
+function decodeHolder(raw: unknown): ControlHolder | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const holder = raw as Record<string, unknown>
+  if (typeof holder.clientId !== 'string' || typeof holder.device !== 'string') return null
+  return { clientId: holder.clientId, device: holder.device }
+}
+
+/**
+ * isController reports whether a roster says this client holds the lease.
+ *
+ * There is no "are you the controller" field on the wire, and this is why: the
+ * comparison is one the client makes against its own identifier, so it cannot
+ * disagree with itself the way a server-computed flag for the wrong recipient
+ * would.
+ */
+export function isController(view: ControlView | null, clientId: string | null): boolean {
+  if (!view || !view.controller || !clientId) return false
+  return view.controller.clientId === clientId
+}
+
+/**
+ * isWaiting reports whether a roster says this client has asked and is queued.
+ *
+ * It is what tells a client that its request arrived. There is no message for
+ * "you are now queued": being queued is a fact about the roster, and the roster
+ * is what the answer to a request carries.
+ */
+export function isWaiting(view: ControlView | null, clientId: string | null): boolean {
+  if (!view || !clientId) return false
+  return view.pending.some((entry) => entry.clientId === clientId)
 }
 
 // ---------------------------------------------------------------------------

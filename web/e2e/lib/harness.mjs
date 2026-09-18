@@ -274,6 +274,12 @@ export async function openPage(browser, options = {}) {
     isMobile: options.isMobile ?? false,
     deviceScaleFactor: options.deviceScaleFactor ?? 1,
     colorScheme: options.colorScheme,
+    // A device that does not state one gets Playwright's, which is this
+    // machine's Chrome. Phase 6 names a device on *other people's* screens, and
+    // it derives that name from this header - so a suite that is about which
+    // device is which states both of them rather than reading back whatever
+    // this machine happens to be running.
+    userAgent: options.userAgent,
   })
   await context.addInitScript(() => {
     const viewport = new EventTarget()
@@ -285,6 +291,26 @@ export async function openPage(browser, options = {}) {
       viewport.height = window.innerHeight - (open ? 300 : 0)
       viewport.dispatchEvent(new Event('resize'))
     }
+
+    // Every WebSocket the page opens, in the order it opened them.
+    //
+    // This exists for one check - the controller whose connection is severed -
+    // and it records rather than intercepts: the page is handed the real socket
+    // and nothing about its behaviour changes. It is here rather than in that
+    // suite because an init script has to be installed before the page loads,
+    // and this is where that happens.
+    //
+    // Why the socket has to be closed by hand at all is in the comment on
+    // `severConnection` below.
+    const Native = window.WebSocket
+    window.__sockets = []
+    window.WebSocket = new Proxy(Native, {
+      construct(target, args) {
+        const socket = new target(...args)
+        window.__sockets.push(socket)
+        return socket
+      },
+    })
   })
 
   const page = await context.newPage()
@@ -299,6 +325,34 @@ export async function openPage(browser, options = {}) {
 
   await page.goto(PAGE_URL, { waitUntil: 'domcontentloaded' })
   return { context, page, frames, errors }
+}
+
+/**
+ * severConnection closes a page's open socket underneath it, as a network would.
+ *
+ * This is for the one scenario a browser cannot be asked to produce on its own.
+ * `context.setOffline(true)` stops a page from opening anything new, but it does
+ * not tear down a socket that is already open: the connection stays up at both
+ * ends, the server has no write outstanding and no way to notice a socket that
+ * is merely silent, and nothing happens until the connection is closed by
+ * something else. That is measured, not assumed - the first version of the
+ * controller suite waited ninety seconds for a disconnected controller to be
+ * noticed and it never was.
+ *
+ * Closing the socket from the page produces what the network would have
+ * produced: the server sees the connection end, the client sees its socket close
+ * without having asked for it, and the reconnect that follows is its own. It is
+ * used together with `setOffline(true)`, which is what stops that reconnect from
+ * succeeding - so the pair is a network black hole rather than a blip.
+ */
+export async function severConnection(page) {
+  return page.evaluate(() => {
+    const sockets = window.__sockets ?? []
+    const socket = sockets[sockets.length - 1]
+    if (!socket) return false
+    socket.close()
+    return true
+  })
 }
 
 /**
@@ -480,6 +534,66 @@ export async function awaitProject(page, entry) {
 /** Every project panel on the page, in the order they are drawn. */
 export function panels(page) {
   return page.locator('.panel--project')
+}
+
+/** The badge that says who is in charge of a project's terminal. */
+export function controlBadge(page, entry) {
+  return panelOf(page, entry).locator('[data-testid="terminal-control"]')
+}
+
+/**
+ * takeControl makes this browser the controller of one project's terminal.
+ *
+ * Phase 6 made the keyboard something a client asks for. A page that opens a
+ * project is a viewer, and it stays one - no keystroke reaches the pty, no
+ * resize is sent, the Prompt Bar is disabled - until it asks and is given the
+ * lease. Every suite written before that phase assumes typing works on arrival,
+ * and this is what they call to get back to the state they were written
+ * against.
+ *
+ * It presses the button a person would press rather than reaching past it into
+ * the client, so what it proves is that the button works. The viewer case, and
+ * the handover between two devices, is what `controller.mjs` is for; this
+ * helper is the one line that keeps the rest of the suites about terminals.
+ */
+export async function takeControl(page, entry) {
+  const badge = controlBadge(page, entry)
+  const mine = async () => ((await badge.textContent().catch(() => '')) ?? '').startsWith('You control')
+
+  // The badge appears with the first roster, which is sent before the first
+  // frame of the terminal - so waiting for it here costs nothing on the path
+  // where control is already held, and is what makes the button below exist.
+  await waitFor(async () => (await badge.count()) > 0, 10_000)
+  if (await mine()) return true
+
+  const button = panelOf(page, entry).getByRole('button', { name: 'Request control' })
+  if ((await button.count()) === 0) return false
+  await button.first().click()
+
+  return waitFor(mine, 10_000)
+}
+
+/**
+ * releaseControl gives up the lease this browser is holding.
+ *
+ * It exists because Phase 6 made a lease exclusive, and two tabs of one browser
+ * are two clients: the second is a viewer even on the machine the first is
+ * typing from. A suite that wants a second tab to be able to type has to have
+ * the first give it up, and pressing the button is how that is done - closing
+ * the tab instead would leave the lease suspended for the grace period, which
+ * is a different behaviour and would make the wait below a race against a timer
+ * rather than a test of anything.
+ */
+export async function releaseControl(page, entry) {
+  const badge = controlBadge(page, entry)
+  const mine = async () => ((await badge.textContent().catch(() => '')) ?? '').startsWith('You control')
+
+  if (!(await mine())) return true
+  const button = panelOf(page, entry).getByRole('button', { name: 'Release control' })
+  if ((await button.count()) === 0) return false
+  await button.first().click()
+
+  return waitFor(async () => !(await mine()), 10_000)
 }
 
 /** The text xterm has actually painted, row by row, trimmed. */

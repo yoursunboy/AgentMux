@@ -15,9 +15,14 @@ import { chromium } from 'playwright'
 import { execFileSync } from 'node:child_process'
 import {
   awaitProject,
+  panelOf,
+  panelText,
+  releaseControl,
+  takeControl,
   claudePids,
   fixtures,
   PAGE_URL,
+  paneSize,
   startServer,
   stopServer,
 } from '../lib/harness.mjs'
@@ -70,6 +75,20 @@ async function rendered(page) {
 const statusText = async (page) =>
   (await page.locator('.terminal__state').first().textContent()) ?? ''
 
+/**
+ * What one panel's control badge says.
+ *
+ * Empty rather than throwing when the panel is not on the current page: "no
+ * badge" and "the badge says nothing" are the same answer to every question
+ * asked of it here, and a suite that dies on the first of them cannot report
+ * the second.
+ */
+const badgeText = async (page, entry) =>
+  (await panelOf(page, entry)
+    .locator('[data-testid="terminal-control"]')
+    .textContent()
+    .catch(() => '')) ?? ''
+
 /** Waits for a predicate over the page, polling, and returns whether it held. */
 async function waitFor(page, predicate, timeoutMs = 25000) {
   const deadline = Date.now() + timeoutMs
@@ -87,6 +106,7 @@ async function openPage(browser) {
   page.on('pageerror', (e) => errors.push(e.message))
   await page.goto(URL, { waitUntil: 'domcontentloaded' })
   await awaitProject(page, CLAUDE)
+  await takeControl(page, CLAUDE)
   await page.waitForSelector('.xterm-screen', { timeout: 20000 })
   await page.waitForTimeout(2500)
   return { context, page, errors }
@@ -137,12 +157,24 @@ async function main() {
     await awaitProject(shellTab, SHELL)
     await shellTab.waitForSelector('.xterm-screen', { timeout: 20000 })
     await shellTab.waitForTimeout(2500)
+    // Phase 6: the keyboard is asked for. This suite is about what a terminal
+    // does across an outage, so it starts from the state every suite before it
+    // assumed - this browser holding the lease. The reconnect is then a real
+    // test of resuming one, not of asking again.
+    check('this tab holds the lease before the outage', await takeControl(shellTab, SHELL), '')
 
     const claudeTab = await context.newPage()
     await claudeTab.goto(URL, { waitUntil: 'domcontentloaded' })
     await awaitProject(claudeTab, CLAUDE)
     await claudeTab.waitForSelector('.xterm-screen', { timeout: 20000 })
     await claudeTab.waitForTimeout(2500)
+    // The first tab is done with Claude, and it has to say so. Two tabs of one
+    // browser are two clients, and a lease is held by one of them: leaving the
+    // first one holding it would make this tab a viewer for the rest of the
+    // run, which would show up later as a terminal that stopped accepting input
+    // rather than as what it is - a browser that never asked for the keyboard.
+    check('the first tab gives Claude up, deliberately', await releaseControl(page, CLAUDE), '')
+    check('this tab holds the lease before the outage too', await takeControl(claudeTab, CLAUDE), '')
 
     check(
       'both terminals are live before the outage',
@@ -203,8 +235,42 @@ async function main() {
       `${shellPaint.split('\n').filter((l) => l.trim()).length} non-empty rows, marker present: ${shellPaint.includes(MARKER)}`,
     )
 
+    // The server that came back has no controller for anything. A lease is not
+    // persisted, and a restarted server does not hand a terminal to a client
+    // that never asked - §三十三 of the phase directive, and the reason the two
+    // checks below have to ask again rather than assume. Without this the tabs
+    // are viewers for the rest of the suite, and a terminal that refuses input
+    // would look like a terminal that did not reconnect.
+    //
+    // Aimed at the panel first, because a badge belongs to a panel and both the
+    // reading and the asking below are scoped to it.
+    await awaitProject(claudeTab, CLAUDE)
+    check(
+      'the restarted server hands the lease to nobody',
+      (await badgeText(claudeTab, CLAUDE)).includes('nobody is in control'),
+      `the Claude tab reads ${JSON.stringify(await badgeText(claudeTab, CLAUDE))}`,
+    )
+    await awaitProject(shellTab, SHELL)
+    check(
+      'so the shell tab, which was typing into it before, asks again',
+      await takeControl(shellTab, SHELL),
+      '',
+    )
+    check(
+      'and so does the Claude tab',
+      await takeControl(claudeTab, CLAUDE),
+      '',
+    )
+
+    // Claude's own panel, rather than every panel the page happens to be
+    // showing. A workspace page holds several terminals, and comparing the rows
+    // of whichever one is drawn first against Claude's pane compares two
+    // different terminals and can only ever be wrong. Aimed at explicitly for
+    // the same reason the typing below aims at its panel: the tab may have been
+    // paged away while the outage was being watched.
+    const claudePainted = () => panelText(claudeTab, CLAUDE).then(lines)
     const claudeCaughtUp = await waitFor(claudeTab, async () => {
-      const painted = lines(await rendered(claudeTab))
+      const painted = await claudePainted()
       const held = lines(pane(CLAUDE))
       const shared = Math.min(painted.length, held.length)
       if (shared <= 5) return false
@@ -212,15 +278,36 @@ async function main() {
       for (let i = 0; i < shared; i += 1) if (painted[i] === held[i]) same += 1
       return same >= shared - 2
     })
-    const claudePaint = lines(await rendered(claudeTab))
+    const claudePaint = await claudePainted()
     const claudePane = lines(pane(CLAUDE))
     const shared = Math.min(claudePaint.length, claudePane.length)
     let matching = 0
     for (let i = 0; i < shared; i += 1) if (claudePaint[i] === claudePane[i]) matching += 1
+    // The same comparison taken from the other end. A terminal that is showing
+    // the pane's screen *and* rows of its own that the pane has never had - its
+    // own scrollback, which is local to the browser - does not line up from the
+    // top but does from the bottom, and the difference between the two is what
+    // says which of those it is.
+    let matchingFromBottom = 0
+    for (let i = 1; i <= shared; i += 1) {
+      if (claudePaint[claudePaint.length - i] === claudePane[claudePane.length - i]) {
+        matchingFromBottom += 1
+      }
+    }
+    // How many of the pane's rows are on screen *somewhere*. Rows that are
+    // present but in the wrong place are a different failure from rows that are
+    // not there at all - the first is a screen that has scrolled, the second is
+    // a screen that stopped being updated - and the count alone cannot say
+    // which, so both are reported.
+    const present = claudePane.filter((row) => claudePaint.includes(row)).length
     check(
       'Claude’s screen after the reconnect still matches the pane',
       claudeCaughtUp,
-      `${matching}/${shared} rows identical`,
+      `${matching}/${shared} rows identical from the top, ${matchingFromBottom}/${shared} from the ` +
+        `bottom, ${present}/${claudePane.length} of the pane's rows anywhere on screen; the browser ` +
+        `is drawing ${claudePaint.length} row(s) and the pane is ${paneSize(CLAUDE)}; painted starting ` +
+        `${JSON.stringify((claudePaint[0] ?? '').slice(0, 40))}, held starting ` +
+        `${JSON.stringify((claudePane[0] ?? '').slice(0, 40))}`,
     )
     check(
       'Claude is the same process through a server restart',

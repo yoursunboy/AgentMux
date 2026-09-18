@@ -79,7 +79,21 @@ type outbound struct {
 type Conn struct {
 	hub *Hub
 	ws  Socket
-	id  string
+
+	// id is this socket's identifier, unique for the life of the process.
+	id string
+
+	// clientID names the browser session this socket belongs to. One client has
+	// many connections over its life; a lease belongs to the client, and this
+	// is what lets a reconnect be recognised as the same person rather than a
+	// new device.
+	clientID string
+
+	// device is the label derived from the handshake's User-Agent. It is what
+	// another client sees beside a controller, and it is the server's reading
+	// of a header rather than text a browser chose.
+	device string
+
 	log *slog.Logger
 
 	ctx    context.Context
@@ -121,24 +135,50 @@ type Conn struct {
 	mu   sync.Mutex
 	subs map[string]*subscription
 
+	// watching is the set of projects this connection was subscribed to when its
+	// read loop ended, taken there because there is nowhere later to take it
+	// from: a subscription removes itself as its goroutine finishes, so by the
+	// time the connection is deregistered its map is empty.
+	//
+	// The hub needs it to tell the other watchers of each project that the
+	// audience changed. A roster counts the connections watching a project, and
+	// a browser that has closed its tab is one of them until somebody says
+	// otherwise.
+	watching []string
+
 	// subWG tracks subscription goroutines so that the disconnect record is
 	// written after them rather than in the middle of them.
 	subWG sync.WaitGroup
-
-	framesIn  atomic.Uint64
-	bytesIn   atomic.Uint64
-	framesOut atomic.Uint64
-	bytesOut  atomic.Uint64
 }
 
 // newConn builds a connection. It does not start it; Serve does.
-func newConn(h *Hub, ws Socket, remote string, n uint64) *Conn {
+func newConn(h *Hub, ws Socket, info ConnInfo, n uint64) *Conn {
 	ctx, cancel := context.WithCancel(context.Background())
-	c := &Conn{
+	id := fmt.Sprintf("ws_%06d", n)
+
+	// The identifier is taken only if it has the shape this protocol defines.
+	// A client that sent none, or sent something that is not one, is given a
+	// fresh one and told what it is in the greeting: the server never refuses a
+	// connection over this, and it never carries an unshaped string into a
+	// roster, a log line or another client's screen.
+	clientID := info.ClientID
+	if !validClientID(clientID) {
+		clientID = newClientID()
+	}
+
+	// A log record carries the client, the project, the event and the time, and
+	// nothing else. The connection's own name, the address it came from and its
+	// frame counters are all deliberately absent: what must never reach a log is
+	// what a person typed and what a terminal printed, and the way to be sure of
+	// that is to hand the logger no more than it needs - see
+	// docs/MULTI_DEVICE.md §11.
+	return &Conn{
 		hub:        h,
 		ws:         ws,
-		id:         fmt.Sprintf("c_%06d", n),
-		log:        h.log.With("clientId", fmt.Sprintf("c_%06d", n), "remote", remote),
+		id:         id,
+		clientID:   clientID,
+		device:     deviceLabel(info.UserAgent),
+		log:        h.log.With("clientId", clientID),
 		ctx:        ctx,
 		cancel:     cancel,
 		out:        make(chan outbound, outboundQueueDepth),
@@ -146,7 +186,6 @@ func newConn(h *Hub, ws Socket, remote string, n uint64) *Conn {
 		writerDone: make(chan struct{}),
 		subs:       make(map[string]*subscription),
 	}
-	return c
 }
 
 // outboundQueueDepth bounds how many frames may be waiting for one browser.
@@ -164,16 +203,28 @@ func (c *Conn) run() {
 
 	// The greeting is queued before anything else can be, so a client always
 	// learns the protocol version before it can be sent a frame it does not
-	// understand.
+	// understand - and, since version 2, learns which of the two identifiers
+	// the server thinks it has.
 	c.enqueueText(encodeJSON(helloMessage{
-		Type:     MsgHello,
-		Protocol: ProtocolVersion,
-		ClientID: c.id,
-		Server:   version.AppName,
-		Version:  version.Version,
+		Type:         MsgHello,
+		Protocol:     ProtocolVersion,
+		ClientID:     c.clientID,
+		ConnectionID: c.id,
+		Device:       c.device,
+		Server:       version.AppName,
+		Version:      version.Version,
 	}))
 
 	c.readLoop()
+
+	// What this connection was watching, recorded now because the subscriptions
+	// are about to end and forget themselves. See the field's comment.
+	c.mu.Lock()
+	c.watching = make([]string, 0, len(c.subs))
+	for projectID := range c.subs {
+		c.watching = append(c.watching, projectID)
+	}
+	c.mu.Unlock()
 
 	// The read loop has ended. If a close is queued, give the writer a moment
 	// to put the error and the close on the wire; the browser's console is the
@@ -237,11 +288,13 @@ func (c *Conn) write(msg outbound) bool {
 		return true
 	}
 	if err := c.ws.WriteMessage(msg.kind, msg.data); err != nil {
-		c.log.Debug("terminal socket write failed", "error", err)
+		// The failure is the event; the error message is not logged with it. A
+		// record here carries the client and the project and nothing else, and
+		// an error string from a socket layer is one of the places a fragment of
+		// what was being written could end up - see docs/MULTI_DEVICE.md §11.
+		c.log.Debug("terminal socket write failed")
 		return false
 	}
-	c.framesOut.Add(1)
-	c.bytesOut.Add(uint64(len(msg.data)))
 	return true
 }
 
@@ -366,12 +419,13 @@ func (c *Conn) readLoop() {
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err,
 				websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-				c.log.Debug("terminal socket read ended", "error", err)
+				// The close code is not logged with it, for the reason the write
+				// failure above gives. An abnormal end is still an end: the hub's
+				// teardown is what says anything further.
+				c.log.Debug("terminal socket read ended")
 			}
 			return
 		}
-		c.framesIn.Add(1)
-		c.bytesIn.Add(uint64(len(data)))
 
 		if kind != websocket.TextMessage {
 			// No client message is binary: raw input is bytes, but it is sent
@@ -436,6 +490,14 @@ func (c *Conn) handleText(data []byte) bool {
 		}
 		c.enqueueText(encodeJSON(pongMessage{Type: MsgPong}))
 		return true
+	case MsgControlRequest:
+		return c.handleControlRequest(msg)
+	case MsgControlRelease:
+		return c.handleControlRelease(msg)
+	case MsgControlAccept:
+		return c.handleControlAccept(msg, true)
+	case MsgControlReject:
+		return c.handleControlAccept(msg, false)
 	case "":
 		c.sendError(CodeBadMessage, "message has no type", "", "")
 		return true
@@ -461,8 +523,8 @@ func (c *Conn) handleSubscribe(msg clientMessage) bool {
 			"projectId must be an AgentMux project identifier", msg.ProjectID, MsgSubscribe)
 		return true
 	}
-	if len(msg.Data) > 0 {
-		c.sendError(CodeBadMessage, "a subscribe carries no data", msg.ProjectID, MsgSubscribe)
+	if len(msg.Data) > 0 || msg.ClientID != "" {
+		c.sendError(CodeBadMessage, "a subscribe carries no data and no client", msg.ProjectID, MsgSubscribe)
 		return true
 	}
 	cols, rows, err := normalizeSize(msg.Cols, msg.Rows)
@@ -500,14 +562,40 @@ func (c *Conn) handleSubscribe(msg clientMessage) bool {
 	// client is sent is the one its terminal will be the right shape for.
 	// Without this the client would draw a screen at the runtime's old size and
 	// then reflow it, which is visible and unnecessary.
-	if cols > 0 {
+	//
+	// It is applied only for the controller, and the condition is the phase's
+	// whole rule applied to the one path that would otherwise slip past it. A
+	// subscribe carries a size because a browser knows how large its viewport
+	// is - but a phone opening a project the desktop is working in must not
+	// reflow the desktop's terminal to forty columns just by looking at it. A
+	// viewer draws the screen at the size it is sent; that the screen is not
+	// the shape of its own box is exactly what it means to be watching somebody
+	// else's terminal. See docs/MULTI_DEVICE.md §8.
+	if cols > 0 && c.hub.authority.MayResize(msg.ProjectID, c.clientID).Allowed {
 		c.applySize(msg.ProjectID, cols, rows)
 	}
 
 	if existing != nil {
+		// The roster is re-sent on a re-subscribe as well as on a first one.
+		// The client may have missed a change while it was not watching - a
+		// controller that expired while the page was elsewhere - and a roster
+		// it has to guess at is a Request Control button that may be wrong.
+		//
+		// It is sent before the resync is requested, so that a client always
+		// has the roster by the time the first frame of the new snapshot
+		// arrives. The other order would make the two race, and a client that
+		// draws a terminal before it knows who is typing into it has drawn a
+		// state it may have to take back.
+		c.sendControl(c.hub.controlMessage(MsgControlChanged, msg.ProjectID, "", c))
 		existing.requestResync()
 		return true
 	}
+
+	// A client that has just started watching is told who is in charge before
+	// it is told anything else, so that its first render is the truth rather
+	// than a guess it corrects a moment later. That means before the
+	// subscription starts, not merely before it produces output.
+	c.sendControl(c.hub.controlMessage(MsgControlChanged, msg.ProjectID, "", c))
 
 	sub := c.startSubscription(msg.ProjectID)
 	if sub == nil {
@@ -518,7 +606,19 @@ func (c *Conn) handleSubscribe(msg clientMessage) bool {
 		// the same project, which is the kind of bug that surfaces as
 		// interleaved output months later.
 		c.sendError(CodeInternal, "subscription already exists", msg.ProjectID, MsgSubscribe)
+		return true
 	}
+
+	// And everybody already watching is told the audience grew, because the
+	// roster says how many other people are watching and that number has just
+	// changed for all of them.
+	//
+	// It is sent after the subscription is created rather than before, because
+	// the count is a count of subscriptions: a broadcast sent first would tell
+	// the others that nobody had arrived. The newcomer is skipped - it was given
+	// the same roster a moment ago, and the point of giving it then was that it
+	// arrives before the first frame.
+	c.hub.broadcastControlExcept(msg.ProjectID, MsgControlChanged, c)
 	return true
 }
 
@@ -534,12 +634,29 @@ func (c *Conn) handleUnsubscribe(msg clientMessage) bool {
 		return true
 	}
 
+	// A client that has stopped watching a project is no longer waiting for its
+	// terminal, and a request left behind would put a name in every other
+	// viewer's roster for a client that has gone. Withdrawing is safe whether
+	// or not there was one: the client may unsubscribe from several projects
+	// and only have asked about some.
+	//
+	// A lease is deliberately *not* released here. A controller that pages away
+	// from a project, or goes full screen on another one, has not given up
+	// control of it - and in the workspace a panel is unmounted whenever its
+	// page is not the current one, which would make paging a way to lose the
+	// keyboard.
+	c.hub.authority.Withdraw(msg.ProjectID, c.clientID)
+
 	c.mu.Lock()
 	sub, ok := c.subs[msg.ProjectID]
 	if ok {
 		delete(c.subs, msg.ProjectID)
 	}
 	c.mu.Unlock()
+
+	// Everyone still watching is told, because the viewer count they are
+	// showing has just changed.
+	c.hub.broadcastControl(msg.ProjectID, MsgControlChanged)
 
 	if !ok {
 		// Unsubscribing from a terminal this connection does not watch is not
@@ -563,8 +680,8 @@ func (c *Conn) handleInput(msg clientMessage) bool {
 			"projectId must be an AgentMux project identifier", msg.ProjectID, MsgInput)
 		return true
 	}
-	if msg.Cols != 0 || msg.Rows != 0 {
-		c.sendError(CodeBadMessage, "input carries no size", msg.ProjectID, MsgInput)
+	if msg.Cols != 0 || msg.Rows != 0 || msg.ClientID != "" {
+		c.sendError(CodeBadMessage, "input carries no size and no client", msg.ProjectID, MsgInput)
 		return true
 	}
 	if len(msg.Data) == 0 {
@@ -583,6 +700,18 @@ func (c *Conn) handleInput(msg clientMessage) bool {
 	if !c.watches(msg.ProjectID) {
 		c.sendError(CodeNotSubscribed,
 			"subscribe to this project before sending input to it", msg.ProjectID, MsgInput)
+		return true
+	}
+	// And only from the client that holds the lease. This is the gate the whole
+	// phase is about: it is consulted here, on the only path that reaches a
+	// terminal with bytes, and there is no second path that skips it.
+	if decision := c.hub.authority.MayInput(msg.ProjectID, c.clientID); !decision.Allowed {
+		c.sendError(decision.Code, decision.Message, msg.ProjectID, MsgInput)
+		// The fact of the refusal is recorded; the bytes are not, and neither
+		// is how many of them there were. A refused keystroke is still a
+		// keystroke, and a log is the easiest place for one to end up somewhere
+		// nobody meant it to be.
+		c.log.Debug("input refused from a viewer", "projectId", msg.ProjectID)
 		return true
 	}
 
@@ -604,8 +733,8 @@ func (c *Conn) handleResize(msg clientMessage) bool {
 			"projectId must be an AgentMux project identifier", msg.ProjectID, MsgResize)
 		return true
 	}
-	if len(msg.Data) > 0 {
-		c.sendError(CodeBadMessage, "a resize carries no data", msg.ProjectID, MsgResize)
+	if len(msg.Data) > 0 || msg.ClientID != "" {
+		c.sendError(CodeBadMessage, "a resize carries no data and no client", msg.ProjectID, MsgResize)
 		return true
 	}
 	if !c.watches(msg.ProjectID) {
@@ -620,6 +749,13 @@ func (c *Conn) handleResize(msg clientMessage) bool {
 	}
 	if cols == 0 {
 		c.sendError(session.CodeInvalidSize, "a resize must carry cols and rows", msg.ProjectID, MsgResize)
+		return true
+	}
+	if decision := c.hub.authority.MayResize(msg.ProjectID, c.clientID); !decision.Allowed {
+		// A viewer's resize is refused rather than ignored. A client that asked
+		// for a shape and was not given it should be told, and the alternative
+		// is a terminal that never matches the shape the client thinks it has.
+		c.sendError(decision.Code, decision.Message, msg.ProjectID, MsgResize)
 		return true
 	}
 	c.applySize(msg.ProjectID, cols, rows)
@@ -707,7 +843,7 @@ func (c *Conn) startSubscription(projectID string) *subscription {
 		defer c.subWG.Done()
 		sub.run()
 	}()
-	c.log.Info("terminal subscribed", "projectId", projectID, "subscriptions", c.subscriptionCount())
+	c.log.Info("terminal subscribed", "projectId", projectID)
 	return sub
 }
 

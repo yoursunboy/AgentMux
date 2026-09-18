@@ -401,12 +401,62 @@ code {
   flex: 0 0 auto;
 }
 
+/* Both ends of the bar are groups so that the state and who is in charge stay
+   together on the left, and the actions stay together on the right, however
+   many of each there are. */
+.terminal__group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The state end gives way when the panel is narrow, and the actions end does
+   not: a truncated sentence still says something, and a half-drawn button says
+   nothing a person can press. */
+.terminal__group--state {
+  flex: 1 1 auto;
+}
+
+.terminal__group--actions {
+  flex: 0 0 auto;
+}
+
 .terminal__state {
   font-size: 11px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Who is in charge, which is the sentence that explains a keyboard that does
+   nothing. It is given the same weight as the connection state and a colour of
+   its own, because a viewer is a working client, not a fault. */
+.terminal__control {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+}
+
+.terminal__control--mine {
+  border-color: var(--online);
+  color: var(--online);
+}
+
+.terminal__control--waiting {
+  border-color: var(--warning);
+  color: var(--warning);
+}
+
+.terminal__control--other,
+.terminal__control--away {
+  color: var(--text-muted);
 }
 
 .terminal__state--open {
@@ -438,7 +488,13 @@ code {
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  /* A viewer's terminal is as large as the terminal is, so a box smaller than
+     the screen somebody else is working in has more of it to show than fits.
+     Scrolling reaches it; hiding would leave a phone watching a desktop's
+     terminal with the top-left corner of it and no way to see the rest. A
+     controller never overflows - its own box is what the pty was resized to -
+     so no scrollbar appears for the browser that is typing. */
+  overflow: auto;
 }
 
 .terminal__screen .xterm {
@@ -474,6 +530,35 @@ code {
   background: var(--bg-sunken);
   color: var(--warning);
   font-size: 12px;
+}
+
+/* The queue, shown only to the controller — the one client that can answer it.
+   It wraps rather than scrolling: a request that could be scrolled out of sight
+   is a request nobody answers. */
+.terminal__requests {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.terminal__request {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.terminal__request > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .prompt-bar {

@@ -12,6 +12,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   accounts,
+  decodeControlView,
   decodeFrame,
   decodeServerMessage,
   encodeInput,
@@ -20,13 +21,18 @@ import {
   FrameType,
   FRAME_VERSION,
   isAlternate,
+  isController,
   isSnapshot,
+  isWaiting,
+  MAX_CLIENT_ID_LENGTH,
   MAX_PROJECT_ID_LENGTH,
+  newClientId,
   OUTPUT_HEADER_BYTES,
   PROTOCOL_VERSION,
   ServerMsg,
   SNAPSHOT_HEADER_BYTES,
   splitOnCharacterBoundaries,
+  validClientId,
 } from './protocol'
 
 const PROJECT_ID = 'p_0123456789abcdef0123'
@@ -341,13 +347,23 @@ describe('the gap rule', () => {
 describe('control messages', () => {
   it('reads the greeting', () => {
     const message = decodeServerMessage(
-      '{"type":"hello","protocol":1,"clientId":"c1","server":"AgentMux","version":"0.1.0"}',
+      JSON.stringify({
+        type: 'hello',
+        protocol: PROTOCOL_VERSION,
+        clientId: 'c_0123456789abcdef',
+        connectionId: 'ws_000001',
+        device: 'Chrome on Windows',
+        server: 'AgentMux',
+        version: '0.1.0',
+      }),
     )
 
     expect(message).toEqual({
       type: 'hello',
       protocol: PROTOCOL_VERSION,
-      clientId: 'c1',
+      clientId: 'c_0123456789abcdef',
+      connectionId: 'ws_000001',
+      device: 'Chrome on Windows',
       server: 'AgentMux',
       version: '0.1.0',
     })
@@ -379,6 +395,113 @@ describe('control messages', () => {
       expect(decodeServerMessage(payload)).toBeNull()
     })
   }
+})
+
+describe('the client identifier', () => {
+  it('accepts what the server issues', () => {
+    expect(validClientId(newClientId())).toBe(true)
+  })
+
+  it('refuses anything that is not the shape the server accepts', () => {
+    // A shape check, not a permission - but it is what stops a stored value
+    // from being offered as an identifier when it is really a path, or a
+    // sentence, or another protocol's idea of an identifier.
+    for (const value of [
+      '',
+      'c_',
+      'c_ABCDEF',
+      'c_0123-4567',
+      '0123456789abcdef',
+      'c_../../etc/passwd',
+      `c_${'a'.repeat(MAX_CLIENT_ID_LENGTH)}`,
+    ]) {
+      expect(validClientId(value)).toBe(false)
+    }
+  })
+
+  it('invents a different one every time', () => {
+    const seen = new Set<string>()
+    for (let i = 0; i < 200; i++) seen.add(newClientId())
+
+    expect(seen.size).toBe(200)
+  })
+})
+
+describe('reading a roster', () => {
+  const roster = { controller: null, suspended: false, expiresAt: '', viewers: 0, pending: [] }
+
+  it('reads one with nobody in charge', () => {
+    expect(decodeControlView(roster)).toEqual(roster)
+  })
+
+  it('reads the controller, the queue and the count', () => {
+    const view = decodeControlView({
+      controller: { clientId: 'c_aaaa', device: 'Safari on iPad' },
+      suspended: true,
+      expiresAt: '2026-09-18T12:00:00Z',
+      viewers: 2,
+      pending: [{ clientId: 'c_bbbb', device: 'Chrome on Android' }],
+    })
+
+    expect(view).toEqual({
+      controller: { clientId: 'c_aaaa', device: 'Safari on iPad' },
+      suspended: true,
+      expiresAt: '2026-09-18T12:00:00Z',
+      viewers: 2,
+      pending: [{ clientId: 'c_bbbb', device: 'Chrome on Android' }],
+    })
+  })
+
+  it('refuses anything it could not draw a header from', () => {
+    // The failure this prevents is a bar assembled from the fields that
+    // happened to parse, which can name the wrong device as the one typing.
+    for (const raw of [
+      null,
+      'a roster',
+      {},
+      { ...roster, suspended: 'yes' },
+      { ...roster, viewers: 'two' },
+      { ...roster, controller: { clientId: 'c_aaaa' } },
+      { ...roster, controller: { device: 'iPad' } },
+      { ...roster, pending: 'none' },
+      { ...roster, pending: [{ clientId: 'c_bbbb' }] },
+    ]) {
+      expect(decodeControlView(raw)).toBeNull()
+    }
+  })
+
+  it('treats a missing queue as no queue', () => {
+    // It is the one field with a safe default: a client that has no queue and a
+    // client that was not told about one draw the same header.
+    const view = decodeControlView({
+      controller: null,
+      suspended: false,
+      viewers: 1,
+    })
+
+    expect(view?.pending).toEqual([])
+    expect(view?.expiresAt).toBe('')
+  })
+
+  it('answers who is in charge from this client’s own identifier', () => {
+    const held = decodeControlView({ ...roster, controller: { clientId: 'c_aaaa', device: 'iPad' } })
+
+    expect(isController(held, 'c_aaaa')).toBe(true)
+    expect(isController(held, 'c_bbbb')).toBe(false)
+    expect(isController(null, 'c_aaaa')).toBe(false)
+    expect(isController(held, null)).toBe(false)
+  })
+
+  it('answers whether this client is in the queue', () => {
+    const view = decodeControlView({
+      ...roster,
+      pending: [{ clientId: 'c_bbbb', device: 'Chrome on Android' }],
+    })
+
+    expect(isWaiting(view, 'c_bbbb')).toBe(true)
+    expect(isWaiting(view, 'c_aaaa')).toBe(false)
+    expect(isWaiting(null, 'c_bbbb')).toBe(false)
+  })
 })
 
 describe('splitting input on character boundaries', () => {

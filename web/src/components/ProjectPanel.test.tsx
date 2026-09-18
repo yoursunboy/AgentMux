@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -6,7 +6,10 @@ import { ProjectPanel, type PanelActions, type PanelPosition } from './ProjectPa
 import { ProjectTerminal } from './ProjectTerminal'
 import { makeProject } from '../test/fixtures'
 import {
+  CLIENT_ID,
   makeClient,
+  makeControlState,
+  makeControlView,
   makeSession,
   makeStatus,
   makeTerminalError,
@@ -14,6 +17,7 @@ import {
 } from '../test/terminal'
 import { TerminalProvider } from '../terminal/useTerminal'
 import type { TerminalSession } from '../terminal/useTerminal'
+import { ControlReason } from '../terminal/protocol'
 import type { Project } from '../api/types'
 
 // xterm is replaced here for the same reason it is replaced in TerminalView's
@@ -415,11 +419,132 @@ describe('ProjectPanel', () => {
       expect(screen.getByLabelText('Message Claude')).toBeDisabled()
     })
 
-    it('is enabled once there is a live terminal', () => {
+    it('is disabled for a viewer, and says who is typing instead', () => {
+      // Phase 6: a live connection is not a keyboard. A client that opens a
+      // project is a viewer until it asks, so a field that accepted text here
+      // would be accepting text the server is going to drop.
       const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
       renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({ controller: { clientId: 'c_ffffffffffffffff', device: 'iPad' } }),
+        ),
+      )
+
+      expect(screen.getByLabelText('Message Claude')).toBeDisabled()
+      expect(screen.getByPlaceholderText(/only iPad can type/)).toBeInTheDocument()
+    })
+
+    it('is enabled once this client holds the lease', () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({ controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' } }),
+        ),
+      )
 
       expect(screen.getByLabelText('Message Claude')).toBeEnabled()
+    })
+
+    it('is disabled while the request is queued, and says it is waiting', () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({
+            controller: { clientId: 'c_ffffffffffffffff', device: 'iPad' },
+            pending: [{ clientId: CLIENT_ID, device: 'Chrome on Windows' }],
+          }),
+        ),
+      )
+
+      expect(screen.getByLabelText('Message Claude')).toBeDisabled()
+      expect(screen.getByPlaceholderText(/waiting for control/)).toBeInTheDocument()
+    })
+  })
+
+  describe('control', () => {
+    it('asks for a terminal nobody is using, which is granted at once', async () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() => terminal.deliverControl(makeControlView()))
+
+      await userEvent.click(screen.getByRole('button', { name: 'Request control' }))
+      expect(terminal.current()?.requestControl).toHaveBeenCalledOnce()
+    })
+
+    it('asks for one somebody else is using, which queues instead', async () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({ controller: { clientId: 'c_ffffffffffffffff', device: 'iPad' } }),
+        ),
+      )
+
+      await userEvent.click(screen.getByRole('button', { name: 'Request control' }))
+      expect(terminal.current()?.requestControl).toHaveBeenCalledOnce()
+    })
+
+    it('offers to release it once we have it', async () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({ controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' } }),
+        ),
+      )
+
+      await userEvent.click(screen.getByRole('button', { name: 'Release control' }))
+      expect(terminal.current()?.releaseControl).toHaveBeenCalledOnce()
+    })
+
+    it('lets the controller answer the queue', async () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({
+            controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' },
+            pending: [{ clientId: 'c_ffffffffffffffff', device: 'iPad' }],
+          }),
+        ),
+      )
+
+      expect(screen.getByText('iPad is asking for control')).toBeInTheDocument()
+      await userEvent.click(screen.getByRole('button', { name: 'Hand over' }))
+      expect(terminal.current()?.acceptControl).toHaveBeenCalledWith('c_ffffffffffffffff')
+    })
+
+    it('leaves the queue to the controller, because nobody else can answer it', () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(
+          makeControlView({
+            controller: { clientId: 'c_ffffffffffffffff', device: 'iPad' },
+            pending: [{ clientId: 'c_0000000000000000', device: 'Android phone' }],
+          }),
+        ),
+      )
+
+      expect(screen.queryByText(/is asking for control/)).not.toBeInTheDocument()
+    })
+
+    it('says so when a request was refused, which the roster cannot', () => {
+      const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+      renderPanel({ project: running(), terminal })
+      act(() =>
+        terminal.deliverControl(makeControlView(), {
+          type: 'control.denied',
+          projectId: makeProject().id,
+          reason: ControlReason.controllerExists,
+          control: makeControlView({ controller: { clientId: 'c_ffffffffffffffff', device: 'iPad' } }),
+        }),
+      )
+
+      expect(screen.getByText('Somebody else is using this terminal.')).toBeInTheDocument()
     })
   })
 
@@ -482,5 +607,134 @@ describe('ProjectTerminal', () => {
     expect(screen.getByText('The server stopped sending this terminal.')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Ask again' }))
     expect(double.session.askAgain).toHaveBeenCalledOnce()
+  })
+
+  describe('who is in charge', () => {
+    it('says whose terminal this is when it is not ours', () => {
+      const double = makeSession({
+        control: makeControlState({
+          view: makeControlView({
+            controller: { clientId: 'c_ffffffffffffffff', device: 'Safari on iPad' },
+          }),
+          held: false,
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-control')).toHaveTextContent(
+        'Viewer · Safari on iPad has control',
+      )
+    })
+
+    it('says when nobody is, which is what makes taking it possible', async () => {
+      const double = makeSession({
+        control: makeControlState({ view: makeControlView(), held: false }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-control')).toHaveTextContent('Viewer · nobody is in control')
+      await userEvent.click(screen.getByRole('button', { name: 'Request control' }))
+      expect(double.session.requestControl).toHaveBeenCalledOnce()
+    })
+
+    it('takes the keyboard away from a viewer and leaves the button that gets it back', () => {
+      const double = makeSession({
+        control: makeControlState({ view: makeControlView(), held: false }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-screen')).toHaveAttribute('data-interactive', 'no')
+      expect(screen.getByRole('button', { name: 'Request control' })).toBeEnabled()
+    })
+
+    it('says somebody is away rather than that they have it, and does not offer to take it', () => {
+      // The grace period: the controller's connection has dropped and the lease
+      // is being held for it. Nobody can take it yet, and a button that says
+      // otherwise is a button that produces a refusal.
+      const double = makeSession({
+        control: makeControlState({
+          view: makeControlView({
+            controller: { clientId: 'c_ffffffffffffffff', device: 'Safari on iPad' },
+            suspended: true,
+            expiresAt: '2026-09-18T12:00:00Z',
+          }),
+          held: false,
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-control')).toHaveTextContent(
+        'Viewer · Safari on iPad is away',
+      )
+      expect(screen.getByRole('button', { name: 'Request control' })).toBeDisabled()
+      expect(screen.getByTestId('terminal-screen')).toHaveAttribute('data-interactive', 'no')
+    })
+
+    it('gives the keyboard back to a controller whose connection came back', () => {
+      const double = makeSession({
+        control: makeControlState({
+          view: makeControlView({
+            controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' },
+            viewers: 2,
+          }),
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-control')).toHaveTextContent('You control · 2 watching')
+      expect(screen.getByTestId('terminal-screen')).toHaveAttribute('data-interactive', 'yes')
+      expect(screen.getByRole('button', { name: 'Release control' })).toBeEnabled()
+    })
+
+    it('shows a viewer that it is waiting, with nothing to press', () => {
+      const double = makeSession({
+        control: makeControlState({
+          view: makeControlView({
+            controller: { clientId: 'c_ffffffffffffffff', device: 'Safari on iPad' },
+            pending: [{ clientId: CLIENT_ID, device: 'Chrome on Windows' }],
+          }),
+          held: false,
+          waiting: true,
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByTestId('terminal-control')).toHaveTextContent('Waiting for control…')
+      expect(screen.getByRole('button', { name: 'Waiting…' })).toBeDisabled()
+    })
+
+    it('explains a refused keystroke, because the server is the one that refused it', () => {
+      // A viewer cannot type: the keyboard is off and the Prompt Bar is
+      // disabled, so this is the answer to input that arrived anyway - a race
+      // between the roster and a keystroke, or a client that has not caught up.
+      const double = makeSession({
+        control: makeControlState({ view: makeControlView(), held: false }),
+        error: makeTerminalError({
+          code: 'not_controller',
+          message: 'you are not controlling this project',
+          about: 'input',
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByText('you are not controlling this project')).toBeInTheDocument()
+      // It is not something asking again fixes, and offering the button would
+      // be offering a loop.
+      expect(screen.queryByRole('button', { name: 'Ask again' })).not.toBeInTheDocument()
+    })
+
+    it('explains a refused resize the same way, in the same channel', () => {
+      const double = makeSession({
+        control: makeControlState(),
+        error: makeTerminalError({
+          code: 'not_controller',
+          message: 'you are not controlling this project',
+          about: 'resize',
+        }),
+      })
+      renderTerminal(double.session)
+
+      expect(screen.getByText('you are not controlling this project')).toBeInTheDocument()
+    })
   })
 })

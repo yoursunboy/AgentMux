@@ -36,6 +36,7 @@ import {
   startServer,
   stopServer,
   settleShell,
+  takeControl,
   typeCommand,
   waitFor,
   wsl,
@@ -360,9 +361,18 @@ async function isolation(browser) {
   )
 
   // Input: the Prompt Bar of one panel reaches that terminal and no other.
+  //
+  // Phase 6: a panel whose client is not the controller has a disabled Prompt
+  // Bar, so the ask comes first. Asked of this panel and not of the others,
+  // because the lease is per project and this check is about routing: the
+  // message must reach one pty. Whether the other four may type at all is the
+  // question `controller.mjs` asks.
   const promptMarker = `PROMPT-${Date.now()}`
   const first = SHELLS[0]
   const firstPanel = page.locator(`.panel--project[data-project-id="${first.id}"]`)
+  if (!(await takeControl(page, first))) {
+    report.check('taking control of a panel to type in it', false, 'the ask was refused')
+  }
   await firstPanel.getByLabel('Message Claude').fill(`echo ${promptMarker}`)
   await firstPanel.getByRole('button', { name: 'Send' }).click()
   await page.waitForTimeout(2000)
@@ -477,6 +487,16 @@ async function focus(browser) {
 
   const target = ALL[0]
   const claudesBefore = claudePids()
+  // Phase 6: focus is a layout, and the terminal following it is a resize -
+  // which belongs to whoever holds the lease for the project. A page that opens
+  // a project is a viewer and its resize is refused, so without this the check
+  // below would be asking whether a layout moved a terminal it has no authority
+  // over. It is the same ask every other suite makes; `controller.mjs` is where
+  // a viewer being unable to do this is the subject rather than the setup.
+  if (!(await takeControl(page, target))) {
+    report.check('taking control of the project to be focused', false, 'the ask was refused')
+  }
+  await page.waitForTimeout(1000)
   const sizeBefore = paneSize(target)
   const marker = `FOCUS-${Date.now()}`
   typeCommand(target, `echo ${marker}`)

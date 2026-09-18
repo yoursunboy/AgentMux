@@ -33,16 +33,22 @@
  */
 import {
   accounts,
+  CLIENT_ID_PARAM,
+  decodeControlView,
   decodeFrame,
   decodeServerMessage,
   encodeInput,
   ENDPOINT,
   isSnapshot,
   Msg,
+  newClientId,
   PROTOCOL_PARAM,
   PROTOCOL_VERSION,
   ServerMsg,
   SUBPROTOCOL,
+  validClientId,
+  type ControlMessage,
+  type ControlView,
   type DecodedFrame,
   type ErrorMessage,
   type HelloMessage,
@@ -83,6 +89,16 @@ export interface SubscriptionHandlers {
   show(payload: Uint8Array, cols: number, rows: number): void
   /** resize reports the canonical size the server applied to the terminal. */
   resize(cols: number, rows: number): void
+  /**
+   * control reports the project's control state.
+   *
+   * It is called for every message in the control family, and the roster it
+   * carries is the whole of what changed. The message itself comes along
+   * because some of them mean something beyond the roster - a refusal carries a
+   * reason, and a client that has just been handed a terminal should be able to
+   * say so - and everything else about it is the caller's to ignore.
+   */
+  control(view: ControlView, message: ControlMessage): void
   /** report describes a failure the subscription cannot recover from itself. */
   report(error: ErrorMessage): void
   /** ended reports that the server stopped sending for this project. */
@@ -98,12 +114,29 @@ export interface TerminalSubscription {
   resize(cols: number, rows: number): void
   /** resync asks to be shown the terminal again from a fresh screen. */
   resync(): void
+  /** requestControl asks to be given the project's keyboard. */
+  requestControl(): void
+  /** releaseControl gives it up. It is a no-op for a client that does not hold it. */
+  releaseControl(): void
+  /** acceptControl hands the lease to a client that has asked for it. */
+  acceptControl(clientId: string): void
+  /** rejectControl declines a request without giving anything up. */
+  rejectControl(clientId: string): void
   /** release stops watching the project. It is idempotent. */
   release(): void
 }
 
 export interface TerminalClient {
   readonly status: ConnectionStatus
+  /**
+   * The browser session identifier, once the server has said what it is.
+   *
+   * It is null until the greeting arrives. It is what a client compares a
+   * roster's controller against to decide whether it is looking at its own
+   * terminal, and it is deliberately not exposed as anything else: it is not a
+   * name, not a login, and nothing about holding it makes this client trusted.
+   */
+  readonly clientId: string | null
   /** onStatusChange subscribes to connection changes, returning an unsubscribe. */
   onStatusChange(listener: (status: ConnectionStatus) => void): () => void
   /** subscribe starts watching a project's terminal. */
@@ -117,6 +150,22 @@ export interface TerminalClient {
   /** close ends the connection for good. */
   close(): void
 }
+
+/**
+ * Where a browser session identifier is kept.
+ *
+ * It is narrowed to the two methods this client uses, so that a test can hand
+ * it an object rather than a storage area - and so that a storage area that
+ * throws, which is what a private window's does, can be caught in exactly one
+ * place.
+ */
+export interface ClientIdStore {
+  getItem(key: string): string | null
+  setItem(key: string, value: string): void
+}
+
+/** The key a browser session identifier is kept under. */
+export const CLIENT_ID_STORAGE_KEY = 'agentmux.clientId'
 
 export interface TerminalClientOptions {
   /**
@@ -134,6 +183,14 @@ export interface TerminalClientOptions {
   socketFactory?: (url: string, protocols: string[]) => WebSocket
   /** jitter feeds the reconnect delay. Defaults to Math.random. */
   jitter?: () => number
+  /**
+   * storage keeps the browser session identifier across a reload. Defaults to
+   * sessionStorage, which is what makes a reload a reconnection rather than a
+   * new device. Null means the identifier lives only as long as the page, which
+   * is what a private window gets and still works - it just means a reload
+   * arrives as a client nobody has seen before.
+   */
+  storage?: ClientIdStore | null
 }
 
 /** Ping interval and the deadline for the answer. */
@@ -201,8 +258,71 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
   let closed = false
   let helloReceived = false
   let fault = ''
+  /**
+   * What this browser session calls itself.
+   *
+   * It is settled once, at the first connection, and then kept for the life of
+   * the page. Settling it once matters more than it looks: a client that
+   * generated a fresh identifier on every reconnect would arrive, after a
+   * network blip, as a device nobody had seen - which is exactly the case the
+   * control lease's grace period exists to cover, and it would never be
+   * exercised.
+   *
+   * Null means nothing has connected yet.
+   */
+  let sessionId: string | null = null
   /** Serialises the reads of any binary frame that arrives as a Blob. */
   let blobReads: Promise<void> = Promise.resolve()
+
+  /**
+   * In-memory fallback, used when there is nowhere to store the identifier.
+   *
+   * A page that cannot read sessionStorage is not a page that cannot have an
+   * identity - it is a page whose identity does not survive a reload. Keeping
+   * it here means the reconnects within one page still resume a lease; only the
+   * reload is a new device, which is the honest outcome for a browser that has
+   * refused to remember anything.
+   */
+  function store(): ClientIdStore | null {
+    if (options.storage !== undefined) return options.storage
+    try {
+      return globalThis.sessionStorage ?? null
+    } catch {
+      // A browser that refuses to hand over sessionStorage at all - the
+      // property itself throws when site data is blocked.
+      return null
+    }
+  }
+
+  function identity(): string {
+    if (sessionId) return sessionId
+    const kept = store()
+    if (kept) {
+      try {
+        const stored = kept.getItem(CLIENT_ID_STORAGE_KEY)
+        if (stored && validClientId(stored)) {
+          sessionId = stored
+          return sessionId
+        }
+      } catch {
+        // Reading storage can throw where writing would have; either way there
+        // is nothing stored that can be used.
+      }
+    }
+    sessionId = newClientId()
+    return sessionId
+  }
+
+  function remember(id: string): void {
+    sessionId = id
+    const kept = store()
+    if (!kept) return
+    try {
+      kept.setItem(CLIENT_ID_STORAGE_KEY, id)
+    } catch {
+      // A full or forbidden store. The identifier still lives in this page.
+    }
+  }
 
   function setStatus(state: ConnectionState, message = '', attempts = 0): void {
     if (status.state === state && status.message === message && status.attempt === attempts) return
@@ -231,7 +351,14 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
   // Connection
 
   function address(): string {
-    return `${url}?${PROTOCOL_PARAM}=${PROTOCOL_VERSION}`
+    // The identifier travels as a query parameter rather than as a header or a
+    // subprotocol, because a WebSocket handshake gives a browser no way to set
+    // one: the URL is the only part of the request this code controls.
+    //
+    // It is not a credential and the server does not treat it as one. It is how
+    // two connections are recognised as the same device, which is what makes a
+    // reload a reconnection instead of a second viewer.
+    return `${url}?${PROTOCOL_PARAM}=${PROTOCOL_VERSION}&${CLIENT_ID_PARAM}=${identity()}`
   }
 
   function connect(): void {
@@ -499,11 +626,33 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
       }
       case ServerMsg.pong:
         return
+      case ServerMsg.controlGranted:
+      case ServerMsg.controlDenied:
+      case ServerMsg.controlRevoked:
+      case ServerMsg.controlExpired:
+      case ServerMsg.controlChanged: {
+        const registration = registrations.get(message.projectId)
+        if (!registration || registration.released) return
+        const view = decodeControlView(message.control)
+        if (!view) {
+          // Every control message carries the roster, and a message that does
+          // not is not this protocol however it is spelled.
+          untrustworthy('the server sent a control message this client cannot read')
+          return
+        }
+        registration.handlers.control(view, message)
+        return
+      }
     }
   }
 
   function handleHello(message: HelloMessage): void {
     helloReceived = true
+    // The server has the last word on what this client is called. It echoes
+    // back what was asked for when that was usable and issues its own when it
+    // was not, and a client that kept its own answer would spend the rest of the
+    // session comparing rosters against a name nobody else has heard of.
+    if (validClientId(message.clientId)) remember(message.clientId)
     if (message.protocol !== PROTOCOL_VERSION) {
       gaveUp = true
       setStatus(
@@ -643,6 +792,22 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
         registration.awaitingSnapshot = true
         send({ type: Msg.resync, projectId })
       },
+      requestControl(): void {
+        if (registration.released) return
+        send({ type: Msg.controlRequest, projectId })
+      },
+      releaseControl(): void {
+        if (registration.released) return
+        send({ type: Msg.controlRelease, projectId })
+      },
+      acceptControl(clientId: string): void {
+        if (registration.released) return
+        send({ type: Msg.controlAccept, projectId, clientId })
+      },
+      rejectControl(clientId: string): void {
+        if (registration.released) return
+        send({ type: Msg.controlReject, projectId, clientId })
+      },
       release(): void {
         if (registration.released) return
         registration.released = true
@@ -676,6 +841,9 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
   return {
     get status() {
       return status
+    },
+    get clientId() {
+      return sessionId
     },
     onStatusChange(listener) {
       listeners.add(listener)

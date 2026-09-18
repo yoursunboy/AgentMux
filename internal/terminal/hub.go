@@ -175,6 +175,42 @@ type HubOptions struct {
 	// Timings overrides the transport's timeouts. Nil, or a zero field, means
 	// the default; see Timings.
 	Timings *Timings
+
+	// ControlGrace is how long a disconnected controller's lease is held for it
+	// before it is released. Zero means DefaultControlGrace.
+	//
+	// It is here rather than in Timings because it is not a transport timeout:
+	// it is a judgement about how long a person takes to come back, and the
+	// value a deployment might want is a product decision rather than a
+	// protocol one.
+	ControlGrace time.Duration
+}
+
+// ConnInfo describes who is on the other end of a socket.
+//
+// It is a struct rather than two parameters because both are strings that name
+// a client, and a call site that swapped them would compile, run, and label
+// every controller with a socket address.
+//
+// The identifier and the device label are produced *from* these fields rather
+// than being passed in, and that is deliberate: the HTTP layer's job is to hand
+// over what the request said, and every judgement about it - is this a usable
+// identifier, what does this user agent mean - is made in one place, in this
+// package, where the vocabulary is.
+//
+// The peer address is not among the fields. It was, and it went: a log record
+// here carries the client, the project, the event and the time and nothing
+// else - see docs/MULTI_DEVICE.md §11 - and an address that reached no further
+// than a log line is a field this package has no use for.
+type ConnInfo struct {
+	// ClientID is the browser session the client claims to be, or empty. It is
+	// checked for shape and replaced with a fresh identifier if it is not
+	// usable; see validClientID and newClientID.
+	ClientID string
+
+	// UserAgent is the handshake's User-Agent header, or empty. The label other
+	// clients see is derived from it here, never sent by the browser.
+	UserAgent string
 }
 
 // Hub owns every browser connection this server has open.
@@ -190,6 +226,11 @@ type Hub struct {
 	rt  Runtime
 	log *slog.Logger
 	now func() time.Time
+
+	// authority is who may type into what. It is the only thing in the server
+	// that answers that question, and the connections below reach the runtime
+	// only through it - see the file comment on authority.go.
+	authority *Authority
 
 	// t is the transport's timeouts, resolved once at construction. It is read
 	// by every connection and never written after NewHub, so it needs no lock.
@@ -237,6 +278,16 @@ func NewHub(rt Runtime, opts HubOptions) (*Hub, error) {
 	if opts.Timings != nil {
 		h.t = opts.Timings.withDefaults()
 	}
+	// The authority is built after the hub because expiry has to broadcast, and
+	// broadcasting is the hub's. The callback runs from the grace timer's own
+	// goroutine with the authority's lock already released, so it takes the
+	// hub's lock on its own terms - the same order every other path uses.
+	h.authority = NewAuthority(AuthorityOptions{
+		Grace:   opts.ControlGrace,
+		Now:     opts.Now,
+		Logger:  h.log,
+		Expired: func(projectID string) { h.broadcastControl(projectID, MsgControlExpired) },
+	})
 	return h, nil
 }
 
@@ -273,8 +324,8 @@ func (h *Hub) Stats() Stats {
 // It blocks. The caller is an HTTP handler that has already upgraded the
 // request, and it returns when the socket closes, when the client breaks the
 // protocol, or when the hub shuts down.
-func (h *Hub) Serve(ws Socket, remote string) {
-	c, ok := h.addConn(ws, remote)
+func (h *Hub) Serve(ws Socket, info ConnInfo) {
+	c, ok := h.addConn(ws, info)
 	if !ok {
 		// The hub is shutting down. The socket is closed rather than left to
 		// hang, so the browser's reconnect logic starts from a known state.
@@ -287,17 +338,30 @@ func (h *Hub) Serve(ws Socket, remote string) {
 }
 
 // addConn registers a connection, or reports that the hub will not take one.
-func (h *Hub) addConn(ws Socket, remote string) (*Conn, bool) {
+func (h *Hub) addConn(ws Socket, info ConnInfo) (*Conn, bool) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.closed {
+		h.mu.Unlock()
 		return nil, false
 	}
 	h.nextID++
-	c := newConn(h, ws, remote, h.nextID)
+	c := newConn(h, ws, info, h.nextID)
 	h.conns[c] = struct{}{}
-	h.log.Info("terminal client connected",
-		"clientId", c.id, "remote", remote, "connections", len(h.conns))
+	h.mu.Unlock()
+
+	h.log.Info("terminal client connected", "clientId", c.clientID)
+
+	// Presence is registered before the read loop starts, and after the
+	// connection is in the set. A client that reconnects with leases suspended
+	// gets them back here, before it has asked for anything - which is what
+	// makes a reload restore control rather than requiring a second click.
+	//
+	// Nothing directed is sent: the connection has not subscribed to anything
+	// yet, so there is no roster to give it and no message it could act on. What
+	// the other viewers need is the roster, and that is what they get.
+	for _, projectID := range h.authority.Attach(c.clientID, c.id, c.device) {
+		h.broadcastControl(projectID, MsgControlChanged)
+	}
 	return c, true
 }
 
@@ -305,17 +369,41 @@ func (h *Hub) addConn(ws Socket, remote string) (*Conn, bool) {
 func (h *Hub) removeConn(c *Conn) {
 	h.mu.Lock()
 	delete(h.conns, c)
-	remaining := len(h.conns)
 	h.mu.Unlock()
 
-	c.log.Info("terminal client disconnected",
-		"clientId", c.id,
-		"connections", remaining,
-		"framesIn", c.framesIn.Load(),
-		"bytesIn", c.bytesIn.Load(),
-		"framesOut", c.framesOut.Load(),
-		"bytesOut", c.bytesOut.Load(),
-	)
+	// Two things about this connection's projects stopped being true at the same
+	// moment, and they are one event seen from two sides: a lease it was holding
+	// is now suspended, and every project it was watching has one fewer viewer.
+	//
+	// They are gathered into one set and broadcast once per project, because a
+	// second roster for the same project would be a second message carrying the
+	// same roster - and a client applying it twice is a client that has been
+	// told nothing twice.
+	changed := make(map[string]struct{})
+	// The client's other connections, if any, keep its leases. Only when the
+	// last one has gone is the client absent - and even then the lease is
+	// suspended rather than released, because a disconnect is usually a
+	// reconnect that has not happened yet.
+	for _, projectID := range h.authority.Detach(c.clientID, c.id) {
+		changed[projectID] = struct{}{}
+	}
+	// A connection that was watching a project was part of that project's
+	// audience, and the roster says how large the audience is. Nothing about the
+	// terminal changed - which is why this is a roster message and not a
+	// revocation: the disconnect above speaks for a lease, and this speaks for
+	// the people watching it.
+	for _, projectID := range c.watching {
+		changed[projectID] = struct{}{}
+	}
+	for projectID := range changed {
+		h.broadcastControl(projectID, MsgControlChanged)
+	}
+
+	// A log record here carries the client, the project, the event and the time,
+	// and nothing else - see docs/MULTI_DEVICE.md §11. The counters this
+	// connection kept - frames and bytes in each direction - went with the
+	// fields they were read by.
+	c.log.Info("terminal client disconnected", "clientId", c.clientID)
 }
 
 // Close ends every connection.
@@ -341,6 +429,11 @@ func (h *Hub) Close() error {
 		conns = append(conns, c)
 	}
 	h.mu.Unlock()
+
+	// Grace timers are stopped before the wait below. A timer that fired during
+	// a shutdown would broadcast to connections that are in the middle of
+	// closing, for a lease nobody is going to come back to.
+	h.authority.Close()
 
 	deadline := h.now().Add(h.t.Shutdown)
 	for _, c := range conns {

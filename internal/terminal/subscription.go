@@ -140,8 +140,7 @@ func (s *subscription) run() {
 			s.conn.dropSubscription(s.projectID)
 			return
 		}
-		s.conn.log.Info("terminal re-synchronising",
-			"projectId", s.projectID, "resync", resyncs)
+		s.conn.log.Info("terminal re-synchronising", "projectId", s.projectID)
 
 		if !sleepContext(s.ctx, s.conn.hub.t.ResyncPause) {
 			return

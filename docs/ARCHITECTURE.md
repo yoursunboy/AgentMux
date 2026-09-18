@@ -144,7 +144,14 @@ Owns:
 In Phase 2 the parts that exist — canonical size, output stream, output sequence, bounded in-memory
 history — live inside the session manager's per-runtime state (`internal/session/buffer.go`). Viewer
 subscriptions exist as `Backend.Attach`; multiple subscribers to one session each receive the same
-bytes. Controller leases, viewer roles, and scroll are Phase 6 and are not stubbed.
+bytes.
+
+Phase 6 completed the list. Canonical size, viewer subscriptions and the controller lease are the hub's
+business rather than the session manager's, because all three are facts about *clients* and the
+session manager does not know what a client is: `internal/terminal/hub.go` holds the subscriptions,
+`internal/terminal/authority.go` holds the leases, and input routing is the one line between them that
+consults the second before it does the first. Scroll is still not a server concept and never will be —
+`docs/TERMINAL.md` §7.
 
 ### Workspace
 
@@ -163,6 +170,21 @@ is stored nowhere. `docs/WORKSPACE.md` is the whole of it.
 ### Controller Manager
 
 Guarantees one input controller per project.
+
+Built in Phase 6 as `internal/terminal/authority.go` — an authority per project rather than a manager
+over all of them, because the guarantee is per project and a single object holding every project's
+lease would be one lock for a fact that has no cross-project meaning.
+
+It owns two questions and answers only those:
+
+- **may this client type** — `MayInput`;
+- **may this client set the size** — `MayResize`.
+
+They are separate methods rather than one `IsController` because the directive keeps Input Authority
+and Resize Authority as separate interfaces (§十五), and because a future phase that wants to let a
+viewer choose its own geometry would change one of them and not the other. The lease itself is a
+`(clientId, expiresAt)` pair where `expiresAt` is set only while the holder is disconnected; the rules
+are in `docs/MULTI_DEVICE.md`, and nothing about it is persisted.
 
 ### HostAdapter
 
@@ -388,7 +410,9 @@ Message categories as built:
 binary:  terminal output (frame type 0x01)
          terminal snapshot (frame type 0x02)
 text:    hello, unsubscribed, resized, error, pong
+         control.granted, control.denied, control.revoked, control.expired, control.changed
          subscribe, unsubscribe, input, resize, resync, ping
+         control.request, control.release, control.accept, control.reject
 ```
 
 High-volume output is batched in the runtime manager, which is the layer that knows how much is
@@ -400,9 +424,24 @@ an encoding step on the hot path. Control is the opposite — rare, small, and w
 log or in a browser's frame list. So output travels in binary frames whose header carries the project
 and the range of sequence numbers it contains, and everything else is a JSON object with a `type`.
 
+One more concept was added in Phase 6 and it is worth naming here because it cuts across the pattern
+above: the **client**, as distinct from the connection. A connection is one WebSocket. A client is a
+browser session — a tab, on a device — and it is named by a `clientId` the browser generates, keeps in
+`sessionStorage`, and states in the handshake (`GET /api/ws?client=c_7f3a…`). It is a query parameter
+rather than a message field because it has to be known before the first message: a reconnecting
+client's leases are restored the moment its socket opens, which is before it has sent anything. The
+`hello` the server sends back carries both — `clientId` for the session and `connectionId` for the
+socket — where version 1 had one id that meant the connection. That distinction is what makes a reload
+a reconnection rather than a second device, and a dropped socket an interruption rather than a
+departure. It is also why §12's claim now has a second half: a reconnect restores a terminal, and it
+restores a *lease*, without the client asking again — unless the reconnect took longer than the grace,
+in which case the lease is gone and the client is an ordinary viewer.
+
 `project.status` and `server.status` are not implemented, and the reason is the same for both: the UI
 already learns project state from `GET /api/projects`, and there was no second consumer to justify a
-push. `controller.changed` is Phase 6 and `provider.changed` is Phase 8.
+push. `controller.changed` shipped in Phase 6 as `control.changed` — a roster carried alongside every
+message in that family rather than a notification that something changed. `provider.changed` is
+Phase 8.
 
 A client never sends a binary frame. Raw input is bytes, but it is bytes the client is sending rather
 than bytes a terminal is producing, and routing it through the same typed, size-limited, individually
@@ -441,6 +480,16 @@ separate process. On startup the server reconciles what it has recorded against 
 actually has and answers Case A/B/C accordingly — see §13 and `docs/RUNTIME.md` §6. A project whose
 session survived is reported `RUNNING` again, without the user's work having been interrupted, and a
 browser that reconnects afterwards finds the terminal where it was left.
+
+**Phase 6 added a second thing to restore, and a rule about not restoring it.** A reconnecting client
+gets its terminal back and, if it held a project's lease, gets that back too — provided it comes back
+inside the grace period. If it does not, the lease lapsed while it was away, and it returns as a viewer
+with no way to have known: the roster it is handed says somebody else has it, or nobody does. What it
+is *not* given is a lease because it used to have one. Nothing about the previous holder survives on
+the server, and a restarted server is the extreme case of that: it knows nothing at all and hands the
+terminal to nobody, not even to the only device watching. Concretely — `stopServer(); startServer()`
+under a live browser — is `web/e2e/suites/controller.mjs` section G, and the unit-level version is
+`internal/terminal/multi_device_test.go`.
 
 ## 13. Persistence
 
@@ -494,6 +543,22 @@ a site the user is visiting from connecting to a local AgentMux server.
 **Nothing sensitive is logged.** Terminal output, raw input, and the contents of a Prompt Bar prompt are
 never written to the log at any level, in either direction. The permitted fields are listed in
 `docs/TERMINAL.md` §13.
+
+**The control path has its own, narrower rule, and it is narrower on purpose.** §三十四 of the phase
+directive allows exactly four fields on a control log record — `clientId`, `projectId`, `event`,
+`timestamp` — and `internal/terminal` writes no others. `event` is the record's own message, from a
+closed vocabulary of plain phrases ("control granted", "control suspended while the controller is
+away", "control expired"); the timestamp is the logger's; and the identifier is a random string rather
+than a credential, so a line is a sentence about a lease and never a sentence about a person.
+`TestALogRecordCarriesOnlyTheFourFields` walks the whole control path — grant, queue, refusal,
+declined handover, accepted handover, release, suspension, resume and lapse — and fails the build if a
+fifth field appears. That rule breaks in practice not by decision but by somebody adding the thing
+that would have been useful while debugging, which is why the test exists rather than the intention.
+
+**A device is named, not identified.** The roster carries a label derived server-side from the
+User-Agent header, from a closed vocabulary (`Chrome on Windows`, `Safari on iPad`), and an
+unrecognised header becomes `Unknown device` rather than being passed through. The interface shows that
+label; it never shows an address, and there is no field in any message that could carry one.
 
 Recommended early deployment:
 

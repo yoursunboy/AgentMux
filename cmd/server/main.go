@@ -240,7 +240,14 @@ func run(args []string) error {
 	// process's: it has to be closed before the runtime manager is, so that
 	// every browser sees an ordinary close instead of a connection that dies
 	// when the process does.
-	terminalHub, err := terminal.NewHub(runtimes, terminal.HubOptions{Logger: logger})
+	hubOptions := terminal.HubOptions{Logger: logger}
+	// Zero is left as zero: the terminal package has its own default for how
+	// long a disconnected controller keeps its lease, and restating the number
+	// here would be a second place for it to be wrong.
+	if cfg.Server.ControlGraceSec > 0 {
+		hubOptions.ControlGrace = time.Duration(cfg.Server.ControlGraceSec) * time.Second
+	}
+	terminalHub, err := terminal.NewHub(runtimes, hubOptions)
 	if err != nil {
 		return err
 	}

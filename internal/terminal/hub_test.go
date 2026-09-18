@@ -722,6 +722,21 @@ type clientOptions struct {
 	// writeBuffer is the capacity of the socket's outgoing queue. Zero means a
 	// comfortable one; a small number is how a test makes the client slow.
 	writeBuffer int
+
+	// clientID is the browser session this client claims. Empty means it claims
+	// none, which is how a program that is not a browser connects - and the
+	// server issues one, which is what most tests below are exercising without
+	// meaning to.
+	clientID string
+
+	// userAgent is what the client sends as its User-Agent header. It is the
+	// only source of the device label other clients see.
+	userAgent string
+
+	// controlGrace overrides how long a disconnected controller's lease is held
+	// for it. Zero means the production default, which is a test that would have
+	// to wait thirty seconds to see a lease lapse.
+	controlGrace time.Duration
 }
 
 // fastTimings is the transport's timeouts at values a test can wait for.
@@ -749,7 +764,11 @@ func newHub(t *testing.T, rt *fakeRuntime, opts clientOptions) *Hub {
 	if opts.timings != nil {
 		timings = opts.timings
 	}
-	hub, err := NewHub(rt, HubOptions{Logger: discardLogger(), Timings: timings})
+	hub, err := NewHub(rt, HubOptions{
+		Logger:       discardLogger(),
+		Timings:      timings,
+		ControlGrace: opts.controlGrace,
+	})
 	if err != nil {
 		t.Fatalf("terminal.NewHub returned an error: %v", err)
 	}
@@ -776,11 +795,15 @@ func attach(t *testing.T, hub *Hub, rt *fakeRuntime, opts clientOptions) *client
 		ws:     ws,
 		served: make(chan struct{}),
 	}
+	before := hub.latestConnID()
 	go func() {
 		defer close(c.served)
-		hub.Serve(ws, "127.0.0.1:1")
+		hub.Serve(ws, ConnInfo{
+			ClientID:  opts.clientID,
+			UserAgent: opts.userAgent,
+		})
 	}()
-	c.conn = hub.awaitConn(t)
+	c.conn = hub.awaitConn(t, before)
 
 	t.Cleanup(func() {
 		_ = ws.Close()
@@ -808,19 +831,26 @@ func (c *client) greet() {
 	c.hello = c.expectMessage()
 }
 
-// awaitConn waits for the hub to register the connection Serve is running.
+// awaitConn waits for the hub to register a connection newer than `after`, and
+// returns it.
 //
 // Serve creates the Conn itself, so polling the hub is the only way a test can
-// reach the one it just started. It is a test helper and lives with the tests.
-func (h *Hub) awaitConn(t *testing.T) *Conn {
+// reach the one it just started. The bound is a connection identifier rather
+// than "any connection" because a hub in a test is not quiet, and returning
+// whichever connection happens to be in the map first would make every
+// assertion about client identity a statement about somebody else's client. The
+// identifiers are zero-padded, so comparing them as strings compares them in the
+// order they were issued.
+func (h *Hub) awaitConn(t *testing.T, after string) *Conn {
 	t.Helper()
 	deadline := time.Now().Add(socketWait)
 	for {
 		h.mu.Lock()
 		var found *Conn
 		for c := range h.conns {
-			found = c
-			break
+			if c.id > after && (found == nil || c.id > found.id) {
+				found = c
+			}
 		}
 		h.mu.Unlock()
 		if found != nil {
@@ -833,23 +863,41 @@ func (h *Hub) awaitConn(t *testing.T) *Conn {
 	}
 }
 
+// latestConnID is the highest connection identifier the hub has issued, or the
+// empty string if it has issued none.
+func (h *Hub) latestConnID() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	latest := ""
+	for c := range h.conns {
+		if c.id > latest {
+			latest = c.id
+		}
+	}
+	return latest
+}
+
 // ---------------------------------------------------------------------------
 // Talking to the client
 
 // serverMessage is every field of every server control message, in one struct,
 // so that a test can assert on the JSON a browser actually receives.
 type serverMessage struct {
-	Type      string `json:"type"`
-	Protocol  int    `json:"protocol"`
-	ClientID  string `json:"clientId"`
-	Server    string `json:"server"`
-	Version   string `json:"version"`
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	ProjectID string `json:"projectId"`
-	About     string `json:"about"`
-	Cols      int    `json:"cols"`
-	Rows      int    `json:"rows"`
+	Type         string      `json:"type"`
+	Protocol     int         `json:"protocol"`
+	ClientID     string      `json:"clientId"`
+	ConnectionID string      `json:"connectionId"`
+	Device       string      `json:"device"`
+	Server       string      `json:"server"`
+	Version      string      `json:"version"`
+	Code         string      `json:"code"`
+	Message      string      `json:"message"`
+	ProjectID    string      `json:"projectId"`
+	About        string      `json:"about"`
+	Reason       string      `json:"reason"`
+	Cols         int         `json:"cols"`
+	Rows         int         `json:"rows"`
+	Control      controlView `json:"control"`
 }
 
 // next reads the next message of either kind.
@@ -947,7 +995,21 @@ func (c *client) sendRaw(text string) {
 	c.ws.sendText(text)
 }
 
+// subscribe watches a project and consumes the roster that answers it.
+//
+// Every subscribe is answered with the roster - who holds the lease, who is
+// waiting, how many others are watching - before anything else reaches the
+// connection. Consuming it here keeps the tests that are about output, input
+// and size from each having to know about control; the tests that *are* about
+// control use sendSubscribe and read the roster themselves.
 func (c *client) subscribe(projectID string, cols, rows int) {
+	c.t.Helper()
+	c.sendSubscribe(projectID, cols, rows)
+	c.expectMessageOfType(MsgControlChanged)
+}
+
+// sendSubscribe asks to watch a project without waiting for the answer.
+func (c *client) sendSubscribe(projectID string, cols, rows int) {
 	c.t.Helper()
 	msg := map[string]any{"type": MsgSubscribe, "projectId": projectID}
 	if cols > 0 {
@@ -974,6 +1036,56 @@ func (c *client) input(projectID string, data []byte) {
 		"projectId": projectID,
 		"data":      base64.StdEncoding.EncodeToString(data),
 	})
+}
+
+// requestControl asks for a project's lease without waiting for the answer.
+func (c *client) requestControl(projectID string) {
+	c.t.Helper()
+	c.send(map[string]any{"type": MsgControlRequest, "projectId": projectID})
+}
+
+// releaseControl gives up a project's lease.
+func (c *client) releaseControl(projectID string) {
+	c.t.Helper()
+	c.send(map[string]any{"type": MsgControlRelease, "projectId": projectID})
+}
+
+// transferControl accepts or declines a pending request from another client.
+func (c *client) transferControl(projectID, targetID string, accept bool) {
+	c.t.Helper()
+	kind := MsgControlAccept
+	if !accept {
+		kind = MsgControlReject
+	}
+	c.send(map[string]any{"type": kind, "projectId": projectID, "clientId": targetID})
+}
+
+// becomeController claims an unheld project's lease and consumes the two
+// messages that answer it: the grant, and the roster that follows it.
+//
+// A viewer is the default state, so a test that types or resizes has to say it
+// wants to be the controller first. That is the whole of this phase, and it is
+// why this is a helper a test calls rather than something subscribing does.
+func (c *client) becomeController(projectID string) {
+	c.t.Helper()
+	c.requestControl(projectID)
+	granted := c.expectMessageOfType(MsgControlGranted)
+	if granted.Reason != ReasonAvailable {
+		c.t.Fatalf("the grant gave reason %q, want %q", granted.Reason, ReasonAvailable)
+	}
+	if granted.Control.Controller == nil || granted.Control.Controller.ClientID != c.conn.clientID {
+		c.t.Fatalf("the grant names controller %+v, want this client %q",
+			granted.Control.Controller, c.conn.clientID)
+	}
+	c.expectMessageOfType(MsgControlChanged)
+}
+
+// watch starts watching a project and takes its control, which is the state
+// most of the tests below are actually about.
+func (c *client) watch(projectID string) {
+	c.t.Helper()
+	c.subscribe(projectID, 0, 0)
+	c.becomeController(projectID)
 }
 
 // waitForSubscriptions waits until the connection reports a number of
@@ -1343,6 +1455,7 @@ func TestAKeystrokeReachesTheTerminalItWasTypedInto(t *testing.T) {
 	c := newClient(t, rt, clientOptions{})
 	c.subscribe(testProject, 0, 0)
 	c.expectFrame()
+	c.becomeController(testProject)
 
 	// Not text: a carriage return, an escape sequence, a UTF-8 prompt, and a
 	// byte that is not valid UTF-8 at all. All four have to arrive unchanged,
@@ -1415,6 +1528,17 @@ func TestAResizeIsSentToTheRuntimeAndReportedToEveryViewer(t *testing.T) {
 	one.expectFrame()
 	two.subscribe(testProject, 0, 0)
 	two.expectFrame()
+	// `one` is told the roster changed, because how many other people are
+	// watching a terminal is part of the roster and `two` has just become the
+	// second of them.
+	one.expectMessageOfType(MsgControlChanged)
+
+	// The size belongs to the terminal, and the terminal has one owner. `one`
+	// asks for it and gets it; `two` only ever watches.
+	one.becomeController(testProject)
+	// `two` is told that the roster changed, because it is watching a terminal
+	// whose owner it had wrong.
+	two.expectMessageOfType(MsgControlChanged)
 
 	one.resize(testProject, 120, 40)
 
@@ -1443,6 +1567,7 @@ func TestAResizeThatChangesNothingIsNotSentToTheRuntime(t *testing.T) {
 	c := newClient(t, rt, clientOptions{})
 	c.subscribe(testProject, 0, 0)
 	c.expectFrame()
+	c.becomeController(testProject)
 
 	c.resize(testProject, 120, 40)
 	c.expectMessageOfType(MsgResized)
@@ -1467,6 +1592,7 @@ func TestViewersAreToldTheSizeTheRuntimeApplied(t *testing.T) {
 	c := newClient(t, rt, clientOptions{})
 	c.subscribe(testProject, 0, 0)
 	c.expectFrame()
+	c.becomeController(testProject)
 
 	c.resize(testProject, 120, 40)
 
@@ -1488,19 +1614,46 @@ func TestViewersAreToldTheSizeTheRuntimeApplied(t *testing.T) {
 func TestASubscribeMayCarryTheTerminalSize(t *testing.T) {
 	rt := newFakeRuntime().add(testProject, 80, 24)
 	c := newClient(t, rt, clientOptions{})
+	c.subscribe(testProject, 0, 0)
+	c.expectFrame()
+	c.becomeController(testProject)
 
 	// Wider than any display: it is clamped, and the client is told what it got
 	// rather than what it asked for.
-	c.subscribe(testProject, 600, 24)
+	c.sendSubscribe(testProject, 600, 24)
 
 	resized := c.expectMessageOfType(MsgResized)
 	if resized.Cols != MaxCols || resized.Rows != 24 {
 		t.Errorf("the size applied was %dx%d, want %dx24", resized.Cols, resized.Rows, MaxCols)
 	}
+	c.expectMessageOfType(MsgControlChanged)
 
 	snapshot := c.expectFrame()
 	if snapshot.Cols != MaxCols || snapshot.Rows != 24 {
 		t.Errorf("the screen is %dx%d, want %dx24", snapshot.Cols, snapshot.Rows, MaxCols)
+	}
+}
+
+// TestAViewersSubscribeDoesNotResizeTheTerminal is the other half of the rule
+// the test above covers.
+//
+// A phone opening a project a desktop is working in sends its own viewport with
+// its subscribe. If that shaped the pty, the desktop's terminal would reflow to
+// forty columns because somebody looked at it - so the size is a request, the
+// request needs the lease, and a viewer does not have it.
+func TestAViewersSubscribeDoesNotResizeTheTerminal(t *testing.T) {
+	rt := newFakeRuntime().add(testProject, 80, 24)
+	c := newClient(t, rt, clientOptions{})
+
+	c.sendSubscribe(testProject, 600, 24)
+	c.expectMessageOfType(MsgControlChanged)
+
+	snapshot := c.expectFrame()
+	if snapshot.Cols != 80 || snapshot.Rows != 24 {
+		t.Errorf("the screen is %dx%d, want the runtime's 80x24", snapshot.Cols, snapshot.Rows)
+	}
+	if resizes := rt.recordedResizes(); len(resizes) != 0 {
+		t.Errorf("the runtime was resized %d times by a viewer, want none", len(resizes))
 	}
 }
 
@@ -1579,7 +1732,7 @@ func TestASubscribeToAnUnregisteredProjectIsRefused(t *testing.T) {
 	rt := newFakeRuntime().add(testProject, 80, 24)
 	c := newClient(t, rt, clientOptions{})
 
-	c.subscribe("p_ffffffffffffffffffff", 0, 0)
+	c.sendSubscribe("p_ffffffffffffffffffff", 0, 0)
 
 	msg := c.expectMessageOfType(MsgError)
 	if msg.Code != session.CodeProjectNotFound {
@@ -1596,7 +1749,7 @@ func TestASubscribeToAStoppedRuntimeIsRefusedRatherThanStartingIt(t *testing.T) 
 	})
 	c := newClient(t, rt, clientOptions{})
 
-	c.subscribe(testProject, 0, 0)
+	c.sendSubscribe(testProject, 0, 0)
 
 	msg := c.expectMessageOfType(MsgError)
 	if msg.Code != session.CodeNotRunning {
@@ -1626,7 +1779,7 @@ func TestOneBrowserMayOnlyWatchSoManyTerminals(t *testing.T) {
 	}
 	c.waitForSubscriptions(MaxSubscriptions)
 
-	c.subscribe(ids[MaxSubscriptions], 0, 0)
+	c.sendSubscribe(ids[MaxSubscriptions], 0, 0)
 	msg := c.expectMessageOfType(MsgError)
 	if msg.Code != CodeTooManySubscriptions {
 		t.Errorf("error code = %q, want %q", msg.Code, CodeTooManySubscriptions)
@@ -1756,7 +1909,7 @@ func TestAFrameForAClientThatIsBehindReSynchronisesRatherThanEnding(t *testing.T
 		t.Fatalf("terminal.NewHub returned an error: %v", err)
 	}
 
-	stalled := newConn(hub, newPipeSocket(1), "test", 1)
+	stalled := newConn(hub, newPipeSocket(1), ConnInfo{}, 1)
 	for i := 0; i < outboundQueueDepth; i++ {
 		stalled.out <- outbound{kind: websocket.TextMessage, data: []byte("x")}
 	}
@@ -1776,7 +1929,7 @@ func TestAFrameForAClientThatIsBehindReSynchronisesRatherThanEnding(t *testing.T
 	}
 
 	// With room in the queue the same frame is delivered.
-	roomy := newConn(hub, newPipeSocket(4), "test", 2)
+	roomy := newConn(hub, newPipeSocket(4), ConnInfo{}, 2)
 	open := newSubscription(roomy, testProject)
 	if got := open.flush(&batch{pending: []byte("hello"), first: 1, last: 1}); got != streamContinues {
 		t.Errorf("a frame for a client that is keeping up was handled as %d, want delivery", got)
@@ -1790,7 +1943,7 @@ func TestAFrameForAClientThatIsBehindReSynchronisesRatherThanEnding(t *testing.T
 	// cancelled connection is ready at once while the queue's timer is not: a
 	// dead connection is recognised immediately rather than after a wait that
 	// could only ever end in the same place.
-	dead := newConn(hub, newPipeSocket(4), "test", 3)
+	dead := newConn(hub, newPipeSocket(4), ConnInfo{}, 3)
 	full := newSubscription(dead, testProject)
 	for i := 0; i < outboundQueueDepth; i++ {
 		dead.out <- outbound{kind: websocket.TextMessage, data: []byte("x")}
@@ -1821,9 +1974,9 @@ func TestAClientThatStopsReadingIsReapedRatherThanHeldOpen(t *testing.T) {
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		hub.Serve(ws, "127.0.0.1:1")
+		hub.Serve(ws, ConnInfo{})
 	}()
-	hub.awaitConn(t)
+	hub.awaitConn(t, "")
 
 	ws.sendText(`{"type":"subscribe","projectId":"` + testProject + `"}`)
 
@@ -1959,7 +2112,7 @@ func TestAConnectionRefusedDuringShutdownIsClosedRatherThanLeftHanging(t *testin
 	}
 
 	ws := newPipeSocket(4)
-	hub.Serve(ws, "127.0.0.1:1")
+	hub.Serve(ws, ConnInfo{})
 
 	select {
 	case <-ws.closedCh:
@@ -1984,7 +2137,7 @@ func TestTheHubCountsWhatItIsCarrying(t *testing.T) {
 
 	c.subscribe(testProject, 0, 0)
 	c.waitForSubscriptions(1)
-	c.subscribe("p_ffffffffffffffffffff", 0, 0)
+	c.sendSubscribe("p_ffffffffffffffffffff", 0, 0)
 	c.waitForSubscriptions(2)
 
 	if stats := c.hub.Stats(); stats.Connections != 1 || stats.Subscriptions != 2 {
@@ -2009,13 +2162,13 @@ func TestTheTransportReachesNoTerminalOfItsOwn(t *testing.T) {
 
 	// A client asks for a project the runtime does not know, using a name that
 	// is well-formed and looks like a real one.
-	c.subscribe("p_00000000000000000000", 0, 0)
+	c.sendSubscribe("p_00000000000000000000", 0, 0)
 	if msg := c.expectMessageOfType(MsgError); msg.Code != session.CodeProjectNotFound {
 		t.Errorf("error code = %q, want %q", msg.Code, session.CodeProjectNotFound)
 	}
 
 	// A client asks with a filesystem path.
-	c.subscribe("/home/sunboy/projects", 0, 0)
+	c.sendSubscribe("/home/sunboy/projects", 0, 0)
 	if msg := c.expectMessageOfType(MsgError); msg.Code != CodeBadProject {
 		t.Errorf("error code = %q, want %q", msg.Code, CodeBadProject)
 	}

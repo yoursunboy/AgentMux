@@ -18,9 +18,9 @@
  */
 import { chromium } from 'playwright'
 import { execFileSync } from 'node:child_process'
-import { awaitProject } from '../lib/harness.mjs'
+import { awaitProject, panelOf } from '../lib/harness.mjs'
 
-import { fixtures, PAGE_URL } from '../lib/harness.mjs'
+import { fixtures, PAGE_URL, waitFor } from '../lib/harness.mjs'
 
 const SHELL = fixtures.projects.filter((entry) => entry.role === 'shell')[0]
 const URL = PAGE_URL
@@ -213,6 +213,26 @@ async function openPage(browser, options = {}) {
   await awaitProject(page, SHELL)
   await page.waitForSelector('.xterm-screen', { timeout: 20000 })
   await page.waitForTimeout(2500)
+  // Phase 6: a page that opens a project is a viewer until it asks. This suite
+  // is about the tablet's keyboard, not about who may use it, so it asks here -
+  // with a tap where there is a finger to tap with, as a person on an iPad
+  // would, rather than by reaching past the interface. The viewer case has its
+  // own suite.
+  //
+  // The tap is conditional because this helper opens the non-touch contexts
+  // too, and Playwright refuses `tap` on one: the sections below are about a
+  // grid of panels and a colour scheme, and neither of them is an iPad. Asking
+  // with a click there is the same request down the same wire.
+  const panel = panelOf(page, SHELL)
+  const badge = panel.locator('[data-testid="terminal-control"]')
+  await waitFor(async () => (await badge.count()) > 0, 10_000)
+  const request = panel.getByRole('button', { name: 'Request control' }).first()
+  if (options.hasTouch) await request.tap()
+  else await request.click()
+  await waitFor(
+    async () => ((await badge.textContent().catch(() => '')) ?? '').startsWith('You control'),
+    10_000,
+  )
   return { context, page, frames, errors }
 }
 

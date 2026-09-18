@@ -10,9 +10,14 @@
 import { createElement } from 'react'
 import { vi } from 'vitest'
 
-import type { ConnectionStatus, TerminalClient, TerminalSubscription } from '../terminal/client'
-import type { ErrorMessage } from '../terminal/protocol'
-import type { TerminalSession, TerminalSink } from '../terminal/useTerminal'
+import type {
+  ConnectionStatus,
+  SubscriptionHandlers,
+  TerminalClient,
+  TerminalSubscription,
+} from '../terminal/client'
+import type { ControlMessage, ControlView, ErrorMessage } from '../terminal/protocol'
+import type { ControlState, TerminalSession, TerminalSink } from '../terminal/useTerminal'
 
 export function makeSubscription(projectId = 'p_0123456789abcdef0123'): TerminalSubscription {
   return {
@@ -20,8 +25,32 @@ export function makeSubscription(projectId = 'p_0123456789abcdef0123'): Terminal
     input: vi.fn(),
     resize: vi.fn(),
     resync: vi.fn(),
+    requestControl: vi.fn(),
+    releaseControl: vi.fn(),
+    acceptControl: vi.fn(),
+    rejectControl: vi.fn(),
     release: vi.fn(),
   }
+}
+
+/** The client identifier these doubles use, and the one a controller's roster names. */
+export const CLIENT_ID = 'c_0123456789abcdef'
+
+/** A roster with nobody in charge, which is what a project starts as. */
+export function makeControlView(overrides: Partial<ControlView> = {}): ControlView {
+  return { controller: null, suspended: false, expiresAt: '', viewers: 0, pending: [], ...overrides }
+}
+
+/**
+ * A roster for a project this client controls.
+ *
+ * It is the default for a session double, because most component tests are
+ * about a person using their own terminal rather than about who may use it: a
+ * test that is about authority says so by overriding this.
+ */
+export function makeControlState(overrides: Partial<ControlState> = {}): ControlState {
+  const view = makeControlView({ controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' } })
+  return { view, held: true, waiting: false, reason: '', ...overrides }
 }
 
 /** A connection status that has nothing to explain, which most tests want. */
@@ -50,6 +79,7 @@ export function makeSession(overrides: Partial<TerminalSession> = {}): SessionDo
     status: makeStatus(),
     error: null,
     ended: false,
+    control: makeControlState(),
     clearError: vi.fn(),
     attach(sink: TerminalSink) {
       sinks.push(sink)
@@ -61,6 +91,10 @@ export function makeSession(overrides: Partial<TerminalSession> = {}): SessionDo
     setSize: vi.fn(),
     input: vi.fn(),
     resize: vi.fn(),
+    requestControl: vi.fn(),
+    releaseControl: vi.fn(),
+    acceptControl: vi.fn(),
+    rejectControl: vi.fn(),
     askAgain: vi.fn(),
     ...overrides,
   }
@@ -73,6 +107,15 @@ export interface ClientDouble {
   readonly subscribes: Array<{ projectId: string; size: unknown }>
   /** The last subscription handed out, if any. */
   current(): TerminalSubscription | undefined
+  /**
+   * deliverControl hands the last subscription a roster, as the client would.
+   *
+   * The real client parses a control message and calls these handlers, and this
+   * is the same call with the parsing already done - which is what lets a
+   * component test be about what the chrome does with a roster rather than about
+   * how one is read off the wire.
+   */
+  deliverControl(view: ControlView, message?: ControlMessage): void
 }
 
 /**
@@ -85,12 +128,17 @@ export interface ClientDouble {
 export function makeClient(overrides: Partial<TerminalClient> = {}): ClientDouble {
   const subscribes: Array<{ projectId: string; size: unknown }> = []
   let last: TerminalSubscription | undefined
+  let handlers: SubscriptionHandlers | undefined
+  let watched = ''
 
   const client: TerminalClient = {
     status: makeStatus(),
+    clientId: CLIENT_ID,
     onStatusChange: () => () => {},
-    subscribe(projectId, size) {
+    subscribe(projectId, size, given) {
       subscribes.push({ projectId, size })
+      handlers = given
+      watched = projectId
       last = makeSubscription(projectId)
       return last
     },
@@ -98,7 +146,14 @@ export function makeClient(overrides: Partial<TerminalClient> = {}): ClientDoubl
     close: vi.fn(),
     ...overrides,
   }
-  return { client, subscribes, current: () => last }
+  return {
+    client,
+    subscribes,
+    current: () => last,
+    deliverControl(view, message = { type: 'control.changed', projectId: watched, control: view }) {
+      handlers?.control(view, message)
+    },
+  }
 }
 
 /** A server error about one project's terminal. */

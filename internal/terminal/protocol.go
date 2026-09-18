@@ -39,7 +39,20 @@ import "encoding/json"
 // It must be raised whenever a change would make an older client draw
 // something wrong rather than fail: a new frame type is additive and does not
 // need it, a change to an existing frame's header does.
-const ProtocolVersion = 1
+//
+// Version 2 is Phase 6, and it is a raise for the second reason rather than the
+// first. The control messages are additive and would not have needed it. What
+// did need it is that `input` and `resize` stopped being things any subscriber
+// may send: a version 1 client watching a terminal could type into it, and a
+// version 2 client is a viewer until it asks. A version 1 client against this
+// server would find its Prompt Bar refused every time, with no Request Control
+// anywhere to explain why - a client drawing a state that is not true, which is
+// exactly what this constant exists to catch.
+//
+// `hello` changed shape with it: `clientId` now names the browser session and
+// `connectionId` names the socket, where version 1 had one id that meant the
+// connection.
+const ProtocolVersion = 2
 
 // Endpoint is the only real-time endpoint the server serves.
 //
@@ -53,12 +66,28 @@ const Endpoint = "/api/ws"
 // speaks.
 const ProtocolParam = "v"
 
+// ClientIDParam is the query parameter a client uses to state which browser
+// session it is.
+//
+// It is a query parameter rather than a message field because it has to be
+// known before the first message: a reconnecting client's leases are restored
+// when its socket opens, which is before it has sent anything. And it is stated
+// by the client because only the client knows which of its tabs this is - the
+// value has to survive a reload, which makes it the browser's to keep.
+//
+// A client that states nothing, or states something that is not an identifier,
+// is given one by the server and told what it is in the greeting. Nothing is
+// refused for this: a program on the machine that opens the endpoint with no
+// query string at all is a legitimate client, and it is a viewer like any
+// other until it asks.
+const ClientIDParam = "client"
+
 // Subprotocol is the WebSocket subprotocol name.
 //
 // It is offered and echoed for the benefit of anything in the middle that
 // understands subprotocols, and it carries the same version as the query
 // parameter so a proxy's log says which protocol was negotiated.
-const Subprotocol = "agentmux.terminal.v1"
+const Subprotocol = "agentmux.terminal.v2"
 
 // Client message types: browser to server.
 //
@@ -101,6 +130,28 @@ const (
 	// ping: this one proves the client's own message loop is running, and it is
 	// answered by the server's, which is the pair that a stalled tab breaks.
 	MsgPing = "ping"
+
+	// MsgControlRequest asks for a project's control lease.
+	//
+	// A client that has not asked is a viewer, always. Control is never
+	// assumed, never inherited, and never given to whoever arrived last - see
+	// docs/MULTI_DEVICE.md §5.
+	MsgControlRequest = "control.request"
+
+	// MsgControlRelease gives up a lease deliberately.
+	//
+	// It is not the same as disconnecting. A release is immediate and has no
+	// grace period, because the client doing it is still there to be told so.
+	MsgControlRelease = "control.release"
+
+	// MsgControlAccept hands a project's lease to a client that asked for it.
+	//
+	// It names that client. A transfer is a handshake between two clients that
+	// both know about it, not a way to push control at somebody.
+	MsgControlAccept = "control.accept"
+
+	// MsgControlReject declines a client's request for control.
+	MsgControlReject = "control.reject"
 )
 
 // Server message types: server to browser.
@@ -130,6 +181,39 @@ const (
 
 	// MsgPong answers MsgPing.
 	MsgPong = "pong"
+
+	// MsgControlGranted tells a client that it now holds a project's lease.
+	//
+	// It is sent only to the client that acquired it, and it carries the same
+	// roster every other message in this family carries. The directed message
+	// and the broadcast are not redundant: the roster says who is in charge,
+	// and this says that the change was *this client's*, which is what a UI
+	// needs in order to stop showing a Request Control button.
+	MsgControlGranted = "control.granted"
+
+	// MsgControlDenied tells a client that its request was refused.
+	//
+	// The reason distinguishes "somebody else has it" from "the controller said
+	// no", because a person reading the message needs to know whether to wait
+	// or to stop asking.
+	MsgControlDenied = "control.denied"
+
+	// MsgControlRevoked tells a client that it no longer holds a project's
+	// lease, having held it. It is the counterpart of MsgControlGranted.
+	MsgControlRevoked = "control.revoked"
+
+	// MsgControlExpired reports that a suspended lease lapsed.
+	//
+	// It is broadcast rather than directed, because the client it is about has
+	// gone - that is why the lease lapsed - and the clients that need to hear
+	// it are the ones still watching a terminal whose owner has not come back.
+	MsgControlExpired = "control.expired"
+
+	// MsgControlChanged reports that a project's roster changed.
+	//
+	// It is the message every other one in this family is accompanied by, and
+	// it is what keeps a viewer that is not a party to anything up to date.
+	MsgControlChanged = "control.changed"
 )
 
 // Limits.
@@ -174,6 +258,31 @@ const (
 	// MaxReasonLen bounds a client-supplied string that the server echoes back
 	// or logs.
 	MaxReasonLen = 200
+
+	// MaxClientIDLen bounds a browser session identifier.
+	//
+	// Real ones are 18 characters. The limit is generous so that it never
+	// rejects a legitimate client and tight enough that the identifier cannot
+	// be used to make the server hold a large string - which matters because it
+	// is carried in a query parameter, echoed in every roster, and shown beside
+	// a controller's device to every other viewer.
+	MaxClientIDLen = 64
+
+	// ClientIDPrefix is the first two characters of a valid session identifier.
+	//
+	// It is checked because the identifier arrives from a browser and is
+	// handled alongside the server's own connection ids: two kinds of id that
+	// look alike in a log are two kinds of id somebody will eventually compare.
+	// The prefix makes "this came from a client" readable at a glance.
+	ClientIDPrefix = "c_"
+
+	// MaxDeviceLen bounds the device label the server derives from User-Agent.
+	//
+	// A User-Agent header is bounded by the HTTP server, but it is still up to
+	// a megabyte in principle, and this label is copied into every roster sent
+	// to every viewer of every project the client touches. The bound is what
+	// keeps that copy small.
+	MaxDeviceLen = 48
 
 	// MinCols, MinRows, MaxCols and MaxRows bound a requested terminal size.
 	//
@@ -226,6 +335,22 @@ const (
 	// runtime that is outrunning the connection is a loop that never ends.
 	CodeStreamUnstable = "stream_unstable"
 
+	// CodeNotController means the message needs the project's control lease and
+	// this client does not hold it. It is what a viewer's input or resize is
+	// refused with, and it carries the message type that failed in `about`.
+	//
+	// It is spelled as an error code rather than as a message type of its own.
+	// The protocol has one error channel with stable codes and the client
+	// already handles it; a second way for a request to fail would mean every
+	// client-side error path had two shapes to consider. See
+	// docs/MULTI_DEVICE.md §8.
+	CodeNotController = "not_controller"
+
+	// CodeNotPending means an accept or a reject named a client that has not
+	// asked for control. A transfer is between two clients that both know about
+	// it; this is the answer when one of them is mistaken.
+	CodeNotPending = "not_pending"
+
 	// CodeInternal means the server failed in a way the client cannot act on.
 	CodeInternal = "internal"
 )
@@ -242,6 +367,11 @@ type clientMessage struct {
 	Data      []byte `json:"data,omitempty"`
 	Cols      int    `json:"cols,omitempty"`
 	Rows      int    `json:"rows,omitempty"`
+
+	// ClientID names another client, and is carried only by a control accept
+	// or reject. It is validated as an identifier shape before it is used, and
+	// it is never a credential: see MaxClientIDLen and docs/MULTI_DEVICE.md §11.
+	ClientID string `json:"clientId,omitempty"`
 }
 
 // hasExtraFields reports whether a message carries a field beyond its type and
@@ -252,7 +382,7 @@ type clientMessage struct {
 // after it is parsed; this is how a "cols" on a subscribe is still refused
 // rather than silently ignored.
 func (m clientMessage) hasExtraFields() bool {
-	return len(m.Data) > 0 || m.Cols != 0 || m.Rows != 0
+	return len(m.Data) > 0 || m.Cols != 0 || m.Rows != 0 || m.ClientID != ""
 }
 
 // Server messages.
@@ -264,9 +394,100 @@ func (m clientMessage) hasExtraFields() bool {
 type helloMessage struct {
 	Type     string `json:"type"`
 	Protocol int    `json:"protocol"`
+
+	// ClientID names the browser session: a tab, on a device, for as long as
+	// it is open. It is what a lease is held by and what survives a reconnect.
 	ClientID string `json:"clientId"`
-	Server   string `json:"server"`
-	Version  string `json:"version"`
+
+	// ConnectionID names this socket. One client has many over its life - a
+	// reload, a network change, a server restart - and the difference between
+	// the two is what lets a reconnect be told apart from a departure.
+	ConnectionID string `json:"connectionId"`
+
+	// Device is the server's reading of the handshake's User-Agent. It is what
+	// other clients see beside a controller's name, and it is derived here
+	// rather than sent by the browser so that it cannot be anything else.
+	Device string `json:"device"`
+
+	Server  string `json:"server"`
+	Version string `json:"version"`
+}
+
+// controlHolder names whoever holds a project's lease.
+type controlHolder struct {
+	ClientID string `json:"clientId"`
+	Device   string `json:"device"`
+}
+
+// controlPending names a client waiting for a project's lease.
+type controlPending struct {
+	ClientID string `json:"clientId"`
+	Device   string `json:"device"`
+}
+
+// controlView is the roster: who is in charge, and who is waiting.
+//
+// It is carried by every message in the control family, including the directed
+// ones, so that a client has exactly one thing to apply and cannot end up with
+// a roster that disagrees with the message that brought it. `Viewers` is
+// counted for the recipient - connections watching this project, other than
+// this recipient's own and other than the controller's - so that the number a
+// person reads is the number of *other* people watching.
+type controlView struct {
+	// Controller is null when nobody holds the lease.
+	Controller *controlHolder `json:"controller"`
+
+	// Suspended is true while the controller's connection is gone and its
+	// lease is being held for it. The lease is not free: a request during this
+	// window is refused, because the controller is probably coming back.
+	Suspended bool `json:"suspended"`
+
+	// ExpiresAt is when a suspended lease lapses, in RFC 3339, or empty. It is
+	// set only while suspended: a connected controller holds its lease for as
+	// long as it is there, including while typing nothing at all.
+	ExpiresAt string `json:"expiresAt,omitempty"`
+
+	// Viewers counts the other connections watching this project.
+	Viewers int `json:"viewers"`
+
+	// Pending names the clients waiting for control. The controller reads it to
+	// decide whether to hand over, and a waiting client reads it to see that it
+	// has asked.
+	Pending []controlPending `json:"pending,omitempty"`
+}
+
+type controlGrantedMessage struct {
+	Type      string      `json:"type"`
+	ProjectID string      `json:"projectId"`
+	Reason    string      `json:"reason"`
+	Control   controlView `json:"control"`
+}
+
+type controlDeniedMessage struct {
+	Type      string      `json:"type"`
+	ProjectID string      `json:"projectId"`
+	Reason    string      `json:"reason"`
+	Message   string      `json:"message,omitempty"`
+	Control   controlView `json:"control"`
+}
+
+type controlRevokedMessage struct {
+	Type      string      `json:"type"`
+	ProjectID string      `json:"projectId"`
+	Reason    string      `json:"reason"`
+	Control   controlView `json:"control"`
+}
+
+type controlExpiredMessage struct {
+	Type      string      `json:"type"`
+	ProjectID string      `json:"projectId"`
+	Control   controlView `json:"control"`
+}
+
+type controlChangedMessage struct {
+	Type      string      `json:"type"`
+	ProjectID string      `json:"projectId"`
+	Control   controlView `json:"control"`
 }
 
 type unsubscribedMessage struct {

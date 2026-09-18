@@ -8,20 +8,37 @@
  * ones that decide whether a terminal is correct or quietly wrong, so they are
  * the ones worth a socket double that obeys the test.
  */
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest'
 
-import { createTerminalClient, type ConnectionStatus, type TerminalClient } from './client'
+import { createTerminalClient, CLIENT_ID_STORAGE_KEY, type ClientIdStore, type ConnectionStatus, type SubscriptionHandlers, type TerminalClient } from './client'
 import { MAX_INITIAL_ATTEMPTS } from './backoff'
-import { FrameType, MAX_INPUT_BYTES, Msg, PROTOCOL_VERSION, ServerMsg, SUBPROTOCOL } from './protocol'
+import { FrameType, MAX_INPUT_BYTES, Msg, PROTOCOL_PARAM, PROTOCOL_VERSION, ServerMsg, SUBPROTOCOL, CLIENT_ID_PARAM, validClientId } from './protocol'
 import { FakeSocket, fakeSocketFactory } from '../test/socket'
 
 const URL = 'ws://test/api/ws'
 const PROJECT = 'p_0123456789abcdef0123'
 const OTHER = 'p_fedcba9876543210fedc'
 
+/**
+ * What the server calls the client in most of these tests.
+ *
+ * It is deliberately not the identifier the client sends: the server has the
+ * last word on the name, and a test that used one value for both would not
+ * notice a client that ignored the greeting.
+ */
+const SERVER_CLIENT_ID = 'c_0123456789abcdef'
+
 /** A hello, as the server sends it. */
 function hello(protocol: number = PROTOCOL_VERSION): Record<string, unknown> {
-  return { type: ServerMsg.hello, protocol, clientId: 'c1', server: 'AgentMux', version: '0.1.0' }
+  return {
+    type: ServerMsg.hello,
+    protocol,
+    clientId: SERVER_CLIENT_ID,
+    connectionId: 'ws_000001',
+    device: 'Chrome on Windows',
+    server: 'AgentMux',
+    version: '0.1.0',
+  }
 }
 
 /** An output frame carrying text, built by hand at the wire offsets. */
@@ -95,13 +112,51 @@ function writeUint64(target: Uint8Array, offset: number, value: number): void {
   target[offset + 7] = low & 0xff
 }
 
-function handlers() {
+/**
+ * A set of handlers that records what it is called with.
+ *
+ * It is declared as an interface rather than left to inference so that every
+ * mock keeps its own type: `draw` and `show` take different arguments, and a
+ * test that reached for the wrong one of them should be a compile error rather
+ * than a suite that passes on `undefined`.
+ */
+interface RecordedHandlers extends SubscriptionHandlers {
+  draw: Mock
+  show: Mock
+  resize: Mock
+  control: Mock
+  report: Mock
+  ended: Mock
+}
+
+function handlers(): RecordedHandlers {
   return {
     draw: vi.fn(),
     show: vi.fn(),
     resize: vi.fn(),
+    control: vi.fn(),
     report: vi.fn(),
     ended: vi.fn(),
+  }
+}
+
+/**
+ * memoryStore is a storage area that is not the browser's.
+ *
+ * The identifier the client keeps is what makes a reload a reconnection, so the
+ * client reaches for sessionStorage by default - which, in a test file, is one
+ * area shared by every test in it. Each test gets its own instead, so that what
+ * one test stores cannot decide what the next one connects as.
+ */
+class MemoryStore implements ClientIdStore {
+  private values = new Map<string, string>()
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value)
   }
 }
 
@@ -114,11 +169,13 @@ function decodeBase64(encoded: string): string {
 
 describe('terminal client', () => {
   let clients: TerminalClient[]
+  let store: MemoryStore
 
   beforeEach(() => {
     vi.useFakeTimers()
     FakeSocket.reset()
     clients = []
+    store = new MemoryStore()
   })
 
   afterEach(() => {
@@ -127,13 +184,15 @@ describe('terminal client', () => {
   })
 
   /** build returns a client that records itself for cleanup. */
-  function build(): TerminalClient {
+  function build(overrides: Partial<Parameters<typeof createTerminalClient>[0]> = {}): TerminalClient {
     const client = createTerminalClient({
       url: URL,
       socketFactory: fakeSocketFactory(),
       // Full nominal delay, so a test advances by a number it can read off the
       // documented table rather than by a range.
       jitter: () => 1,
+      storage: store,
+      ...overrides,
     })
     clients.push(client)
     return client
@@ -181,10 +240,20 @@ describe('terminal client', () => {
       expect(FakeSocket.last.messagesOfType(Msg.subscribe)).toHaveLength(2)
     })
 
-    it('states the protocol version, and offers the subprotocol a browser needs', () => {
-      const { socket } = connected()
+    it('states the protocol version and its identity, and offers the subprotocol a browser needs', () => {
+      const client = build()
+      client.subscribe(PROJECT, null, handlers())
+      const socket = FakeSocket.last
 
-      expect(socket.url).toBe(`${URL}?v=${PROTOCOL_VERSION}`)
+      // The identity is settled before the handshake rather than adopted from
+      // the greeting, because the URL is the only part of a WebSocket request
+      // this code can put anything in - and because a reconnect after a dropped
+      // network has to arrive as the same client, which means the identifier has
+      // to exist before the server has said anything.
+      const query = new URLSearchParams(socket.url.split('?')[1])
+      expect(query.get(PROTOCOL_PARAM)).toBe(String(PROTOCOL_VERSION))
+      expect(validClientId(query.get(CLIENT_ID_PARAM) ?? '')).toBe(true)
+
       // A browser that offers a subprotocol and is answered without one fails
       // the handshake, so this is not decoration.
       expect(socket.protocols).toEqual([SUBPROTOCOL])
@@ -486,6 +555,169 @@ describe('terminal client', () => {
       socket.deliverText({ type: ServerMsg.resized, projectId: OTHER, cols: 90, rows: 25 })
 
       expect(sink.resize).not.toHaveBeenCalled()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+
+  describe('identity', () => {
+    it('invents one before the handshake, because the URL is settled first', () => {
+      const client = build()
+      client.subscribe(PROJECT, null, handlers())
+
+      expect(validClientId(client.clientId ?? '')).toBe(true)
+      expect(FakeSocket.last.url).toContain(`client=${client.clientId}`)
+    })
+
+    it('takes the server’s answer, which is the name everybody else will use', () => {
+      // The client offers an identifier and the server decides: it echoes what
+      // it was given when that was usable and issues its own when it was not.
+      // A client that kept its own would compare rosters against a name no
+      // other client has ever heard.
+      const { client } = connected()
+
+      expect(client.clientId).toBe(SERVER_CLIENT_ID)
+    })
+
+    it('keeps the server’s answer, so a reload is the same client', () => {
+      connected()
+
+      expect(store.getItem(CLIENT_ID_STORAGE_KEY)).toBe(SERVER_CLIENT_ID)
+    })
+
+    it('offers what it has stored rather than inventing a second identity', () => {
+      store.setItem(CLIENT_ID_STORAGE_KEY, 'c_aaaaaaaaaaaaaaaa')
+      const client = build()
+      client.subscribe(PROJECT, null, handlers())
+
+      expect(FakeSocket.last.url).toContain('client=c_aaaaaaaaaaaaaaaa')
+      expect(client.clientId).toBe('c_aaaaaaaaaaaaaaaa')
+    })
+
+    it('ignores what it has stored when it is not usable as an identifier', () => {
+      // A value that fails the shape check is not an error to report: the
+      // client simply asks for a new one by offering something else.
+      store.setItem(CLIENT_ID_STORAGE_KEY, '../../etc/passwd')
+      const client = build()
+      client.subscribe(PROJECT, null, handlers())
+
+      expect(client.clientId).not.toBe('../../etc/passwd')
+      expect(validClientId(client.clientId ?? '')).toBe(true)
+    })
+
+    it('reconnects as the same client, which is what a lease resumes on', () => {
+      // The fact the grace period is built on: a dropped connection is the same
+      // device coming back, not a stranger arriving.
+      const { client, socket } = connected()
+      socket.drop()
+      vi.advanceTimersByTime(60_000)
+
+      expect(FakeSocket.instances.length).toBeGreaterThan(1)
+      expect(FakeSocket.last.url).toContain(`client=${SERVER_CLIENT_ID}`)
+      expect(client.clientId).toBe(SERVER_CLIENT_ID)
+    })
+
+    it('works without anywhere to store one, and says so by connecting as new', () => {
+      // A private window refuses storage. The client still has an identity for
+      // as long as the page lives; it is only the reload that arrives as a
+      // device nobody has seen, which is the honest outcome for a browser that
+      // will not remember anything.
+      const client = build({ storage: null })
+      client.subscribe(PROJECT, null, handlers())
+
+      expect(validClientId(client.clientId ?? '')).toBe(true)
+      expect(store.getItem(CLIENT_ID_STORAGE_KEY)).toBeNull()
+    })
+  })
+
+  // -------------------------------------------------------------------------
+
+  describe('control', () => {
+    it('hands the roster to the subscriber that asked for the project', () => {
+      const { socket, sink } = connected()
+      const view = { controller: null, suspended: false, expiresAt: '', viewers: 0, pending: [] }
+
+      socket.deliverText({ type: ServerMsg.controlChanged, projectId: PROJECT, control: view })
+
+      expect(sink.control).toHaveBeenCalledWith(view, expect.objectContaining({ type: 'control.changed' }))
+    })
+
+    it('carries the reason on the messages that have one', () => {
+      const { socket, sink } = connected()
+      const view = { controller: null, suspended: false, expiresAt: '', viewers: 0, pending: [] }
+
+      socket.deliverText({
+        type: ServerMsg.controlDenied,
+        projectId: PROJECT,
+        reason: 'controller_exists',
+        control: view,
+      })
+
+      expect(sink.control).toHaveBeenCalledWith(
+        view,
+        expect.objectContaining({ type: 'control.denied', reason: 'controller_exists' }),
+      )
+    })
+
+    it('ignores a roster for a project it is not watching', () => {
+      const { socket, sink } = connected()
+
+      socket.deliverText({
+        type: ServerMsg.controlChanged,
+        projectId: OTHER,
+        control: { controller: null, suspended: false, expiresAt: '', viewers: 0, pending: [] },
+      })
+
+      expect(sink.control).not.toHaveBeenCalled()
+    })
+
+    it('treats a roster it cannot read as a connection it cannot trust', () => {
+      // Drawing a header from the fields that happened to parse is the failure
+      // this prevents: a bar that names the wrong device as the typist is worse
+      // than a terminal that says it is reconnecting.
+      const { socket, sink } = connected()
+
+      socket.deliverText({
+        type: ServerMsg.controlChanged,
+        projectId: PROJECT,
+        control: { suspended: true, viewers: 'two' },
+      })
+
+      expect(sink.control).not.toHaveBeenCalled()
+      expect(socket.closed).toBe(true)
+    })
+
+    it('asks, gives up, and answers the queue with the messages the server reads', () => {
+      const { subscription, socket } = connected()
+
+      subscription.requestControl()
+      subscription.acceptControl('c_ffffffffffffffff')
+      subscription.rejectControl('c_ffffffffffffffff')
+      subscription.releaseControl()
+
+      expect(socket.messagesOfType(Msg.controlRequest)).toEqual([
+        { type: Msg.controlRequest, projectId: PROJECT },
+      ])
+      expect(socket.messagesOfType(Msg.controlAccept)).toEqual([
+        { type: Msg.controlAccept, projectId: PROJECT, clientId: 'c_ffffffffffffffff' },
+      ])
+      expect(socket.messagesOfType(Msg.controlReject)).toEqual([
+        { type: Msg.controlReject, projectId: PROJECT, clientId: 'c_ffffffffffffffff' },
+      ])
+      expect(socket.messagesOfType(Msg.controlRelease)).toEqual([
+        { type: Msg.controlRelease, projectId: PROJECT },
+      ])
+    })
+
+    it('says nothing about control once the subscription is gone', () => {
+      const { subscription, socket } = connected()
+      subscription.release()
+
+      subscription.requestControl()
+      subscription.releaseControl()
+
+      expect(socket.messagesOfType(Msg.controlRequest)).toHaveLength(0)
+      expect(socket.messagesOfType(Msg.controlRelease)).toHaveLength(0)
     })
   })
 

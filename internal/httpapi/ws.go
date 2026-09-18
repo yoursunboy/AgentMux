@@ -151,7 +151,14 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.log.Debug("terminal upgrade failed", "remote", r.RemoteAddr, "error", err)
 		return
 	}
-	s.terminal.Serve(ws, r.RemoteAddr)
+	// What the request said about who is on the other end is handed over as it
+	// arrived. Deciding whether the identifier is usable and what the user agent
+	// means is the terminal package's business, and doing it here as well would
+	// be two places that could disagree about what a valid client is.
+	s.terminal.Serve(ws, terminal.ConnInfo{
+		ClientID:  strings.TrimSpace(r.URL.Query().Get(terminal.ClientIDParam)),
+		UserAgent: r.UserAgent(),
+	})
 }
 
 // checkProtocolVersion refuses a client that speaks a version this server does

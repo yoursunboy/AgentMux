@@ -139,6 +139,21 @@ export class ResizeScheduler {
     this.sent = size
   }
 
+  /**
+   * forget drops the record of the size the server was last told about.
+   *
+   * It is for the one moment authority changes hands. A viewer is drawing a
+   * terminal whose shape the server chose, so this browser's own box - and
+   * whatever it measured on arrival - has nothing to do with the pty. When that
+   * viewer becomes the controller, the first thing it owes the terminal is its
+   * own size, and without this the two would have to differ by luck: a box that
+   * happened to measure what the server last applied would say nothing, and the
+   * pty would keep a shape no screen in the room has.
+   */
+  forget(): void {
+    this.sent = null
+  }
+
   /** request offers a measured size. It is sent only if it is worth sending. */
   request(size: TerminalSize): void {
     this.pending = size

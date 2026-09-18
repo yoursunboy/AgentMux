@@ -36,8 +36,8 @@ unchanged. That is checked rather than asserted — see §12.
 ## 2. The endpoint
 
 ```text
-GET /api/ws?v=1
-Sec-WebSocket-Protocol: agentmux.terminal.v1
+GET /api/ws?v=2&client=c_7f3a91b2
+Sec-WebSocket-Protocol: agentmux.terminal.v2
 ```
 
 There is exactly one real-time endpoint, and it is one socket per browser rather than one per
@@ -50,6 +50,31 @@ that does not know to send it is a client this version can still serve. Present 
 the request is refused with `400` rather than upgraded, because a client that states a version it
 does not have is telling the server it will mis-draw what it is sent. The negotiated subprotocol
 carries the same number so that a proxy's log says which protocol was agreed.
+
+The current version is **2**, raised by Phase 6, and it is worth stating why a raise was needed for
+changes that were additive. The control messages are additive and would not have needed one. What
+did is that `input` and `resize` stopped being things any subscriber may send: a version 1 client
+watching a terminal could type into it, and a version 2 client is a viewer until it asks. A version
+1 client served by this server would find its Prompt Bar refused every time, with no Request Control
+anywhere to explain why — a client drawing a state that is not true, which is exactly what this
+parameter exists to catch. It is the one place where a stale cached page has to reload.
+
+**Client.** `client` names the browser session: a tab, on a device, for as long as it is open. It is
+sent here rather than in a message because it has to be known before the first one — a reconnecting
+client's leases are restored the moment its socket opens — and it is stated by the client because
+only the client knows which of its tabs this is. It is held in `sessionStorage`, so it survives a
+reload and does not survive a new tab.
+
+The two identifiers in the greeting below are the point of it. A *client* is a browser session; a
+*connection* is one socket. One client has many connections over its life — a reload, a network
+change, a server restart — and the difference between the two is what lets a reconnect be told apart
+from a departure.
+
+A client that states nothing, or states something that is not an identifier, is given one by the
+server and told what it is in the greeting. Nothing is refused for this: a program on this machine
+that opens the endpoint with no query string is a legitimate client, and it is a viewer like any
+other until it asks. `docs/MULTI_DEVICE.md` §1 and §11 have the shape of an identifier and what it
+is and is not.
 
 **Origin.** A WebSocket handshake carries `Origin`, and a browser page on another site can attempt
 one. The policy is:
@@ -153,6 +178,21 @@ strict: a field that does not belong to the message's type is refused rather tha
 | `resize` | `projectId`, `cols`, `rows` | set the canonical size |
 | `resync` | `projectId` | re-establish from a fresh snapshot |
 | `ping` | — | application-level liveness |
+| `control.request` | `projectId` | ask for the lease |
+| `control.release` | `projectId` | give it up |
+| `control.accept` | `projectId`, `clientId` | answer a request by handing it over |
+| `control.reject` | `projectId`, `clientId` | answer a request by refusing it |
+
+The last four are Phase 6's, documented in `docs/MULTI_DEVICE.md` §12. Two things about them belong
+in this table. They are the only client messages whose *acceptance* depends on something other than
+the connection's own state — schema, subscription, size — and that something is who holds a lease,
+which is a fact about other clients. And `input` and `resize`, which were unconditional in version 1,
+are now in that same position: see §4.3.
+
+There is no `control.withdraw`. A request that has not been answered is taken back by
+`unsubscribe`, which is what a person closing the tab or moving to another project does; a second
+message for it would be a second way to say the same thing, with a second chance for the two to
+disagree.
 
 `subscribe` carries a size because a browser knows how large its viewport is before it knows anything
 else, and stating it up front means the runtime is resized once, before the snapshot is taken, rather
@@ -170,14 +210,27 @@ answered by the server's, which is the pair a stalled tab breaks.
 
 | `type` | fields | meaning |
 | --- | --- | --- |
-| `hello` | `protocol`, `clientId`, `server`, `version` | first message on every connection |
+| `hello` | `protocol`, `clientId`, `connectionId`, `device`, `server`, `version` | first message on every connection |
 | `unsubscribed` | `projectId` | the subscription has ended |
 | `resized` | `projectId`, `cols`, `rows` | the canonical size changed |
 | `error` | `code`, `message`, `projectId?`, `about?` | a client message failed |
 | `pong` | — | answers `ping` |
+| `control.granted` | `projectId`, `control` | this client now holds the lease |
+| `control.denied` | `projectId`, `control`, `reason` | this client's request was refused |
+| `control.revoked` | `projectId`, `control` | this client no longer holds it |
+| `control.expired` | `projectId`, `control` | a suspended lease lapsed |
+| `control.changed` | `projectId`, `control` | the roster changed |
 
 `hello` is always first, and states the protocol version so a client can refuse to go further rather
-than guess.
+than guess. `clientId` names the browser session and `connectionId` names this socket; §2 has why
+they are two.
+
+The `control.*` messages are Phase 6's and are documented in `docs/MULTI_DEVICE.md` §12, which is the
+reference for them. What belongs here is the shape they share with the rest of this table: they are
+text frames, they are projects-scoped, and the `control` they carry is the roster — who holds the
+lease, who is waiting, and how many others are watching. It is carried by *every* message in that
+family rather than sent once, so a client has exactly one thing to apply and cannot end up holding a
+roster that disagrees with the message that brought it.
 
 `resized` goes to **every** subscriber of that project, not only to the one that asked. There is one
 pty, so there is one size; a second tab rendering at its own idea of the size would draw a terminal
@@ -200,9 +253,16 @@ or whether the runtime refused, which is a state of the world.
 | `project_not_found` | known project, no runtime |
 | `too_many_subscriptions` | the connection is already watching as many projects as it may |
 | `not_subscribed` | input or resize named a project this connection is not watching |
+| `not_controller` | input or resize for a project whose lease this client does not hold — `about` says which |
+| `not_pending` | a handover or a refusal named a client that has no request waiting |
 | `input_too_large` | one input message carried more than `MaxInputBytes` after decoding |
 | `stream_unstable` | the connection could not keep up and re-synchronising did not help (§10) |
 | `internal` | the server failed in a way the client cannot act on |
+
+`not_controller` is the one Phase 6 added to a path that already existed, and it is what makes the
+keyboard a thing a client is given rather than a thing it has. It is sent to the device that earned
+it and to nobody else: ten viewers typing into a terminal they do not hold produce ten refusals, not
+a hundred messages. `docs/MULTI_DEVICE.md` §8 is the rule.
 
 ## 5. Snapshot and live output
 
@@ -266,11 +326,18 @@ The server is never told where a client's viewport is looking, and there is no m
 tell it. Two people watching the same terminal are looking at different lines, and a server that knew
 where either of them was would have to pick one to obey.
 
-Three consequences, all of them deliberate:
+Four consequences, all of them deliberate:
 
 - A resync does not clear scrollback, so the history a client has already drawn stays where it was.
 - Output does not move a client's viewport. A client that has scrolled up is not yanked back down;
   it is offered a way back, and a count of what has arrived since.
+- A snapshot does move it, and the two rules are one rule: the viewport belongs at the end of *the
+  screen*, and only new output leaves it where a reader put it. A snapshot is the screen drawn again
+  rather than a line added to it, so the client that receives one puts its viewport at the bottom —
+  unconditionally, including for a reader who had scrolled up, because the rows they were reading
+  have just been replaced. A client that skips this is not behind by a frame: a terminal with
+  scrollback of its own can take the snapshot into its screen rows with the viewport left above them,
+  and it then paints the terminal's history while tmux paints its screen.
 - "Follow output" is a client-side decision with no server state behind it.
 
 ## 8. Resize
@@ -282,6 +349,16 @@ client and the server from answering each other's sizes forever.
 
 Requests are clamped to the bounds in §9 rather than refused, and a size that does not change the
 canonical one is not applied.
+
+A client's half of "draw at the size you were told" is the part that is easy to get wrong, because a
+browser terminal has an addon whose whole purpose is to resize the terminal to fill its element. Only
+a client that may resize fits; a viewer draws the size it was told, and its element becomes a window
+onto a screen larger than itself, which it can scroll. Fitting a viewer has the pty's rows pushed
+down into the viewer's own scrollback and leaves the box showing the blank part of the screen below
+them — measured as a panel with nothing on it at all. For the controller the element's size *is* the
+request, so fitting is what a controller does. `docs/MULTI_DEVICE.md` §8 has the measurement. The
+other half of drawing at the size you were told is being at the right place in the terminal once you
+have: §7's third consequence, which is the same defect seen from the other end.
 
 A client must not send a resize for a soft keyboard. On a tablet the on-screen keyboard shrinks the
 *visual* viewport and leaves the layout viewport alone, and resizing the pty for it would make every
@@ -402,14 +479,14 @@ well as in the transport tests:
 
 ## 13. Logging
 
-The list of things that may be logged about a connection is short, and it is short on purpose. What
-may be logged:
+The list of things that may be logged about a connection is short, and it is short on purpose.
 
-- `clientId`, `projectId`;
-- `subscribe`, `unsubscribe`;
-- byte counts and frame counts;
-- `disconnect`, and why;
-- `resync` and the drop notices of §10.
+A record carries four fields and no more:
+
+- `clientId` — the browser session;
+- `projectId` — the project, where the event is about one;
+- the event, which is the record's message;
+- the time, which the handler adds.
 
 What is **never** logged, at any level:
 
@@ -417,6 +494,10 @@ What is **never** logged, at any level:
 - raw input payloads, including pastes;
 - the contents of a prompt sent from the Prompt Bar;
 - anything a program inside the terminal printed, including anything Claude Code printed.
+
+Phase 4 also allowed byte counts and frame counts on the disconnect record. Phase 6 removed them,
+along with the counters that fed them and the peer address: see `docs/MULTI_DEVICE.md` §11 for why,
+and for the test that holds every record to the four fields above.
 
 The Prompt Bar shares the input path with the keyboard, so there is no separate place for a prompt to
 be recorded. This is the same rule as `docs/CLAUDE_RUNTIME.md`'s, applied to a second way into the
@@ -439,8 +520,12 @@ carries on.
 
 Named here so that the boundary is a statement rather than an omission:
 
-- **no controller, viewer, or lease.** Every subscription is equal; there is no roster and no notion
-  of who may type. `Backend.Attach` allows several watchers, and each receives the same bytes.
+- **no notion of who may type, in the transport.** Every subscription this document describes is
+  equal: several clients may attach to one runtime and each receives the same bytes, and nothing on
+  the snapshot, output, batching, sequencing or recovery paths consults a lease. Phase 6 added
+  authority, as a separate plane in the same package that exactly two paths ask about — `input` and
+  `resize` — and `docs/MULTI_DEVICE.md` is that document. Everything else here is unchanged by it,
+  including the rule that a viewer receives every byte the controller does.
 - **no authentication.** The endpoint is as reachable as the server is. It is bound to a host and a
   port like every other route, and putting it on a network is a decision about the deployment, not
   something this layer decides.

@@ -31,10 +31,15 @@ vi.mock('@xterm/addon-unicode11', async () => {
 
 const encoder = new TextEncoder()
 
-function renderView(interactive = true, fontSize = 11) {
+function renderView(interactive = true, fontSize = 11, mayResize = interactive) {
   const double = makeSession()
   const view = render(
-    <TerminalView session={double.session} interactive={interactive} fontSize={fontSize} />,
+    <TerminalView
+      session={double.session}
+      interactive={interactive}
+      mayResize={mayResize}
+      fontSize={fontSize}
+    />,
   )
   return { ...double, ...view, view }
 }
@@ -134,6 +139,46 @@ describe('TerminalView', () => {
       expect(FakeTerminal.last.events).toEqual(['write'])
     })
 
+    it('returns the viewport to the bottom when a snapshot changes the shape', () => {
+      // The case a viewer meets and a controller does not: a page is sent the
+      // terminal at *the terminal's* size rather than at its own, so reconnecting
+      // to one larger than the page was drawing resizes into a screen the page
+      // did not choose. Order matters as much as the scroll does - the rows go in
+      // at the new shape, and the viewport is put at the bottom afterwards rather
+      // than before, because the write can move it again.
+      const { current } = renderView()
+      expect(FakeTerminal.last.cols).toBe(80)
+
+      FakeFitAddon.size = { cols: 132, rows: 50 }
+      act(() => current()!.show(encoder.encode('wide screen'), 132, 50))
+
+      expect(FakeTerminal.last.scrolledToBottom).toBe(1)
+      expect(screen.queryByRole('button', { name: /Jump to latest|New output/ })).not.toBeInTheDocument()
+    })
+
+    it('anchors the viewport even when the shape did not change', () => {
+      // The half of the rule a shape change does not cover, and the one that was
+      // missing. A snapshot is the present: it is what the pane is showing now.
+      // A terminal with scrollback of its own can take one into its screen rows
+      // with the viewport left above them, and then the page paints the
+      // terminal's history while tmux paints the screen. Measured in a browser as
+      // a reconnected tab drawing the splash screen that came *before* what the
+      // pane held.
+      //
+      // Not the rule the local scroll model keeps for output. Writing output
+      // while somebody is reading further up must not drag them to the bottom,
+      // and that is `draw`; a snapshot arrives when a connection is established
+      // or a screen is asked for again, which are the moments the live screen is
+      // what was asked for.
+      const { current } = renderView()
+      act(() => FakeTerminal.last.fireScroll(0, 200))
+
+      act(() => current()!.show(encoder.encode('the screen as it is now'), 80, 24))
+
+      expect(FakeTerminal.last.scrolledToBottom).toBe(1)
+      expect(screen.queryByRole('button', { name: /Jump to latest|New output/ })).not.toBeInTheDocument()
+    })
+
     it('adopts the size the server reports, so the acknowledgement is not echoed back', () => {
       // Without this the two answer each other forever: the server applies a
       // size, the client draws at it, the drawing reports a size.
@@ -148,6 +193,47 @@ describe('TerminalView', () => {
       // The resize that xterm reports back for this change is not sent on.
       settleResize()
       expect(session.resize).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('the shape the terminal has', () => {
+    it('keeps the shape the server sent while this browser is only watching', () => {
+      // The case a viewer is in and a controller never sees. The screen arrives
+      // at the terminal's size, which is not this browser's - and a viewer that
+      // fitted its own element anyway would push the pty's rows down into its
+      // scrollback and be left looking at the empty part of the screen below
+      // them. Measured in the grid as a panel with nothing on it while tmux
+      // held a shell prompt.
+      const { current, session, rerender } = renderView(true, 11, false)
+
+      act(() => current()!.show(encoder.encode('somebody else’s screen'), 100, 30))
+      expect(FakeTerminal.last.cols).toBe(100)
+
+      // Anything that measures - here a change of text size - must leave that
+      // shape alone. The element fits 80x24.
+      rerender(<TerminalView session={session} interactive mayResize={false} fontSize={12.5} />)
+      settleResize()
+
+      expect(FakeTerminal.last.cols).toBe(100)
+      expect(FakeTerminal.last.rows).toBe(30)
+      expect(session.resize).not.toHaveBeenCalled()
+    })
+
+    it('states its own size the moment it is given the keyboard', () => {
+      // Being given the keyboard is being given the shape. The box here fits
+      // exactly the size the server last applied, which is the case that would
+      // say nothing at all unless the scheduler is told to forget what it had
+      // recorded - the recorded size was the server's, not this browser's.
+      const { current, session, rerender } = renderView(true, 11, false)
+
+      act(() => current()!.show(encoder.encode('somebody else’s screen'), 80, 24))
+      settleResize()
+      vi.mocked(session.resize).mockClear()
+
+      rerender(<TerminalView session={session} interactive mayResize fontSize={11} />)
+      settleResize()
+
+      expect(session.resize).toHaveBeenCalledWith(80, 24)
     })
   })
 
@@ -176,7 +262,7 @@ describe('TerminalView', () => {
 
       expect(FakeTerminal.last.options.disableStdin).toBe(true)
 
-      rerender(<TerminalView session={session} interactive fontSize={11} />)
+      rerender(<TerminalView session={session} interactive mayResize fontSize={11} />)
       expect(FakeTerminal.last.options.disableStdin).toBe(false)
     })
 
@@ -194,7 +280,7 @@ describe('TerminalView', () => {
       expect(FakeTerminal.last.options.fontSize).toBe(11)
 
       FakeFitAddon.size = { cols: 100, rows: 30 }
-      rerender(<TerminalView session={session} interactive fontSize={12.5} />)
+      rerender(<TerminalView session={session} interactive mayResize fontSize={12.5} />)
 
       expect(FakeTerminal.last.options.fontSize).toBe(12.5)
       settleResize()
@@ -206,7 +292,7 @@ describe('TerminalView', () => {
       settleResize()
       vi.mocked(session.resize).mockClear()
 
-      rerender(<TerminalView session={session} interactive fontSize={11} />)
+      rerender(<TerminalView session={session} interactive mayResize fontSize={11} />)
       settleResize()
 
       expect(session.resize).not.toHaveBeenCalled()

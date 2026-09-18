@@ -14,6 +14,7 @@ import {
   lines as asLines,
   setWorkspace,
   settleShell,
+  takeControl,
   typeCommand,
   writeFile,
 } from '../lib/harness.mjs'
@@ -118,6 +119,14 @@ async function openPage(browser, project, options = {}) {
   // The suite that is about many at once is the workspace one.
   await setWorkspace(page, [project])
   await page.waitForSelector('.xterm-screen', { timeout: 20000 })
+  // Phase 6: the keyboard is asked for. This suite is about what a terminal
+  // draws and what reaches it, so it holds the lease throughout - the case
+  // where a client does not is `controller.mjs`.
+  if (!(await takeControl(page, project))) {
+    throw new Error(
+      `could not take control of ${project.name}; every keystroke below would be refused`,
+    )
+  }
   if (process.env.AMX_E2E_DEBUG) {
     const ids = await page.evaluate(() =>
       Array.from(document.querySelectorAll('.panel--project')).map((p) => p.getAttribute('data-project-id')),
@@ -172,7 +181,7 @@ async function main() {
     // need it are skipped with that reason rather than failed, because "we
     // could not test this" and "this is broken" are different answers.
     if (!claudeIsUp(CLAUDE)) {
-      const reason = `Claude is not running in ${CLAUDE.name} on this host; see docs/WORKSPACE.md, Known Issues`
+      const reason = `Claude is not running in ${CLAUDE.name} on this host; see docs/WORKSPACE.md §13, Known issues`
       skip('xterm shows the real Claude Code TUI', reason)
       skip('the painted text matches the pane line for line', reason)
       skip('a keystroke in the browser reaches Claude itself', reason)

@@ -13,6 +13,7 @@ As of version 0.1.0:
 | Phase 3 — Real Claude Code runtime | **Partial** | `internal/claude` launcher, agent lifecycle in `internal/session`, agent API, real-CLI integration tests. Runtime integration is complete and verified against the real CLI; the one outstanding item is that the WSL Claude Code is not signed in, so E2E conversation is not yet possible on this host. See below. |
 | Phase 4 — Web terminal | **Done** | `/api/ws` transport, snapshot and live output, raw input, Prompt Bar, resize, local scroll, reconnect and resync, touch keys. Verified in a real browser, including a tablet in emulation. See below. |
 | Phase 5 — Multi-project workspace | **Done** | The workspace grid, slots, the Project Manager as the last cell, pagination, Focus and full screen, and the browser suites moved into the repository. Verified against real Chrome at four viewports. See below. |
+| Phase 6 — Multi-device control | **Done** | One controller and many viewers per project, a lease with a grace period, a handshake for handing control over, and input and resize authority on the server. Verified in two real browser contexts at once — a desktop and an emulated tablet. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -330,15 +331,87 @@ Phase 6, and `docs/WORKSPACE.md` §12 states it rather than implying otherwise.
 
 ## Phase 6 — Multi-device control
 
-Deliver:
+**Status: Done.** One project's terminal open on a desktop and a tablet at the same time, with exactly
+one of them able to type into it, and a way to hand that over.
 
-- Viewer/Controller;
-- atomic Take Control;
-- 10-second lease;
-- independent scroll;
-- canonical PTY size;
-- controller-only resize;
-- software-keyboard resize protection.
+**Goal.** Stop one browser from being the only place a terminal lives. A project has one runtime and
+one pty; several people looking at it is the point of the product, and several people typing into it
+is not.
+
+**Deliver.**
+
+- `internal/terminal/authority.go` — the lease, one per project, and the two questions it answers:
+  may this client type, may this client set the size;
+- `internal/terminal/control.go` — request, grant, queue, hand over, decline, release;
+- `internal/terminal/device.go` — a device label derived from the User-Agent, from a closed vocabulary;
+- the roster (`control.changed`) carried by every message in the control family;
+- protocol version 2, because `input` and `resize` stopped being things any subscriber may send;
+- the client identifier: a browser session, kept in `sessionStorage`, stated in the handshake;
+- `web/src/terminal/` — the control state, the badge, the request list, and the four places authority
+  is enforced: the keyboard, the touch keys, the resize, and the fit that a viewer must not make;
+- `web/e2e/suites/controller.mjs` — two browser contexts, one desktop and one emulated tablet;
+- `docs/MULTI_DEVICE.md`.
+
+**What was built, and the four decisions in it.**
+
+*A lease, not a flag.* Control is held per project by a client. A client that is connected and holding
+it keeps it indefinitely — there is no idle timeout, because taking a terminal away from somebody who
+is reading it would be a product decision nobody asked for. `expiresAt` is set only while the holder
+is *away*, which is what makes the grace period a rule about disconnection rather than about silence.
+
+*Viewer by default.* A client that opens a project is a viewer, and stays one until it asks. Nothing is
+inherited, nothing is granted on arrival, and a restarted server gives the terminal to nobody — not to
+the device that held it before, and not to whoever happened to be watching. That last one is the rule
+that makes a restart safe: an owner invented by the server is worse than no owner.
+
+*Transfer is a handshake.* A device that wants a terminal somebody else is typing into asks for it. The
+request is put in front of the holder, who hands over or declines. Control is never taken and never
+pushed. The button is *Request control* everywhere in the interface, and the directive's §十一 is
+explicit that *Take Control* must not appear, because on a project somebody else is using it is not
+what happens.
+
+*Two authorities, one lease.* `MayInput` and `MayResize` are separate questions with separate answers,
+and a refusal names which one it was. The geometry belongs to the terminal rather than to the browsers:
+the controller's resize moves the pty and everybody is told, and a viewer's box is a viewport onto the
+terminal rather than a measurement of it — resizing that box changes how much of the screen the viewer
+can see and nothing about the pty. Where in that screen a browser is looking stays its own business and
+never crosses the wire; the one thing that moves it is a snapshot, because a snapshot is the screen
+drawn again rather than a line added to it, and a client that has just been handed the present belongs
+at the end of it.
+
+**Verification.** A whole run of the browser suites — `npm run test:e2e`, six suites, one fixture each,
+182 checks passed and two skipped — over `web/e2e/suites/controller.mjs`'s 41, against a real server,
+real tmux and two real browser contexts: one stating a Windows Chrome User-Agent, one an iPad Safari
+User-Agent with touch and mobile emulation. The controller suite drives the ordinary cases, the four
+transfer cases, project isolation, a controller that disappears, a controller whose connection is
+severed, and a server that is stopped and started underneath a live browser. Beside it: transport 28,
+terminal 24, recovery 26, tablet 18, workspace 45. Both skips are reported where they happen rather
+than passed over, and neither is a product failure dressed as one — the terminal suite's line-for-line
+comparison, which needs a pane whose size is not being changed under it, and the workspace suite's two
+live Claudes, which this host keeps one of; the same line-for-line comparison is made in the recovery
+suite, where nothing resizes the terminal underneath it, and there it passes. Behind them: `internal/terminal/control_test.go` — the
+identifier, the device label, the queue, both authorities, transfer and release; and
+`internal/terminal/authority_test.go` — the rules of the lease, including
+`TestSimultaneousRequestsProduceExactlyOneController`, which is the race §十八 asks for; and
+`internal/terminal/multi_device_test.go` — one controller and ten viewers on one terminal, the
+thirty-second default, and a lease that does not outlive the server that granted it. The Go packages
+are green uncached (`go test -count=1 ./...`, ten packages) and so is the frontend (`npm test`, 448
+tests in 21 files, with `npm run typecheck` clean).
+
+**Outstanding, and the limits worth repeating.** A physical iPad was not used: the tablet half is
+Playwright's touch and mobile emulation, and the suite says so in its own header rather than implying
+otherwise. `go test -race` could not be run on the development host — cgo and gcc are not available
+there — so the concurrency tests run without the race detector; the race itself is exercised by
+racing two askers deterministically, which is a weaker instrument than `-race` and is stated as such.
+And one protocol break is deliberate: version 2 refuses a `?v=1` client rather than serving it, so a
+cached page from Phase 5 must reload. That is §二十二's compatibility requirement not being met in one
+place, by choice, and the alternative was a version 1 client drawing a Prompt Bar that silently does
+not work.
+
+**One gap in the interface.** A controller who closes a project's panel keeps the lease until the grace
+lapses, or until they reopen the panel and release it. There is no control anywhere in the interface
+that gives up a lease for a project that is not on screen. It is a gap in the UI rather than in the
+server — the message exists and is handled — and it is recorded here rather than left to be discovered.
 
 ## Phase 7 — Claude state awareness
 

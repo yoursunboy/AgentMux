@@ -116,6 +116,20 @@ type ServerConfig struct {
 	IdleTimeoutSec   int `json:"idleTimeoutSeconds"`
 	ShutdownGraceSec int `json:"shutdownGraceSeconds"`
 
+	// ControlGraceSec is how long a browser that holds a project's terminal
+	// keeps it after its connection drops.
+	//
+	// It is a grace period rather than a timeout because the usual reason a
+	// controller's socket closes is a network that will come back: a tablet
+	// that slept, a laptop that changed networks, a page that is being
+	// reloaded. Releasing on the disconnect would mean the person typing loses
+	// the terminal to whoever asks first during a two-second gap. Empty means
+	// the terminal package's own default.
+	//
+	// A short value is for a machine where the lease should turn over quickly;
+	// a long one is for a link that drops often.
+	ControlGraceSec int `json:"controlGraceSeconds"`
+
 	// AllowedOrigins lists extra browser origins permitted by CORS and by the
 	// WebSocket upgrade's Origin check, on top of the always-allowed loopback
 	// origins. Empty means loopback only.

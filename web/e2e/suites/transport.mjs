@@ -47,6 +47,18 @@ function wsl(script, input) {
 }
 const paneOf = (project) =>
   wsl(`tmux -S ${fixtures.dataDir}/tmux/${project.id}.sock capture-pane -p -t amx-${project.id}`)
+/**
+ * paneSize is the terminal's own dimensions, asked of the terminal.
+ *
+ * A message saying a terminal is a hundred columns wide and a terminal that is
+ * a hundred columns wide are different claims, and only one of them can be read
+ * out of a WebSocket frame.
+ */
+const paneSize = (project) =>
+  wsl(
+    `tmux -S ${fixtures.dataDir}/tmux/${project.id}.sock ` +
+      `display-message -p -t amx-${project.id} '#{pane_width}x#{pane_height}'`,
+  ).trim()
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const grepCount = (pattern) => Number(wsl(`grep -c "${pattern}" ${LOG}`).trim() || '0')
 
@@ -171,7 +183,7 @@ function decodeFrame(bytes) {
  * without one is a program rather than a page, which is what this is, and the
  * server says so in as many words.
  */
-function connect({ path = '/api/ws?v=1', origin } = {}) {
+function connect({ path = '/api/ws?v=2', origin } = {}) {
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: '127.0.0.1', port: 8787 })
     let buffer = Buffer.alloc(0)
@@ -209,7 +221,7 @@ function connect({ path = '/api/ws?v=1', origin } = {}) {
         'Connection: Upgrade',
         `Sec-WebSocket-Key: ${crypto.randomBytes(16).toString('base64')}`,
         'Sec-WebSocket-Version: 13',
-        'Sec-WebSocket-Protocol: agentmux.terminal.v1',
+        'Sec-WebSocket-Protocol: agentmux.terminal.v2',
       ]
       if (origin) headers.push(`Origin: ${origin}`)
       socket.write(`${headers.join('\r\n')}\r\n\r\n`)
@@ -315,14 +327,19 @@ async function main() {
     check(
       'a non-browser client is upgraded and answered with the subprotocol it offered',
       /^HTTP\/1\.1 101/.test(client.handshake) &&
-        /sec-websocket-protocol:\s*agentmux\.terminal\.v1/i.test(client.handshake),
+        /sec-websocket-protocol:\s*agentmux\.terminal\.v2/i.test(client.handshake),
       client.handshake.split('\r\n')[0],
     )
     const greeted = await waitUntil(() => text(client).some((m) => m.type === 'hello'))
     const hello = text(client).find((m) => m.type === 'hello') ?? {}
     check(
       'the server greets before anything else, and states its protocol',
-      greeted && hello.protocol === 1 && typeof hello.clientId === 'string' && hello.clientId !== '',
+      greeted &&
+        hello.protocol === 2 &&
+        typeof hello.clientId === 'string' &&
+        hello.clientId !== '' &&
+        typeof hello.connectionId === 'string' &&
+        hello.connectionId !== '',
       `protocol ${hello.protocol}, clientId ${hello.clientId}, server ${hello.server} ${hello.version}`,
     )
     client.close()
@@ -341,11 +358,12 @@ async function main() {
       gotSnapshot && snapshot.type === 2 && snapshot.projectId === SHELL.id,
       `type ${snapshot?.type}, boundary ${snapshot?.last}, ${snapshot?.payload?.length} bytes`,
     )
-    check(
-      'the snapshot carries the geometry the subscribe asked for',
-      snapshot.cols === 100 && snapshot.rows === 30,
-      `${snapshot.cols}x${snapshot.rows} (asked for 100x30)`,
-    )
+    // The size this subscribe asked for is not asserted here, and the reason is
+    // the phase's rule rather than a gap: geometry follows the lease, so this
+    // client - which has not asked for control - is sent the terminal as it is.
+    // Both halves of that are checked at the end of this block, where the
+    // sequence numbers are no longer being counted and a resize can be allowed
+    // to produce output.
 
     // Now make it talk, and check every frame that comes back rather than the
     // screen at the end of it. The wait is on the last line the loop prints,
@@ -450,6 +468,96 @@ async function main() {
       drift === 0 && client.binary.length >= 10,
       `${client.binary.length} frames, ${drift} a client would have rejected`,
     )
+
+    // ------------------------------------ the geometry, and who may ask for it
+    //
+    // A subscribe carries a size because a browser knows how large its viewport
+    // is, and until this phase the server applied it for whoever asked. It no
+    // longer does: a viewer is *shown* a terminal, and a phone opening the
+    // project somebody is working in must not reflow that terminal to forty
+    // columns just by looking at it. Both halves are here, on the wire, because
+    // "the wrong client can reshape your terminal" is not a thing to find out
+    // from a screenshot.
+    //
+    // It is done at the end of the block rather than at the start so that the
+    // resize's own output - a shell told it has fewer columns redraws itself -
+    // cannot be mistaken for the transport losing frames.
+    {
+      // What the terminal actually is, measured from tmux rather than assumed
+      // from a fixture default. The viewer's check below is that it was sent
+      // this and not the size it asked for, and both halves of that have to be
+      // real numbers for the comparison to mean anything.
+      const asIs = paneSize(SHELL)
+
+      const watcher = await connect()
+      await waitUntil(() => text(watcher).some((m) => m.type === 'hello'))
+      watcher.send({ type: 'subscribe', projectId: SHELL.id, cols: 40, rows: 12 })
+      const watched = await waitUntil(() => watcher.binary.length > 0)
+      check(
+        'a viewer is sent the terminal as it is, not at the size it asked for',
+        watched && `${watcher.binary[0].cols}x${watcher.binary[0].rows}` === asIs && asIs !== '40x12',
+        `a viewer asked for 40x12, was sent ${watcher.binary[0]?.cols}x${watcher.binary[0]?.rows}, and the pane is ${asIs}`,
+      )
+
+      // Subscribed first, because the server will not take a request from a
+      // client that is not watching the terminal: a lease held by somebody who
+      // cannot see what they are typing into is of no use to anybody.
+      client.send({ type: 'control.request', projectId: SHELL.id })
+      const granted = await waitUntil(() =>
+        text(client).some((m) => m.type === 'control.granted'),
+      )
+      check(
+        'the first client to ask for an unclaimed terminal is given it',
+        granted,
+        text(client)
+          .filter((m) => m.type.startsWith('control.'))
+          .map((m) => m.type)
+          .join(',') || 'no control message at all',
+      )
+
+      // And now the same subscribe means something. The size is applied before
+      // the screen is taken, so the client draws a terminal the right shape
+      // once instead of drawing an old shape and reflowing it - and the pane is
+      // checked too, because a message saying the terminal is 100 columns wide
+      // is not the same claim as a terminal that is.
+      const before = client.binary.length
+      client.send({ type: 'subscribe', projectId: SHELL.id, cols: 100, rows: 30 })
+      const gotFitted = await waitUntil(() =>
+        client.binary.slice(before).some((f) => f.type === 2),
+      )
+      const fitted = client.binary.slice(before).find((f) => f.type === 2)
+      check(
+        'and a controller asking for a size is sent a screen that shape',
+        gotFitted && fitted.cols === 100 && fitted.rows === 30,
+        `${fitted?.cols}x${fitted?.rows} (asked for 100x30)`,
+      )
+      check(
+        'and the terminal itself is that size afterwards',
+        paneSize(SHELL) === '100x30',
+        `the pane is ${paneSize(SHELL)}`,
+      )
+      check(
+        'and everybody watching is told the terminal changed shape',
+        await waitUntil(() =>
+          text(watcher).some((m) => m.type === 'resized' && m.cols === 100 && m.rows === 30),
+        ),
+        text(watcher)
+          .filter((m) => m.type === 'resized')
+          .map((m) => `${m.cols}x${m.rows}`)
+          .join(',') || 'nothing',
+      )
+
+      watcher.close()
+      // Given back rather than dropped. Disconnecting and releasing are
+      // different actions with different consequences, and this one is
+      // deliberate: the lease is not left suspended over the sections below.
+      client.send({ type: 'control.release', projectId: SHELL.id })
+      check(
+        'and giving it up is answered, so a client knows it is no longer typing into anything',
+        await waitUntil(() => text(client).some((m) => m.type === 'control.revoked')),
+        '',
+      )
+    }
 
     client.close()
   }
@@ -560,7 +668,7 @@ async function main() {
         'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
       ]
       if (origin) args.push('-H', `Origin: ${origin}`)
-      args.push('http://127.0.0.1:8787/api/ws?v=1')
+      args.push('http://127.0.0.1:8787/api/ws?v=2')
       return wsl(`curl ${args.map((a) => `'${a}'`).join(' ')}`).trim()
     }
     const withoutOrigin = probe(null)

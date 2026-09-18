@@ -151,6 +151,15 @@ Controlled by PC
 [Take Control]
 ```
 
+**As built in Phase 6, and this sketch is the one place the product deliberately reads differently.**
+The label is the device's own name rather than "PC" — derived from the User-Agent, and shown to
+everyone else as `Chrome on Windows` or `Safari on iPad` — and the button is **Request control**, not
+*Take Control*. §十一 of the phase directive is explicit about the second: on a project somebody else
+is typing into, the terminal is not taken, and a label that says it can be would be wrong about what
+the button does. The viewer is told why it cannot type in the Prompt Bar's own placeholder, and the
+touch keys it has no other way to send are disabled alongside it. `docs/MULTI_DEVICE.md` §14 is the
+whole of what the interface shows.
+
 ## 11. Project Manager panel
 
 ```text

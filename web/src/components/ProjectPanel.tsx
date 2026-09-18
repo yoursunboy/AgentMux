@@ -30,7 +30,7 @@ import {
 import { useTerminalSession } from '../terminal/useTerminal'
 import { ConfirmDialog } from './ConfirmDialog'
 import { PanelMenu, type MenuItem } from './PanelMenu'
-import { ProjectTerminal } from './ProjectTerminal'
+import { ProjectTerminal, controlButton, promptBarBlockedReason } from './ProjectTerminal'
 import { PromptBar } from './PromptBar'
 
 /** Where this panel sits in the workspace, and which way it can move. */
@@ -105,6 +105,7 @@ export function ProjectPanel({
   const session = useTerminalSession(project.id, watching)
   const connected = session.status.state === 'open'
   const focused = mode !== 'grid'
+  const control = controlButton(session.control)
 
   const menu: MenuItem[] = [
     {
@@ -128,6 +129,16 @@ export function ProjectPanel({
       disabled: !watching,
       title: 'Ask the server for this terminal again from a fresh screen',
       separated: true,
+    },
+    {
+      // The same action the terminal bar offers, and the same words for it -
+      // the grid's bar is a few hundred pixels wide, and this is where an
+      // action goes when the bar runs out of room for it.
+      key: 'control',
+      label: control.label,
+      onSelect: control.run === 'release' ? session.releaseControl : session.requestControl,
+      disabled: !watching || !connected || control.disabled,
+      title: control.title,
     },
     {
       key: 'pin',
@@ -300,7 +311,10 @@ export function ProjectPanel({
             says nothing about whether *this* project has a terminal. */}
         <PromptBar
           session={session}
-          disabled={!watching || !connected}
+          disabled={!watching || !connected || !session.control.held}
+          {...(watching && connected && !session.control.held
+            ? { disabledReason: promptBarBlockedReason(session) }
+            : {})}
           {...(mode === 'grid' ? { compact: true } : {})}
         />
       </footer>

@@ -135,15 +135,24 @@ func (r *ProjectStore) GetByHostPath(ctx context.Context, hostPath string) (*pro
 
 // List returns projects matching the filter.
 //
-// Ordering is stable - name, then identifier - so that a client refreshing a
-// list does not see panels reshuffle. Slot ordering arrives with the workspace
-// grid in Phase 5.
+// Ordering is the workspace's slot order, and it is decided here rather than in
+// the browser because two devices showing the same projects should not disagree
+// about which one comes first.
+//
+// Pinned projects come first, in slot order. Everything else follows in
+// registration order: not by name, and not by when they were last opened. A
+// list that reordered itself because a runtime stopped, or because somebody
+// clicked a different panel, would move the thing the user was looking at -
+// which is the one thing a grid of terminals must never do.
+//
+// `pinned_slot IS NULL` sorts the unpinned after the pinned, because SQLite
+// yields 0 for a non-null value and 1 for a null one.
 func (r *ProjectStore) List(ctx context.Context, filter project.ListFilter) ([]*project.Project, error) {
 	query := `SELECT ` + projectColumns + ` FROM projects`
 	if !filter.IncludeArchived {
 		query += ` WHERE archived = 0`
 	}
-	query += ` ORDER BY name COLLATE NOCASE ASC, id ASC`
+	query += ` ORDER BY (pinned_slot IS NULL) ASC, pinned_slot ASC, created_at ASC, id ASC`
 
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {

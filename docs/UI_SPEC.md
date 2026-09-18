@@ -1,5 +1,11 @@
 # AgentMux UI Specification
 
+> **As built.** This is the design document, and it is left as it was written.
+> The workspace it describes — the grid, Focus, full screen, the Project Manager
+> in the last cell, one project per page on a phone — is implemented, and
+> `docs/WORKSPACE.md` describes it as built, including the places where the two
+> differ and why. Today's persistent state is `docs/ROADMAP.md`.
+
 ## 1. Design language
 
 AgentMux should feel like a compact modern IDE and control room, not an enterprise dashboard.

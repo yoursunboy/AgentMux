@@ -14,14 +14,16 @@ const Version = "0.1.0"
 // Phase names the roadmap phase this build implements.
 //
 // Phase 0 (foundation), Phase 1 (project model and server foundation), Phase 2
-// (persistent session runtime), Phase 3 (real Claude Code runtime) and Phase 4
-// (web terminal) are implemented. A project's runtime can host the real Claude
-// Code CLI, and that terminal is now in a browser: it is resolved, launched in
-// the project's own directory, observed through the process table, streamed
-// over GET /api/ws, and it survives a server restart. What Phase 4 did not add
-// is a controller, a viewer, or a lease - every subscription is equal - and the
-// multi-project grid is Phase 5.
-const Phase = "Phase 4 - Web terminal"
+// (persistent session runtime), Phase 3 (real Claude Code runtime), Phase 4
+// (web terminal) and Phase 5 (multi-project workspace) are implemented. A
+// project's runtime can host the real Claude Code CLI, that terminal is in a
+// browser, and several of them are on screen at once: each project takes a slot
+// in the workspace, the grid shows up to five at a time over one WebSocket, and
+// the page, the focus and the scroll belong to the browser while the membership
+// belongs to this server. What Phase 5 did not add is a controller, a viewer,
+// or a lease - every subscription is still equal, and every client that can
+// reach this server can type into every terminal it watches. That is Phase 6.
+const Phase = "Phase 5 - Multi-project workspace"
 
 // TerminalRuntimeImplemented reports whether this build can run persistent
 // terminal sessions.

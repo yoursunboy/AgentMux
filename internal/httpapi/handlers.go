@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -402,6 +403,70 @@ func (s *Server) handleRegisterProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, s.log, http.StatusCreated, projectResponse{Project: p})
+}
+
+// slotValue is a pinned-slot field that can tell "not sent" from "sent as
+// null".
+//
+// The two mean different things here - leave the pin where it is, versus take
+// it off - and a plain *int collapses them into one, which would make it
+// impossible to distinguish a request that forgot the field from one that
+// deliberately cleared it.
+type slotValue struct {
+	// Present is true when the field appeared in the body at all.
+	Present bool
+	// Slot is the requested slot, or nil for "no pin".
+	Slot *int
+}
+
+// UnmarshalJSON records that the field was sent, then decodes it.
+func (v *slotValue) UnmarshalJSON(data []byte) error {
+	v.Present = true
+	if strings.TrimSpace(string(data)) == "null" {
+		v.Slot = nil
+		return nil
+	}
+	var slot int
+	if err := json.Unmarshal(data, &slot); err != nil {
+		return err
+	}
+	v.Slot = &slot
+	return nil
+}
+
+// updateProjectRequest is the body of PATCH /api/projects/{id}.
+type updateProjectRequest struct {
+	PinnedSlot slotValue `json:"pinnedSlot"`
+}
+
+// handleUpdateProject implements PATCH /api/projects/{id}.
+//
+// The only field it accepts is the workspace slot, and that is deliberate. A
+// general "edit a project" endpoint is where every future field arrives with no
+// decision attached to it; here, a caller asking to rename a project is told the
+// field is unknown, which is a clearer answer than a write with no rule behind
+// it. Archiving, renaming and removing stay where they already are.
+func (s *Server) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.contextWithTimeout(r, 10*time.Second)
+	defer cancel()
+
+	var req updateProjectRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, err.Error(), nil)
+		return
+	}
+	if !req.PinnedSlot.Present {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest,
+			"the request must set pinnedSlot, to a slot number or to null", nil)
+		return
+	}
+
+	p, err := s.projects.SetSlot(ctx, r.PathValue("id"), req.PinnedSlot.Slot)
+	if err != nil {
+		writeServiceError(w, s.log, err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, projectResponse{Project: p})
 }
 
 // createProjectRequest is the body of POST /api/projects.

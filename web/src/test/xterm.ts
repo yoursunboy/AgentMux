@@ -63,6 +63,8 @@ export class FakeTerminal {
   readonly events: string[] = []
 
   host: HTMLElement | null = null
+  /** The element xterm scrolls, which the component listens to as well. */
+  viewport: HTMLElement | null = null
   opened = false
   disposed = false
   focused = 0
@@ -87,6 +89,14 @@ export class FakeTerminal {
   open(host: HTMLElement): void {
     this.opened = true
     this.host = host
+    // The real xterm puts its scrolling element inside the host, and the
+    // component listens to that element: a mouse wheel scrolls it without
+    // xterm reporting anything through onScroll, which is the whole reason the
+    // listener exists. A double without it would let that bug back in.
+    const viewport = document.createElement('div')
+    viewport.className = 'xterm-viewport'
+    host.appendChild(viewport)
+    this.viewport = viewport
   }
 
   write(data: Uint8Array | string): void {
@@ -153,6 +163,19 @@ export class FakeTerminal {
     this.buffer.active.viewportY = viewportY
     this.buffer.active.baseY = baseY
     for (const listener of this.scrollListeners) listener()
+  }
+
+  /**
+   * fireViewportScroll is the browser scrolling the viewport element.
+   *
+   * It is what a mouse wheel does, and it is deliberately not `fireScroll`: the
+   * browser moves the element and xterm's own event never fires, so a test that
+   * used the other one would be testing a path a mouse does not take.
+   */
+  fireViewportScroll(viewportY: number, baseY: number): void {
+    this.buffer.active.viewportY = viewportY
+    this.buffer.active.baseY = baseY
+    this.viewport?.dispatchEvent(new Event('scroll'))
   }
 
   /** Everything written, decoded, so a test can read what the terminal shows. */

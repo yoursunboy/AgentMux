@@ -12,6 +12,7 @@ As of version 0.1.0:
 | Phase 2.5 — tmux stability validation and runtime isolation | **Partial** | One tmux server and socket per project; Control Monitor lifecycle; a four-environment tmux compatibility matrix. Complete except for re-running the pure-Linux columns, which need interactive authentication on the test host. See below. |
 | Phase 3 — Real Claude Code runtime | **Partial** | `internal/claude` launcher, agent lifecycle in `internal/session`, agent API, real-CLI integration tests. Runtime integration is complete and verified against the real CLI; the one outstanding item is that the WSL Claude Code is not signed in, so E2E conversation is not yet possible on this host. See below. |
 | Phase 4 — Web terminal | **Done** | `/api/ws` transport, snapshot and live output, raw input, Prompt Bar, resize, local scroll, reconnect and resync, touch keys. Verified in a real browser, including a tablet in emulation. See below. |
+| Phase 5 — Multi-project workspace | **Done** | The workspace grid, slots, the Project Manager as the last cell, pagination, Focus and full screen, and the browser suites moved into the repository. Verified against real Chrome at four viewports. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -273,16 +274,59 @@ Outstanding: nothing in the phase. The limit worth repeating is that a snapshot 
 reports it, so a full-screen program that keeps state it never repaints is restored to what it looks
 like rather than to what it knows. `docs/TERMINAL.md` §6 lists exactly what survives.
 
-## Phase 5 — Multi-project grid
+## Phase 5 — Multi-project workspace
 
-Deliver:
+**Status: Done.** The workspace grid, its slot model, the Project Manager as the
+last cell of every page, pagination, Focus and full screen, and the browser
+suites moved into the repository.
 
-- ProjectPanel;
-- 1×3 and 2×3 layouts;
-- Project Manager;
-- focus/full-screen;
-- five concurrent project sessions;
-- pagination foundation.
+**Goal.** Turn the proven single-project terminal into a workspace: several
+projects visible at once, each one its own terminal, none of them able to
+disturb the others.
+
+**Deliver.**
+
+- `web/src/workspace/` — the slot model, the layout hook, the page preference,
+  the full-screen hook, and the workspace state;
+- `WorkspaceGrid`, `WorkspacePager`, `PanelMenu`, `PanelBoundary`,
+  `ConfirmDialog`, `ProjectDetailsDialog`;
+- a grid of up to two rows, three columns wide, holding five projects and the
+  manager;
+- the Project Manager's two lists — in the workspace, and registered;
+- pagination, with the manager on every page;
+- Focus and full screen as client layouts that restart nothing;
+- `PATCH /api/projects/{id}` — the one mutable field on a project;
+- `web/e2e/` — five browser suites and the runner that builds their fixture.
+
+**What was built.** A project is in the workspace exactly when it holds a
+reserved slot, and that is stored server-side, so the workspace survives a
+reload, a second browser and a server restart with nothing to keep in step.
+Positions do not move on their own: not when a runtime stops, not on a rename,
+not on a click. A page holds at most two rows, and how many projects that is
+depends on the width — five, three or one — which is why a phone shows one
+project per page and gives the manager a page of its own at the end.
+
+Beyond the viewport a page is not mounted at all: no subscriptions, no xterm
+instances. The runtimes carry on, and coming back to a page takes a fresh
+screen.
+
+Two defects were found by the browser suites rather than by the unit tests, and
+both are fixed: the pager counted registered projects instead of workspace
+members, and the terminal client closed its socket during a page change — which
+React makes look like "nothing is subscribed" for the instant between unmounting
+one page and mounting the next.
+
+**Verification.** Five browser suites, 113 checks, against real Chrome, a real
+server and seven real tmux sessions of which two host the real Claude Code CLI:
+`npm run test:e2e`. Four viewports are driven — 1440×900, 1180×820, 820×1180
+and 390×844 — and the measured grid geometry at each is in
+`docs/WORKSPACE.md` §6.
+
+**Outstanding.** Nothing in the phase. The limits worth repeating: a physical
+iPad was not used (the tablet suites are emulation, and say so), Claude Code on
+this host is installed but not signed in, and concurrent input authority is not
+solved — every client that can reach the server can type. That last one is
+Phase 6, and `docs/WORKSPACE.md` §12 states it rather than implying otherwise.
 
 ## Phase 6 — Multi-device control
 

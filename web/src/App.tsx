@@ -4,8 +4,11 @@ import {
   ApiError,
   ErrorCodes,
   createProject,
+  destroyRuntime,
   discoverProjects,
   registerProject,
+  setPinnedSlot,
+  startAgent,
   startRuntime,
   stopRuntime,
 } from './api/client'
@@ -13,22 +16,41 @@ import type { Candidate, DiscoveryResult, Project } from './api/types'
 import { ErrorBanner } from './components/ErrorBanner'
 import { GlobalBar } from './components/GlobalBar'
 import { NewProjectDialog } from './components/NewProjectDialog'
+import { ProjectDetailsDialog } from './components/ProjectDetailsDialog'
 import { ProjectManagerPanel } from './components/ProjectManagerPanel'
-import { ProjectPanel } from './components/ProjectPanel'
+import { ProjectPanel, type PanelActions, type PanelPosition } from './components/ProjectPanel'
 import { RegisterProjectDialog } from './components/RegisterProjectDialog'
+import { WorkspaceGrid } from './components/WorkspaceGrid'
+import { WorkspacePager } from './components/WorkspacePager'
 import { useProjects, useServerInfo } from './hooks/useProjects'
 import { describeError } from './lib/format'
 import { createTerminalClient } from './terminal/client'
-import { TerminalProvider } from './terminal/useTerminal'
+import { TerminalProvider, useConnectionStatus } from './terminal/useTerminal'
+import {
+  firstFreeSlot,
+  members,
+  moveToSlot,
+  neighbourSwap,
+  type SlotChange,
+} from './workspace/slots'
+import { useFullscreen } from './workspace/useFullscreen'
+import { useWorkspace } from './workspace/useWorkspace'
 
 type Dialog = 'none' | 'new' | 'register'
 
 /**
- * App is the whole UI: a global bar, project panels, and the project manager.
+ * App is the whole UI: a global bar, a workspace of project panels, and the
+ * Project Manager in the last cell of every page.
  *
- * There is no router and no dashboard. The UI spec describes one workspace, and
- * inventing pages for a product with three screens would be furniture, not
- * function.
+ * There is still no router and no dashboard. The workspace is one page of up to
+ * five terminals plus the manager, and pages of them when there are more
+ * projects open than fit; a route for "which panel is focused" would be a
+ * router introduced to express a click.
+ *
+ * Everything the panels can do is decided here. A panel is handed callbacks and
+ * knows nothing about the API, the workspace, or which display mode it is in -
+ * which is what makes the grid, focus and full screen three boxes around one
+ * component rather than three features.
  */
 export function App() {
   const server = useServerInfo()
@@ -37,12 +59,18 @@ export function App() {
 
   // One terminal client for the page. It opens its socket when the first
   // terminal is watched and closes it when the last one is released, so a page
-  // with nothing on screen holds no connection.
+  // with nothing on screen holds no connection. Every panel subscribes through
+  // this, which is what keeps a workspace of five terminals to one WebSocket.
   const [terminalClient] = useState(() => createTerminalClient())
   useEffect(() => () => terminalClient.close(), [terminalClient])
+  const connection = useConnectionStatus(terminalClient)
+
+  const list = projects.data ?? []
+  const workspace = useWorkspace(list)
+  const fullscreen = useFullscreen()
 
   const [dialog, setDialog] = useState<Dialog>('none')
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [detailsId, setDetailsId] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [actionError, setActionError] = useState<{ dialog: Dialog; error: Error } | null>(null)
   const [pageError, setPageError] = useState<string | null>(null)
@@ -51,7 +79,9 @@ export function App() {
   const [discoveryLoading, setDiscoveryLoading] = useState(false)
   const [discoveryError, setDiscoveryError] = useState<Error | null>(null)
 
-  const [runtimeBusy, setRuntimeBusy] = useState(false)
+  const roots = server.data?.projectsRoots ?? []
+  const refreshProjects = projects.refresh
+  const { focus, unfocus } = workspace
 
   const scan = useCallback(async () => {
     setDiscoveryLoading(true)
@@ -65,11 +95,6 @@ export function App() {
     }
   }, [])
 
-  const list = projects.data ?? []
-  const selected = list.find((project) => project.id === selectedId) ?? list[0] ?? null
-  const roots = server.data?.projectsRoots ?? []
-  const refreshProjects = projects.refresh
-
   /** reportFailure keeps the message, not just the fact, of a failure. */
   const reportFailure = useCallback((scope: Dialog, error: unknown) => {
     const failure = error instanceof Error ? error : new Error(String(error))
@@ -80,16 +105,27 @@ export function App() {
     setActionError({ dialog: scope, error: failure })
   }, [])
 
-  /** afterWrite refreshes the list and the discovery marks. */
+  /** afterWrite folds a created or registered project back into the page. */
   const afterWrite = useCallback(
     async (created: Project) => {
-      setSelectedId(created.id)
       setActionError(null)
       setDialog('none')
-      refreshProjects()
+      // A project that was just created or registered joins the workspace: a
+      // project that appeared nowhere would look like the action failed. The
+      // pin is a second write, so a failure here is reported as what it is -
+      // the project exists, and it is the panel that did not open.
+      try {
+        await setPinnedSlot(created.id, firstFreeSlot(list))
+      } catch (error) {
+        setPageError(
+          `${created.name} was created, but it could not be opened in the workspace. ${describeError(error)}`,
+        )
+      } finally {
+        refreshProjects()
+      }
       if (discovery) await scan()
     },
-    [discovery, refreshProjects, scan],
+    [discovery, list, refreshProjects, scan],
   )
 
   const onRegister = useCallback(
@@ -139,8 +175,8 @@ export function App() {
   }, [reloadServer, refreshProjects])
 
   /**
-   * runRuntimeAction drives one runtime request and folds its outcome back into
-   * the page.
+   * runRuntimeAction drives one request about a runtime and folds the outcome
+   * back into the page.
    *
    * The project list is refreshed afterwards rather than the panel patching its
    * own copy, because the runtime state is the server's to report: a session can
@@ -148,15 +184,18 @@ export function App() {
    * a restart, and a panel that kept its own answer would drift from all three.
    */
   const runRuntimeAction = useCallback(
-    async (projectId: string, action: 'start' | 'stop') => {
-      setRuntimeBusy(true)
+    async (projectId: string, action: 'start' | 'stop' | 'destroy' | 'agent') => {
+      setBusy(true)
       setPageError(null)
       try {
-        await (action === 'start' ? startRuntime(projectId) : stopRuntime(projectId))
+        if (action === 'start') await startRuntime(projectId)
+        else if (action === 'stop') await stopRuntime(projectId)
+        else if (action === 'destroy') await destroyRuntime(projectId)
+        else await startAgent(projectId)
       } catch (error) {
         reportFailure('none', error)
       } finally {
-        setRuntimeBusy(false)
+        setBusy(false)
         refreshProjects()
         // The server's own view of whether a terminal can run here can change
         // while the page is open - tmux installed, the server restarted - and a
@@ -167,6 +206,94 @@ export function App() {
     [refreshProjects, reloadServer, reportFailure],
   )
 
+  /**
+   * applySlots writes reservation changes and refreshes.
+   *
+   * Writes are sequential rather than parallel on purpose: a swap is two
+   * reservations that have to end up exchanged, and the second one needs the
+   * list the first one produced to be sure it is the same two projects. Two
+   * requests is not a performance question, and a half-applied swap is a
+   * workspace with two projects in one slot.
+   */
+  const applySlots = useCallback(
+    async (changes: SlotChange[]) => {
+      if (changes.length === 0) return
+      setBusy(true)
+      setPageError(null)
+      try {
+        for (const change of changes) {
+          await setPinnedSlot(change.projectId, change.slot)
+        }
+      } catch (error) {
+        reportFailure('none', error)
+      } finally {
+        setBusy(false)
+        refreshProjects()
+      }
+    },
+    [refreshProjects, reportFailure],
+  )
+
+  const openInWorkspace = useCallback(
+    (project: Project) => void applySlots([{ projectId: project.id, slot: firstFreeSlot(list) }]),
+    [applySlots, list],
+  )
+
+  // Removing a project takes its panel off the grid and nothing else. The
+  // runtime, the session and whatever is running in it are untouched: this
+  // writes one column of one row.
+  const removeFromWorkspace = useCallback(
+    (project: Project) => void applySlots([{ projectId: project.id, slot: null }]),
+    [applySlots],
+  )
+
+  const move = useCallback(
+    (project: Project, direction: 'left' | 'right') => {
+      void applySlots(neighbourSwap(list, project.id, direction) ?? [])
+    },
+    [applySlots, list],
+  )
+
+  const pin = useCallback(
+    (project: Project, slot: number) => {
+      void applySlots(moveToSlot(list, project.id, slot))
+    },
+    [applySlots, list],
+  )
+
+  const details = list.find((project) => project.id === detailsId) ?? null
+
+  /** The actions one panel is given. Rebuilt when a dependency moves, not per render. */
+  const panelActions = useCallback(
+    (project: Project): PanelActions => ({
+      startRuntime: () => void runRuntimeAction(project.id, 'start'),
+      stopRuntime: () => void runRuntimeAction(project.id, 'stop'),
+      startAgent: () => void runRuntimeAction(project.id, 'agent'),
+      destroyRuntime: () => void runRuntimeAction(project.id, 'destroy'),
+      focus: () => focus(project.id),
+      leaveFocus: unfocus,
+      toggleFullscreen: fullscreen.toggle,
+      move: (direction) => move(project, direction),
+      pin: (slot) => pin(project, slot),
+      remove: () => {
+        if (workspace.focused?.id === project.id) unfocus()
+        removeFromWorkspace(project)
+      },
+      details: () => setDetailsId(project.id),
+    }),
+    [
+      focus,
+      fullscreen.toggle,
+      move,
+      pin,
+      removeFromWorkspace,
+      runRuntimeAction,
+      unfocus,
+      workspace.focused?.id,
+      list,
+    ],
+  )
+
   return (
     <TerminalProvider client={terminalClient}>
       <div className="app">
@@ -174,6 +301,7 @@ export function App() {
           info={server.data}
           loading={server.loading}
           error={server.error ? describeError(server.error) : null}
+          connection={connection}
           onRetry={retryEverything}
         />
 
@@ -199,59 +327,71 @@ export function App() {
           </div>
         )}
 
-        <main className="workspace">
-          {selected ? (
+        <WorkspacePager
+          page={workspace.page}
+          pages={workspace.pages}
+          onPrevious={workspace.previousPage}
+          onNext={workspace.nextPage}
+        />
+
+        {workspace.focused ? (
+          <main className="workspace workspace--focus" aria-label="Focused project">
             <ProjectPanel
-              // Keyed by project so that switching projects is a different
-              // terminal rather than a change to this one: the view owns an
-              // xterm instance and its scrollback, and neither belongs to the
-              // panel that happens to be around it.
-              key={selected.id}
-              project={selected}
-              // All three facts the server folds into features.terminal: the
-              // build has the runtime, the server is on the right side of the
-              // WSL boundary, and tmux is installed where sessions run.
+              key={workspace.focused.id}
+              project={workspace.focused}
               terminalAvailable={server.data?.features.terminal === true}
               terminalBlocker={server.data?.terminalBlocker ?? ''}
-              busy={runtimeBusy}
-              onStartRuntime={() => void runRuntimeAction(selected.id, 'start')}
-              onStopRuntime={() => void runRuntimeAction(selected.id, 'stop')}
+              busy={busy}
+              position={workspacePosition(list, workspace.focused.id)}
+              actions={panelActions(workspace.focused)}
+              mode={fullscreen.active ? 'fullscreen' : 'focus'}
+              canFullscreen={fullscreen.supported}
             />
-          ) : (
-            <section className="panel panel--empty" aria-label="No project selected">
-              <div className="panel__body">
-                <p className="notice">
-                  {projects.loading
-                    ? 'Loading…'
-                    : 'No project is open. Create or register one to get started.'}
-                </p>
-              </div>
-            </section>
-          )}
-
-          <ProjectManagerPanel
-            projects={list}
-            projectsLoading={projects.loading}
-            projectsError={projects.error}
-            discovery={discovery}
-            discoveryLoading={discoveryLoading}
-            discoveryError={discoveryError}
-            busy={busy}
-            onOpenNew={() => {
-              setActionError(null)
-              setDialog('new')
-            }}
-            onOpenRegister={() => {
-              setActionError(null)
-              setDialog('register')
-            }}
-            onDiscover={() => void scan()}
-            onRegisterCandidate={onRegisterCandidate}
-            onRefresh={refreshProjects}
-            selectedId={selected?.id ?? null}
-            onSelect={(project) => setSelectedId(project.id)}
+          </main>
+        ) : (
+          <WorkspaceGrid
+            items={workspace.items}
+            columns={workspace.columns}
+            renderProject={(project) => (
+              <ProjectPanel
+                project={project}
+                terminalAvailable={server.data?.features.terminal === true}
+                terminalBlocker={server.data?.terminalBlocker ?? ''}
+                busy={busy}
+                position={workspacePosition(list, project.id)}
+                actions={panelActions(project)}
+                mode="grid"
+                canFullscreen={fullscreen.supported}
+              />
+            )}
+            renderManager={() => (
+              <ProjectManagerPanel
+                projects={list}
+                projectsLoading={projects.loading}
+                projectsError={projects.error}
+                discovery={discovery}
+                discoveryLoading={discoveryLoading}
+                discoveryError={discoveryError}
+                busy={busy}
+                onOpenNew={() => {
+                  setActionError(null)
+                  setDialog('new')
+                }}
+                onOpenRegister={() => {
+                  setActionError(null)
+                  setDialog('register')
+                }}
+                onDiscover={() => void scan()}
+                onRegisterCandidate={onRegisterCandidate}
+                onRefresh={refreshProjects}
+                onOpenInWorkspace={openInWorkspace}
+                onRemoveFromWorkspace={removeFromWorkspace}
+                onMove={move}
+                onFocus={(project) => focus(project.id)}
+              />
+            )}
           />
-        </main>
+        )}
 
         {dialog === 'new' && (
           <NewProjectDialog
@@ -276,7 +416,34 @@ export function App() {
             onRegisterCandidate={onRegisterCandidate}
           />
         )}
+
+        {details && <ProjectDetailsDialog project={details} onClose={() => setDetailsId(null)} />}
       </div>
     </TerminalProvider>
   )
+}
+
+/**
+ * workspacePosition is where a panel sits, for the labels and the move buttons.
+ *
+ * It is derived from the rendered order rather than read from the stored slot,
+ * because those are two different numbers the moment a reservation collides
+ * with another or leaves a gap: what a person can see is the position, and the
+ * menu should say what it is looking at.
+ */
+function workspacePosition(
+  projects: readonly Project[],
+  projectId: string,
+): PanelPosition {
+  const open = members(projects)
+  const index = open.findIndex((project) => project.id === projectId)
+  if (index === -1) {
+    return { slot: 0, total: open.length, canMoveLeft: false, canMoveRight: false }
+  }
+  return {
+    slot: index,
+    total: open.length,
+    canMoveLeft: index > 0,
+    canMoveRight: index < open.length - 1,
+  }
 }

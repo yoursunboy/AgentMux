@@ -31,9 +31,11 @@ vi.mock('@xterm/addon-unicode11', async () => {
 
 const encoder = new TextEncoder()
 
-function renderView(interactive = true) {
+function renderView(interactive = true, fontSize = 11) {
   const double = makeSession()
-  const view = render(<TerminalView session={double.session} interactive={interactive} />)
+  const view = render(
+    <TerminalView session={double.session} interactive={interactive} fontSize={fontSize} />,
+  )
   return { ...double, ...view, view }
 }
 
@@ -174,8 +176,40 @@ describe('TerminalView', () => {
 
       expect(FakeTerminal.last.options.disableStdin).toBe(true)
 
-      rerender(<TerminalView session={session} interactive />)
+      rerender(<TerminalView session={session} interactive fontSize={11} />)
       expect(FakeTerminal.last.options.disableStdin).toBe(false)
+    })
+
+    it('opens at the text size it was given', () => {
+      renderView(true, 9.5)
+
+      expect(FakeTerminal.last.options.fontSize).toBe(9.5)
+    })
+
+    it('re-measures when the display mode changes the text size', () => {
+      // A different text size is a different number of columns in the same box,
+      // so it is a real change of geometry and the pty has to be told. It goes
+      // through the same debounce as every other measurement.
+      const { rerender, session } = renderView(true, 11)
+      expect(FakeTerminal.last.options.fontSize).toBe(11)
+
+      FakeFitAddon.size = { cols: 100, rows: 30 }
+      rerender(<TerminalView session={session} interactive fontSize={12.5} />)
+
+      expect(FakeTerminal.last.options.fontSize).toBe(12.5)
+      settleResize()
+      expect(session.resize).toHaveBeenCalledWith(100, 30)
+    })
+
+    it('does nothing when the text size has not changed', () => {
+      const { rerender, session } = renderView(true, 11)
+      settleResize()
+      vi.mocked(session.resize).mockClear()
+
+      rerender(<TerminalView session={session} interactive fontSize={11} />)
+      settleResize()
+
+      expect(session.resize).not.toHaveBeenCalled()
     })
 
     it('offers the keys a soft keyboard does not have', () => {
@@ -318,6 +352,29 @@ describe('TerminalView', () => {
       act(() => FakeTerminal.last.fireScroll(200, 200))
 
       expect(screen.queryByRole('button', { name: /Jump to latest|New output/ })).not.toBeInTheDocument()
+    })
+
+    it('offers the way back when the browser scrolls the viewport, as a wheel does', () => {
+      // xterm reports its own scrolling through onScroll, and a mouse wheel is
+      // not its own scrolling: the browser moves the viewport element and xterm
+      // says nothing. Measured in a real browser, where the wheel moved
+      // scrollTop and this component never heard about it - so a mouse user
+      // scrolling up was still being treated as following, and never got the
+      // way back to the bottom.
+      renderView()
+
+      act(() => FakeTerminal.last.fireViewportScroll(120, 400))
+
+      expect(screen.getByRole('button', { name: /Jump to latest/ })).toBeInTheDocument()
+    })
+
+    it('marks output that arrives while a wheel has scrolled the viewport up', () => {
+      const { current } = renderView()
+
+      act(() => FakeTerminal.last.fireViewportScroll(120, 400))
+      act(() => current()!.draw(encoder.encode('a new line')))
+
+      expect(screen.getByRole('button', { name: /New output/ })).toBeInTheDocument()
     })
 
     it('never tells the session where the viewport is', () => {

@@ -1,0 +1,117 @@
+[
+  {
+    "name": "a non-browser client is upgraded and answered with the subprotocol it offered",
+    "ok": true,
+    "detail": "HTTP/1.1 101 Switching Protocols"
+  },
+  {
+    "name": "the server greets before anything else, and states its protocol",
+    "ok": true,
+    "detail": "protocol 1, clientId c_000001, server AgentMux 0.1.0"
+  },
+  {
+    "name": "subscribing is answered with a snapshot before any output",
+    "ok": true,
+    "detail": "type 2, boundary 18, 1215 bytes"
+  },
+  {
+    "name": "the snapshot carries the geometry the subscribe asked for",
+    "ok": true,
+    "detail": "100x30 (asked for 100x30)"
+  },
+  {
+    "name": "every live frame follows the one before it, with nothing skipped",
+    "ok": true,
+    "detail": "123 frame(s), 0 gap(s), sequence reached 141"
+  },
+  {
+    "name": "the frames carry the terminal bytes themselves, not an encoding of them",
+    "ok": true,
+    "detail": "121 of 123 frame(s) hold terminal bytes, 1972 bytes total"
+  },
+  {
+    "name": "a resync is answered with a screen taken after the request, not a replay",
+    "ok": true,
+    "detail": "boundary 141 -> 144, 4733 bytes, marker in it: true"
+  },
+  {
+    "name": "the sequence moves forward across a resync rather than restarting",
+    "ok": true,
+    "detail": "boundary 141 -> 144"
+  },
+  {
+    "name": "output after a resync continues from the screen it was given",
+    "ok": true,
+    "detail": "2 frame(s) after it, starting at 145, expected 145, 0 discontinuity(ies)"
+  },
+  {
+    "name": "a real server stream never gives the client a reason to ask for a resync",
+    "ok": true,
+    "detail": "130 frames, 0 a client would have rejected"
+  },
+  {
+    "name": "output for a watcher that stopped reading is dropped, not buffered",
+    "ok": true,
+    "detail": "14195 drop notice(s) in the log while nothing was read"
+  },
+  {
+    "name": "a client that never reads is given a screen, not the bytes it missed",
+    "ok": true,
+    "detail": "64 MiB produced, 3.06 MiB delivered to it"
+  },
+  {
+    "name": "and holding it costs the server a bounded amount of memory",
+    "ok": true,
+    "detail": "server RSS 22240 -> 34204 KiB (11.7 MiB)"
+  },
+  {
+    "name": "a connection whose client stopped reading is ended, with the reason recorded",
+    "ok": true,
+    "detail": "the server closed the socket"
+  },
+  {
+    "name": "the terminal re-established itself while it was behind, rather than drifting",
+    "ok": true,
+    "detail": "1 re-synchronisation(s) logged"
+  },
+  {
+    "name": "the session and the agent outlive the client the server gave up on",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "a page from another site cannot open a terminal, and is told so",
+    "ok": true,
+    "detail": "Origin http://evil.example -> 403"
+  },
+  {
+    "name": "a program with no origin and the page this server serves both can",
+    "ok": true,
+    "detail": "no Origin -> 101, same origin -> 101"
+  },
+  {
+    "name": "a client stating a protocol version this server does not speak is refused",
+    "ok": true,
+    "detail": "v=99 -> 400"
+  },
+  {
+    "name": "a client cannot name a path, nor a project the server does not know",
+    "ok": true,
+    "detail": "/etc=bad_project p_00000000000000000000=project_not_found"
+  },
+  {
+    "name": "input is refused for a terminal the connection never subscribed to",
+    "ok": true,
+    "detail": "bad_project,project_not_found,not_subscribed"
+  },
+  {
+    "name": "an oversized input message is refused by name",
+    "ok": true,
+    "detail": "bad_project,project_not_found,not_subscribed,input_too_large"
+  },
+  {
+    "name": "a binary message from a client is not accepted as input",
+    "ok": true,
+    "detail": "the connection was closed"
+  }
+]

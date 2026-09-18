@@ -258,4 +258,5 @@ provider.changed
 
 Never include credentials.
 
-Still reserved and still unimplemented — Phase 8. Nothing in Phase 4 touched the provider path.
+Still reserved and still unimplemented — Phase 8. Nothing in Phase 4 or Phase 5
+touched the provider path.

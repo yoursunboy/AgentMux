@@ -215,3 +215,33 @@ export function describeProjectLocation(project: Project): string {
 export function pluralise(count: number, singular: string, plural = `${singular}s`): string {
   return count === 1 ? singular : plural
 }
+
+/**
+ * SessionPrefix is the namespace every AgentMux runtime session name carries.
+ *
+ * It mirrors `project.SessionPrefix` in the Go model, and it is spelled once
+ * here for the same reason it is spelled once there: two spellings of a session
+ * name are two different sessions, and the failure that produces - a project
+ * whose terminal is running but unreachable - is invisible until it matters.
+ */
+export const SessionPrefix = 'amx-'
+
+/**
+ * sessionNameFor is the runtime session name for a project.
+ *
+ * Derived from the stable id and never from the display name, so renaming a
+ * project cannot orphan a running session.
+ */
+export function sessionNameFor(projectId: string): string {
+  return `${SessionPrefix}${projectId}`
+}
+
+/**
+ * displaySlot renders a zero-based workspace slot the way a person counts.
+ *
+ * The stored slot is an index because that is what a page and a position are
+ * computed from; "slot 1" on screen is the first one, which is index 0.
+ */
+export function displaySlot(slot: number | null): string {
+  return slot === null ? 'Not in the workspace' : String(slot + 1)
+}

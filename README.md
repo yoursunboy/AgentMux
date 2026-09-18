@@ -6,8 +6,9 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 4**. The project model, the server foundation, the
-persistent session runtime, the real Claude Code runtime, and the web terminal all exist and work.
+This repository is at **version 0.1.0, end of Phase 5**. The project model, the server foundation, the
+persistent session runtime, the real Claude Code runtime, the web terminal, and the multi-project
+workspace all exist and work.
 
 | Works today | Does not exist yet |
 | --- | --- |
@@ -15,9 +16,8 @@ persistent session runtime, the real Claude Code runtime, and the web terminal a
 | Projects Root configuration, Windows/WSL and Linux path mapping | Claude Hooks, Waiting/Completed state detection |
 | Bounded discovery of project candidates | CC Switch / provider switching |
 | Register an existing project | Codex, Gemini, OpenCode |
-| Create a project, optionally with `git init` | The multi-project 1×3 / 2×3 grid |
-| SQLite metadata store with migrations | Multi-device control |
-| Persistent tmux sessions that outlive the server | Authentication |
+| Create a project, optionally with `git init` | SQLite metadata store with migrations | Persistent tmux sessions that outlive the server | Authentication |
+| Concurrent input authority on one project |
 | Runtime start / stop / destroy, with reconciliation on restart | |
 | **One tmux server and socket per project**, so one project's runtime cannot take another's down | |
 | Raw byte-accurate input, real PTY resize, sequenced output | |
@@ -27,23 +27,27 @@ persistent session runtime, the real Claude Code runtime, and the web terminal a
 | **Raw keyboard input, including Ctrl+C, and a Prompt Bar that shares the same input path** | |
 | **Reconnect and snapshot recovery: a fresh screen with the exact sequence where the stream resumes** | |
 | **Window resize, local scroll that is never yanked to the bottom, and touch keys on a tablet** | |
+| **A workspace of up to five projects at once, one WebSocket, the Project Manager in the last cell** | |
+| **Pages, slots that do not move on their own, Focus, full screen** | |
+| **A project removed from the grid keeps running, and comes back to the session it had** | |
 
 The product is not described here as if it were finished. A project's runtime hosts the real Claude
 Code CLI, and its terminal is now in the browser: the bytes are the terminal's own, the keystrokes are
 the keyboard's own, and closing the tab leaves Claude running. What is missing is around the edge of
-that — no controller or viewer roles, so every browser that can reach the server can type; no
-authentication; and one project on screen at a time, because the grid is Phase 5.
+that — no controller or viewer roles, so every browser that can reach the server can type; and no
+authentication.
 
 One thing about the development host rather than this build: the WSL Claude Code is installed but
 **not signed in**, so a terminal opened on it shows Claude Code's own sign-in screen rather than a
-conversation. That is Phase 3's outstanding item, and Phase 4 was specified to leave authentication
-alone — nothing was copied, faked, or worked around to hide it. Everything the terminal does is
-verified with a real shell in a real tmux session; the Claude TUI itself is verified as far as Claude's
-own sign-in screen, which is a real full-screen TUI and exercises the same paths.
+conversation. That is Phase 3's outstanding item, and neither Phase 4 nor Phase 5 was allowed to touch
+it — nothing was copied, faked, or worked around to hide it. Everything the terminal does is verified
+with real shells in real tmux sessions, and the Claude TUI is verified as far as the screens Claude
+itself draws on this host: its sign-in flow and its first-run theme picker, both real full-screen TUIs
+drawn through the same path.
 
 `provider.integrated` is false and the provider switch is a disabled control that says "Coming later".
-See `docs/ROADMAP.md` for the phase table, `docs/TERMINAL.md` for the terminal protocol, and
-`docs/RUNTIME.md` for how the runtime works and what it does not do.
+See `docs/ROADMAP.md` for the phase table, `docs/WORKSPACE.md` for the grid, `docs/TERMINAL.md` for the
+transport, and `docs/RUNTIME.md` for how the runtime works and what it does not do.
 
 ## Requirements
 
@@ -301,7 +305,7 @@ Workspace:
 └──────────────┴──────────────┴──────────────┘
 ```
 
-Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is the target. Today one project panel is on screen at a time — its runtime's state, its Start and Stop controls, its live terminal, and its prompt bar — and the grid of six is Phase 5.
+Each project panel displays the real AI terminal output and retains a prompt/input bar at the bottom. That is what this build does: up to five project panels and the manager on a page, each with its own live terminal, its state, its menu and its prompt bar — see `docs/WORKSPACE.md`. What the diagram above does not show is that the sixth cell is the Project Manager on every page, not only the last one.
 
 ## Tests
 
@@ -338,10 +342,17 @@ wsl -d Ubuntu-24.04 -- /tmp/session.test -test.v
 **The browser is a test target too, and it is not covered by the two commands above.** A terminal that
 is correct over a socket can still be drawn wrong: the fidelity this phase promises is about pixels,
 Unicode widths and touch targets, and those need a real browser attached to a real xterm.js. The
-end-to-end suites drive headless Chrome against a running server, a running tmux session and the real
-frontend, and they live outside the repository because they need a browser and a fixture rather than
-because they are optional — `docs/ROADMAP.md` Phase 4 lists what they cover and `docs/TERMINAL.md` §6
-is where the fidelity limits they measure against are stated.
+end-to-end suites drive headless Chrome against a running server, real tmux sessions and the real
+frontend. They are **in the repository** — `web/e2e/` — with a runner that builds the fixture they
+need from nothing, so they either work or say what is missing:
+
+```bash
+cd web && npm run test:e2e
+```
+
+It needs a WSL distribution with tmux and the Claude Code CLI, Go on the machine running it, Node 22+,
+and Chrome (which Playwright drives as a channel rather than downloading). `docs/ROADMAP.md` Phase 5
+lists what the five suites cover and `docs/WORKSPACE.md` §6 is where the measured geometry is.
 
 ## Documentation reading order
 
@@ -355,8 +366,9 @@ is where the fidelity limits they measure against are stated.
 8. `docs/API.md` — what this build actually serves
 9. `docs/CLAUDE_RUNTIME.md` — how the real Claude Code CLI is resolved, launched, observed and stopped
 10. `docs/TERMINAL.md` — the terminal protocol, the snapshot boundary, and its fidelity limits
-11. `CLAUDE.md`
-12. `.claude/rules/`
+11. `docs/WORKSPACE.md` — the grid, its slots, its pages, and its multi-device limit
+12. `CLAUDE.md`
+13. `.claude/rules/`
 
 ## Development principle
 
@@ -388,6 +400,11 @@ the terminal survives the AgentMux server being restarted underneath it. The two
 deliberately did not do are the ones that would have made it a different phase — no controller or
 viewer roles, and no multi-project grid.
 
-Phase 5 expands the proven terminal into the multi-project 1×3 / 2×3 workspace grid with the Project
-Manager occupying the final slot. Claude Hooks, state detection, notifications, provider switching,
-and additional AI tools are later milestones.
+Phase 5 built the workspace: up to five projects on one page, each its own terminal, the Project
+Manager in the last cell of every page, pages when there are more projects than that, and Focus for
+working in one of them. Two defects came out of the browser suites rather than the unit tests, which
+is the argument for having them.
+
+Phase 6 adds explicit controller and viewer ownership, so the same project can be open on a PC, a
+tablet and a phone at once while exactly one client controls input and resize. Claude Hooks, state
+detection, notifications, provider switching, and additional AI tools are later milestones.

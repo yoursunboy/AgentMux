@@ -1,23 +1,77 @@
 import type { ServerInfo } from '../api/types'
 import { capitalise, describeHost, formatUptime } from '../lib/format'
+import type { ConnectionState, ConnectionStatus } from '../terminal/client'
+
+/** What the bar's first section says, and in which colour. */
+export interface GlobalState {
+  state: 'online' | 'connecting' | 'offline'
+  label: string
+}
+
+/**
+ * globalState folds the server's REST state and the terminal socket's state
+ * into the one word the bar shows.
+ *
+ * # Why the socket is part of it
+ *
+ * "Online" is a claim about the connection this page is actually using, and the
+ * connection it actually uses for its terminals is the WebSocket. A page whose
+ * REST calls are fine and whose terminal socket has gone is not offline, but it
+ * is not simply online either: terminals are stopped, and saying "Online" over a
+ * grid of frozen panels is the one answer that would be wrong.
+ *
+ * The order of the tests is the order of specificity. A server that cannot be
+ * reached at all is offline whatever the socket says, because the socket's
+ * reconnect loop is a consequence of that and not separate news. A socket that
+ * gave up is reported as the terminal's problem, in the terminal's own words,
+ * because the two failures have different fixes: one is "start the server", the
+ * other is "reload the page".
+ *
+ * A client with nothing subscribed is `idle` and holds no socket at all, which
+ * is not a fault and is reported as online.
+ */
+export function globalState(
+  server: { error: boolean; loading: boolean },
+  connection: ConnectionState,
+  message: string,
+): GlobalState {
+  if (server.error) return { state: 'offline', label: 'Offline' }
+  if (server.loading) return { state: 'connecting', label: 'Connecting' }
+
+  switch (connection) {
+    case 'reconnecting':
+      return { state: 'connecting', label: 'Reconnecting' }
+    case 'failed':
+      return { state: 'offline', label: message || 'Terminal offline' }
+    case 'connecting':
+      return { state: 'connecting', label: 'Connecting' }
+    default:
+      return { state: 'online', label: 'Online' }
+  }
+}
 
 interface GlobalBarProps {
   info: ServerInfo | null
   loading: boolean
   error: string | null
+  /** The shared terminal connection, which every panel on the page uses. */
+  connection: ConnectionStatus
   onRetry: () => void
 }
 
 /**
  * GlobalBar is the fixed top bar: connection state, host, and provider.
  *
- * The provider switch is disabled and says "Coming later". CC Switch is not
- * integrated in Phase 1, and a control that looks live but does nothing is
- * worse than one that admits it is not ready.
+ * It is one line and stays one line. The provider switch is disabled and says
+ * "Coming later": CC Switch is not integrated, and a control that looks live
+ * but does nothing is worse than one that admits it is not ready.
  */
-export function GlobalBar({ info, loading, error, onRetry }: GlobalBarProps) {
-  const state = error ? 'offline' : loading ? 'connecting' : 'online'
-  const label = state === 'online' ? 'Online' : state === 'connecting' ? 'Connecting' : 'Offline'
+export function GlobalBar({ info, loading, error, connection, onRetry }: GlobalBarProps) {
+  const { state, label } = globalState(
+    { error: error !== null, loading },
+    connection.state,
+    connection.message,
+  )
 
   return (
     <header className="global-bar" role="banner">
@@ -29,7 +83,6 @@ export function GlobalBar({ info, loading, error, onRetry }: GlobalBarProps) {
           {label}
         </span>
       </div>
-
       <span className="global-bar__divider" aria-hidden="true">
         |
       </span>

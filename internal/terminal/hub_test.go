@@ -737,7 +737,7 @@ func fastTimings() *Timings {
 		ResyncPause: 5 * time.Millisecond,
 		Input:       time.Second,
 		Lookup:      time.Second,
-		Shutdown:   2 * time.Second,
+		Shutdown:    2 * time.Second,
 	}
 }
 

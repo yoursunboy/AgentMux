@@ -731,16 +731,54 @@ describe('terminal client', () => {
   // -------------------------------------------------------------------------
 
   describe('releasing', () => {
-    it('unsubscribes and closes the socket when nothing is wanted', () => {
+    it('unsubscribes at once, and closes once nothing has wanted it for a moment', () => {
       const { client, subscription, socket } = connected()
 
       subscription.release()
 
+      // The unsubscribe is immediate: the server should stop sending for a
+      // project the moment this client stops wanting it.
       expect(socket.messagesOfType(Msg.unsubscribe)).toEqual([
         { type: Msg.unsubscribe, projectId: PROJECT },
       ])
+      // The close is not, and that is the whole point of the delay - see the
+      // page-change case below.
+      expect(socket.closed).toBe(false)
+
+      vi.advanceTimersByTime(1000)
+
       expect(socket.closed).toBe(true)
       expect(client.status.state).toBe('idle')
+    })
+
+    it('survives a page change, where one set of panels is replaced by another', () => {
+      // React unmounts before it mounts, so changing workspace page releases
+      // every subscription before the new panels subscribe. Closing on the
+      // first release closed the socket on every page change, which a browser
+      // test caught: paging from five panels to two dropped the WebSocket and
+      // opened another.
+      const client = build()
+      const first = client.subscribe(PROJECT, null, handlers())
+      const second = client.subscribe(OTHER, null, handlers())
+      const socket = FakeSocket.last
+      open(socket)
+
+      first.release()
+      second.release()
+      const replacement = client.subscribe('p_00000000000000000000', null, handlers())
+
+      expect(socket.closed).toBe(false)
+      expect(FakeSocket.instances).toHaveLength(1)
+      expect(client.status.state).toBe('open')
+
+      // And it is still the same connection afterwards, rather than a second
+      // one that happens to look like it.
+      vi.advanceTimersByTime(1000)
+      expect(FakeSocket.instances).toHaveLength(1)
+      expect(socket.messagesOfType(Msg.subscribe).at(-1)).toMatchObject({
+        projectId: 'p_00000000000000000000',
+      })
+      replacement.release()
     })
 
     it('keeps the socket while another project is still watched', () => {

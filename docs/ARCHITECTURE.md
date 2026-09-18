@@ -14,6 +14,7 @@ iPad / Phone / PC
 │ Session Manager             │   internal/session        — built in Phase 2
 │ Terminal Manager            │   part of session.Manager — sequence, history
 │ Terminal Transport          │   internal/terminal       — built in Phase 4
+│ Workspace                   │   web/src/workspace       — built in Phase 5
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Controller Manager          │   Phase 6, not stubbed
@@ -144,6 +145,20 @@ In Phase 2 the parts that exist — canonical size, output stream, output sequen
 history — live inside the session manager's per-runtime state (`internal/session/buffer.go`). Viewer
 subscriptions exist as `Backend.Attach`; multiple subscribers to one session each receive the same
 bytes. Controller leases, viewer roles, and scroll are Phase 6 and are not stubbed.
+
+### Workspace
+
+Owns:
+
+- which projects are in the workspace, and in what order (a reserved slot per project);
+- how many cells a page has, and which projects are on it;
+- which page a browser is showing, and which project it has focused.
+
+It is not a server component and it is not a new layer in the diagram above: it is
+the client's composition of the terminal layer into a grid. Its one server-side fact
+is `projects.pinned_slot`, which is stored because two devices have to agree on it;
+everything else about the workspace is a property of one browser at one moment and
+is stored nowhere. `docs/WORKSPACE.md` is the whole of it.
 
 ### Controller Manager
 

@@ -260,5 +260,47 @@ export async function destroyRuntime(projectId: string, signal?: AbortSignal): P
   return body.runtime
 }
 
+/**
+ * Reserve a project's workspace slot, or clear the reservation with null.
+ *
+ * A project is in the workspace exactly when it has a slot, which is why this
+ * one call is both "add to the workspace" and "move within it", and why
+ * clearing it is what "remove from the workspace" means. It is a property of
+ * the project rather than of a browser, so it is the same on every device, and
+ * it survives a reload.
+ *
+ * It does not touch the runtime. Removing a project from the workspace leaves
+ * its terminal running - `docs/WORKSPACE.md` says why that is the important
+ * half of the rule.
+ */
+export async function setPinnedSlot(
+  projectId: string,
+  slot: number | null,
+  signal?: AbortSignal,
+): Promise<Project> {
+  const body = await request<{ project: Project }>(`/projects/${encodeURIComponent(projectId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ pinnedSlot: slot }),
+    signal: signal ?? null,
+  })
+  return body.project
+}
+
+/**
+ * Start the coding agent in a project's runtime.
+ *
+ * It is idempotent in the way that matters here: an agent that is already
+ * running is adopted rather than launched a second time, so this is the safe
+ * way to say "make sure Claude is running in this project" without first
+ * finding out whether it is. That is exactly what a grid panel wants, since a
+ * panel does not poll the agent's state - the terminal shows it.
+ */
+export async function startAgent(projectId: string, signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/projects/${encodeURIComponent(projectId)}/runtime/agent/start`, {
+    method: 'POST',
+    signal: signal ?? null,
+  })
+}
+
 /** Re-exported so callers do not import from two modules for one concept. */
 export type { Candidate, DiscoveryResult, Project, Runtime, ServerInfo }

@@ -422,7 +422,20 @@ The Prompt Bar shares the input path with the keyboard, so there is no separate 
 be recorded. This is the same rule as `docs/CLAUDE_RUNTIME.md`'s, applied to a second way into the
 same terminal.
 
-## 14. What this layer does not do
+## 14. More than one terminal
+
+Phase 5 put several of these on screen at once, and this layer did not change to
+allow it: one socket per browser carries every project's terminal, and a
+subscription is per project. What the workspace added is a policy about *when* to
+subscribe - the page being shown, and nothing else - and `docs/WORKSPACE.md` §8 is
+that policy. Everything in this document holds per subscription.
+
+The one thing worth repeating here, because the workspace makes it easy to run
+into: **subscribing is not the only way to reach a terminal, and unsubscribing is
+not a way to stop one.** Leaving a page releases subscriptions and the runtime
+carries on.
+
+## 15. What this layer does not do
 
 Named here so that the boundary is a statement rather than an omission:
 

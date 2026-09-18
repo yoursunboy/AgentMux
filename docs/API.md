@@ -342,6 +342,37 @@ If `initGit` fails, no project is registered, and the response says what happene
 `rolledBack: true` means this request created the directory and then removed it again.
 `rolledBack: false` means the directory already existed and was left exactly as it was.
 
+## PATCH /api/projects/{id}
+
+**The one field of a project a client may change: where it sits in the workspace.**
+
+A project is in the workspace exactly when it has a reserved slot, so this call is
+also how a project is added and removed:
+
+```json
+{ "pinnedSlot": 3 }     reserve slot 3
+{ "pinnedSlot": null }  give the slot up
+```
+
+It answers with the whole project, like every other project endpoint, and it is
+`200` whether the slot was set or cleared.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `invalid_request` | 400 | The body is not JSON, carries an unknown field, or omits `pinnedSlot` altogether |
+| `invalid_input` | 400 | A slot outside 0-199, with the refused value in `details.pinnedSlot` |
+| `project_not_found` | 404 | No project with that identifier |
+
+**Nothing else about a project can be written here.** A `PATCH` carrying `name`,
+`archived` or `hostPath` is refused by name rather than quietly ignored, because a
+general update endpoint is where every future field arrives with no rule attached
+to it. Archiving, renaming and deleting are separate operations with their own
+consequences and their own phases.
+
+**It does not touch the runtime.** Removing a project from the workspace leaves its
+terminal running: this writes one column of one row. `docs/WORKSPACE.md` §2 is the
+model and §9 is why that half of the rule matters.
+
 ## The runtime resource
 
 A project's runtime lives at `/api/projects/{id}/runtime`, nested rather than a top-level
@@ -714,7 +745,9 @@ client that saw `500` there would report a bug where the honest answer is "not o
 
 There is no provider switching, no controller or viewer role, no Claude Hooks and no Waiting/Completed
 state detection. `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for them, and none of
-them answers today.
+them answers today. **In particular there is no lease on typing**: every client that can reach this
+server can send input to every terminal it is subscribed to, and two of them typing at once interleave
+their keystrokes. That is Phase 6.
 
 What this build serves, beyond the project model, is the runtime endpoints, the agent inside one, and
 the terminal: a project's runtime can host the real Claude Code CLI, started by the server, the server

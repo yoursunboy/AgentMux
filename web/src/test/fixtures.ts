@@ -57,7 +57,7 @@ export function makeServerInfo(overrides: Partial<ServerInfo> = {}): ServerInfo 
   return {
     appName: 'AgentMux',
     version: '0.1.0',
-    phase: 'Phase 4 - Web terminal',
+    phase: 'Phase 5 - Multi-project workspace',
     status: 'online',
     startedAt: '2026-09-17T12:00:00Z',
     uptimeSeconds: 754,

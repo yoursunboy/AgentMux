@@ -39,9 +39,19 @@ interface PromptBarProps {
   session: TerminalSession
   /** Whether there is a connected terminal to send to. */
   disabled: boolean
+  /**
+   * Compact is the grid's shape: one line, no hint row, a send button that
+   * fits beside the field.
+   *
+   * A grid panel is about three hundred pixels tall, and a Prompt Bar that
+   * takes three rows of it is a Prompt Bar that costs the terminal more than it
+   * gives the person typing. Nothing is lost - the size limit is still enforced
+   * and still announced - it is only the layout that is tighter.
+   */
+  compact?: boolean
 }
 
-export function PromptBar({ session, disabled }: PromptBarProps) {
+export function PromptBar({ session, disabled, compact = false }: PromptBarProps) {
   const [text, setText] = useState('')
   const areaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -81,7 +91,7 @@ export function PromptBar({ session, disabled }: PromptBarProps) {
   )
 
   return (
-    <div className="prompt-bar">
+    <div className={compact ? 'prompt-bar prompt-bar--compact' : 'prompt-bar'}>
       <textarea
         ref={areaRef}
         className="prompt-bar__input"
@@ -98,13 +108,23 @@ export function PromptBar({ session, disabled }: PromptBarProps) {
       />
       <div className="prompt-bar__actions">
         {/* Announced rather than silently disabling the button, so that a
-            paste into the wrong field explains itself. */}
-        <span className="prompt-bar__hint" aria-live="polite">
-          {tooLong ? `Too long: ${bytes} bytes, the limit is ${MAX_PROMPT_BYTES}.` : ''}
-        </span>
-        <button type="button" className="button" onClick={send} disabled={!canSend}>
-          Send
-        </button>
+            paste into the wrong field explains itself. In the compact layout
+            the hint replaces the button rather than sitting beside it: a
+            refusal is the more important thing on screen. */}
+        {compact && tooLong ? (
+          <span className="prompt-bar__hint" aria-live="polite">
+            Too long: {bytes} bytes, the limit is {MAX_PROMPT_BYTES}.
+          </span>
+        ) : (
+          <>
+            <span className="prompt-bar__hint" aria-live="polite">
+              {tooLong ? `Too long: ${bytes} bytes, the limit is ${MAX_PROMPT_BYTES}.` : ''}
+            </span>
+            <button type="button" className="button" onClick={send} disabled={!canSend}>
+              Send
+            </button>
+          </>
+        )}
       </div>
     </div>
   )

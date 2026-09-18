@@ -117,12 +117,20 @@ func (r *fakeRepo) List(_ context.Context, filter ListFilter) ([]*Project, error
 		}
 		out = append(out, p.Clone())
 	}
-	// Name, then identifier, matching the SQLite ordering.
+	// Slot order, matching the SQLite ordering: pinned first by slot, then
+	// everything else by registration order.
 	sort.SliceStable(out, func(i, j int) bool {
-		if !strings.EqualFold(out[i].Name, out[j].Name) {
-			return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name)
+		left, right := out[i], out[j]
+		if (left.PinnedSlot == nil) != (right.PinnedSlot == nil) {
+			return left.PinnedSlot != nil
 		}
-		return out[i].ID < out[j].ID
+		if left.PinnedSlot != nil && *left.PinnedSlot != *right.PinnedSlot {
+			return *left.PinnedSlot < *right.PinnedSlot
+		}
+		if !left.CreatedAt.Equal(right.CreatedAt) {
+			return left.CreatedAt.Before(right.CreatedAt)
+		}
+		return left.ID < right.ID
 	})
 	return out, nil
 }
@@ -826,6 +834,155 @@ func TestGetRejectsAnUnknownIdentifier(t *testing.T) {
 	}
 	_, err = h.service.Get(context.Background(), unknown)
 	wantCode(t, err, CodeNotFound)
+}
+
+// ---------------------------------------------------------------------------
+// Workspace slots
+// ---------------------------------------------------------------------------
+
+func TestSetSlotPinsAndClearsAPin(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	p, err := h.service.Register(ctx, RegisterInput{HostPath: h.mkdir(t, "App")})
+	if err != nil {
+		t.Fatalf("Register returned an error: %v", err)
+	}
+	if p.PinnedSlot != nil {
+		t.Fatalf("PinnedSlot = %d on a new project, want nil", *p.PinnedSlot)
+	}
+
+	slot := 3
+	pinned, err := h.service.SetSlot(ctx, p.ID, &slot)
+	if err != nil {
+		t.Fatalf("SetSlot returned an error: %v", err)
+	}
+	if pinned.PinnedSlot == nil || *pinned.PinnedSlot != 3 {
+		t.Fatalf("SetSlot returned PinnedSlot = %v, want 3", pinned.PinnedSlot)
+	}
+
+	// The pin is stored, not just reported: a second read is a different
+	// question from the write that answered the first one.
+	stored, err := h.service.Get(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Get returned an error: %v", err)
+	}
+	if stored.PinnedSlot == nil || *stored.PinnedSlot != 3 {
+		t.Fatalf("Get returned PinnedSlot = %v after pinning, want 3", stored.PinnedSlot)
+	}
+
+	cleared, err := h.service.SetSlot(ctx, p.ID, nil)
+	if err != nil {
+		t.Fatalf("SetSlot(nil) returned an error: %v", err)
+	}
+	if cleared.PinnedSlot != nil {
+		t.Errorf("PinnedSlot = %d after clearing, want nil", *cleared.PinnedSlot)
+	}
+}
+
+func TestSetSlotAcceptsItsBoundsAndRefusesPastThem(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	p, err := h.service.Register(ctx, RegisterInput{HostPath: h.mkdir(t, "App")})
+	if err != nil {
+		t.Fatalf("Register returned an error: %v", err)
+	}
+
+	for _, slot := range []int{0, MaxSlot} {
+		if _, err := h.service.SetSlot(ctx, p.ID, &slot); err != nil {
+			t.Errorf("SetSlot(%d) returned an error: %v", slot, err)
+		}
+	}
+
+	for _, slot := range []int{-1, MaxSlot + 1} {
+		value := slot
+		_, err := h.service.SetSlot(ctx, p.ID, &value)
+		wantCode(t, err, CodeInvalidInput)
+		if got := detailOf(err, "pinnedSlot"); got != slot {
+			t.Errorf("SetSlot(%d) reported pinnedSlot detail %v, want %d", slot, got, slot)
+		}
+	}
+}
+
+func TestSetSlotReportsAnUnknownProject(t *testing.T) {
+	h := newHarness(t)
+	slot := 1
+
+	if _, err := h.service.SetSlot(context.Background(), "p_00000000000000000000", &slot); err == nil {
+		t.Fatal("SetSlot on an unknown project succeeded, want a failure")
+	} else {
+		wantCode(t, err, CodeNotFound)
+	}
+}
+
+// TestSetSlotRefusesAMalformedIdentifier checks the cheap rejection happens
+// before the lookup, so a caller cannot use this endpoint to probe the store
+// with arbitrary strings.
+func TestSetSlotRefusesAMalformedIdentifier(t *testing.T) {
+	h := newHarness(t)
+	slot := 1
+
+	_, err := h.service.SetSlot(context.Background(), "../../etc/passwd", &slot)
+	wantCode(t, err, CodeNotFound)
+}
+
+// TestSetSlotChangesNothingElse is the reason this is a narrow endpoint rather
+// than an update: pinning a project must not be a way to rewrite it.
+func TestSetSlotChangesNothingElse(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	p, err := h.service.Register(ctx, RegisterInput{HostPath: h.mkdir(t, "App"), Name: "Renamed"})
+	if err != nil {
+		t.Fatalf("Register returned an error: %v", err)
+	}
+
+	slot := 2
+	after, err := h.service.SetSlot(ctx, p.ID, &slot)
+	if err != nil {
+		t.Fatalf("SetSlot returned an error: %v", err)
+	}
+
+	if after.Name != p.Name || after.HostPath != p.HostPath || after.RuntimePath != p.RuntimePath {
+		t.Errorf("SetSlot changed the project: %+v -> %+v", p, after)
+	}
+	if after.Archived != p.Archived || !after.CreatedAt.Equal(p.CreatedAt) {
+		t.Errorf("SetSlot changed archived or createdAt: %+v -> %+v", p, after)
+	}
+	if !after.UpdatedAt.After(p.UpdatedAt) && !after.UpdatedAt.Equal(p.UpdatedAt) {
+		t.Errorf("UpdatedAt = %v, want it not to move backwards from %v", after.UpdatedAt, p.UpdatedAt)
+	}
+}
+
+// TestSetSlotDoesNotMutateWhatTheRepositoryHolds is the reason SetSlot clones
+// before it edits. A repository is free to hand back a pointer it still owns,
+// and editing that in place would pin a project even when the write fails.
+func TestSetSlotDoesNotMutateWhatTheRepositoryHolds(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	p, err := h.service.Register(ctx, RegisterInput{HostPath: h.mkdir(t, "App")})
+	if err != nil {
+		t.Fatalf("Register returned an error: %v", err)
+	}
+
+	storageErr := &Error{Code: CodeStorageFailure, Message: "could not store the project"}
+	h.repo.fail("update", storageErr)
+
+	slot := 4
+	if _, err := h.service.SetSlot(ctx, p.ID, &slot); !errors.Is(err, storageErr) {
+		t.Fatalf("SetSlot error = %v, want the storage failure unchanged", err)
+	}
+
+	h.repo.fail("", nil)
+	stored, err := h.service.Get(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Get returned an error: %v", err)
+	}
+	if stored.PinnedSlot != nil {
+		t.Errorf("PinnedSlot = %d after a failed write, want nil", *stored.PinnedSlot)
+	}
 }
 
 func TestListExcludesArchivedProjectsByDefault(t *testing.T) {

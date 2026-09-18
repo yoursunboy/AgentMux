@@ -757,7 +757,6 @@ func (c *Conn) subscriptionCount() int {
 // ---------------------------------------------------------------------------
 // Helpers
 
-
 // validProjectID reports whether a client-supplied identifier could name a
 // project.
 //

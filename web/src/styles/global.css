@@ -86,43 +86,52 @@ code {
 
 /* --- Layout ------------------------------------------------------------- */
 
+/* The page is the viewport, not a document that happens to be tall. A grid of
+   terminals has to divide a known height between its rows, and a page that grew
+   with its content could not: the terminals would each take whatever they
+   wanted and the panels would not line up.
+
+   dvh rather than vh, because a phone's browser chrome slides away and a
+   terminal sized for the taller viewport is a terminal whose bottom row is
+   under the toolbar. */
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100%;
+  height: 100dvh;
+  overflow: hidden;
 }
 
+/* The grid's column count is set inline by the component, from the same
+   breakpoints the layout hook reads, so the two cannot disagree. What is here
+   is the shape of a cell and how the rows divide.
+
+   grid-auto-rows with a floor is what makes the grid a monitoring view rather
+   than a squeeze: two rows share the height equally, and on a screen too short
+   for that the rows stop shrinking at a legible minimum and the grid scrolls
+   instead. */
 .workspace {
   flex: 1;
   display: grid;
   gap: var(--gap);
   padding: var(--gap);
-  /* Up to three panels per the UI spec: two project panels and the manager.
-     The grid collapses on its own at narrow widths. */
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(260px, 320px);
+  grid-auto-rows: minmax(var(--panel-min-height), 1fr);
   align-items: stretch;
   min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
 }
 
-/* Three panels need a desktop's width, and that is a higher bar than it looks:
-   two project panels side by side are each half of what is left after the
-   manager, and a terminal squeezed under about 600px is too narrow to run a
-   full-screen program in. Below this the second project panel is the thing to
-   give up, because a panel nobody can read is worth less than one that fits. */
-@media (max-width: 1280px) {
-  .workspace {
-    grid-template-columns: minmax(0, 1fr) minmax(240px, 300px);
-  }
+:root {
+  /* A panel below this height is a strip, not a terminal. See §7 of
+     docs/WORKSPACE.md for where the number comes from. */
+  --panel-min-height: 200px;
 }
 
-/* One panel per page on phones, and on a tablet held upright - an iPad in
-   portrait is 820px, where a project panel and the manager side by side would
-   leave the terminal around 470px, about sixty columns. Turned on its side the
-   same tablet has room for both, and gets them. */
-@media (max-width: 900px) {
-  .workspace {
-    grid-template-columns: minmax(0, 1fr);
-  }
+/* Focus is the same workspace with one cell in it: one column, one row, and
+   everything the grid's gaps would take goes to the terminal instead. */
+.workspace--focus {
+  grid-auto-rows: minmax(0, 1fr);
+  overflow: hidden;
 }
 
 /* --- Global bar --------------------------------------------------------- */
@@ -229,9 +238,23 @@ code {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-bottom: 1px solid var(--border);
+  /* A grid panel's header is one compact line. It is the difference between a
+     panel that shows a terminal and a panel that shows a header with a
+     terminal under it. */
+  min-height: 34px;
+  flex: 0 0 auto;
+}
+
+.panel--focus .panel__header,
+.panel--fullscreen .panel__header {
   min-height: 40px;
+  padding: 8px 10px;
+}
+
+.panel__back {
+  flex: 0 0 auto;
 }
 
 .panel__header-actions {
@@ -293,9 +316,15 @@ code {
 .panel__body {
   flex: 1;
   min-height: 0;
-  padding: 10px;
+  padding: 8px;
   display: flex;
   flex-direction: column;
+  gap: 8px;
+}
+
+.panel--focus .panel__body,
+.panel--fullscreen .panel__body {
+  padding: 10px;
   gap: 10px;
 }
 
@@ -326,20 +355,27 @@ code {
 .panel__footer {
   display: flex;
   gap: 6px;
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.panel--focus .panel__footer,
+.panel--fullscreen .panel__footer {
+  padding: 8px 10px;
 }
 
 .panel__footer--manager {
   justify-content: flex-end;
 }
 
-/* When the terminal is showing, the body scrolls rather than clipping: the
-   terminal has a definite height so that xterm has something to fit to, and a
-   short window would otherwise push the Prompt Bar out of a panel that hides
-   its overflow. */
+/* When the terminal is showing, the body is the terminal: it fills what the
+   panel has rather than scrolling. A grid panel's height comes from the grid
+   row, and a terminal that scrolled inside it would be a terminal whose bottom
+   rows are a scroll away - which is the one thing a monitoring view cannot
+   afford. Focus and full screen give it the same box, only larger. */
 .panel__body--terminal {
-  overflow-y: auto;
+  overflow: hidden;
 }
 
 .panel--manager .panel__body {
@@ -351,8 +387,9 @@ code {
 .panel__terminal {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-height: 0;
+  flex: 1;
 }
 
 .terminal__bar {
@@ -360,12 +397,16 @@ code {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  min-height: 24px;
+  min-height: 20px;
+  flex: 0 0 auto;
 }
 
 .terminal__state {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .terminal__state--open {
@@ -385,17 +426,15 @@ code {
   position: relative;
   display: flex;
   min-width: 0;
+  min-height: 0;
+  flex: 1;
 }
 
 .terminal__screen {
   flex: 1;
   min-width: 0;
-  /* A definite height is what xterm measures against. The viewport unit keeps
-     it useful on a tablet in landscape as well as on a desktop, and the floor
-     keeps a full-screen program legible in a short window. */
-  height: 52vh;
-  min-height: 240px;
-  padding: 6px 8px;
+  min-height: 0;
+  padding: 4px 6px;
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -869,4 +908,194 @@ code {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
+}
+
+/* --- Workspace pager ---------------------------------------------------- */
+
+/* Shown only when there is more than one page, so a workspace that fits on one
+   screen pays nothing for it. */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-raised);
+  flex: 0 0 auto;
+  /* The strip is the one place a sideways swipe changes page. See
+     WorkspacePager for why it is not available on the terminal itself. */
+  touch-action: pan-y;
+}
+
+.pager__count {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 4ch;
+  text-align: center;
+}
+
+/* --- Panel menu --------------------------------------------------------- */
+
+.panel-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.panel-menu__button {
+  padding: 3px 7px;
+  line-height: 1;
+}
+
+.panel-menu__list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  min-width: 200px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-menu__item {
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  padding: 7px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.panel-menu__item:hover:not(:disabled) {
+  background: var(--bg-sunken);
+}
+
+.panel-menu__item:disabled {
+  color: var(--text-faint);
+  cursor: not-allowed;
+}
+
+.panel-menu__item--danger {
+  color: var(--danger);
+}
+
+.panel-menu__separator {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
+}
+
+/* --- Placeholder actions ------------------------------------------------ */
+
+.panel__placeholder-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* A panel that failed to render says so in the same shape as one whose runtime
+   is stopped, because to the person looking at it they are the same kind of
+   news: this cell is not showing a terminal, and here is why. */
+.panel--failed .panel__placeholder-actions {
+  margin-top: 12px;
+}
+
+.button--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.button--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 80%, #000000);
+}
+
+/* --- Project list rows -------------------------------------------------- */
+
+.project-list__row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.project-list__slot {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.project-list__row .project-list__item {
+  flex: 1;
+  min-width: 0;
+}
+
+.project-list__actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
+.project-list__actions .button {
+  padding: 2px 6px;
+  line-height: 1.2;
+}
+
+.manager__count {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Compact Prompt Bar ------------------------------------------------- */
+
+/* The grid's shape: one line, no hint row competing with the send button. */
+.prompt-bar--compact {
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+
+.prompt-bar--compact .prompt-bar__input {
+  min-height: 30px;
+  padding: 5px 8px;
+  font-size: 13px;
+  resize: none;
+}
+
+.prompt-bar--compact .prompt-bar__actions {
+  gap: 6px;
+}
+
+.prompt-bar--compact .prompt-bar__hint {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.prompt-bar--compact .button {
+  padding: 5px 10px;
+  font-size: 13px;
+}
+
+.dialog__body p {
+  margin: 0 0 8px;
+}
+
+.dialog__body p:last-child {
+  margin-bottom: 0;
 }

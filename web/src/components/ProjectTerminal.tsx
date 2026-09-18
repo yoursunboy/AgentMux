@@ -1,12 +1,16 @@
 /**
- * A project's terminal and everything that has to be said about it.
+ * A project's terminal and what has to be said about it.
  *
- * The bar above the terminal is the part that matters. A terminal that has
+ * The strip above the terminal is the part that matters. A terminal that has
  * stopped printing and a terminal whose server has gone away look exactly the
- * same - both are a screen that is not changing - and the difference is the
+ * same - both are a screen that is not changing - and that difference is the
  * only thing a person needs in order to know whether to wait or to do
  * something. So the connection state is stated rather than left to be inferred
- * from the absence of output.
+ * from the absence of output, in every display mode including the grid.
+ *
+ * What the grid gives up is the Redraw button, not the state: a panel three
+ * hundred pixels tall spends its width on the sentence, and the action moves to
+ * the panel's menu where the other occasional actions live.
  */
 import { TerminalErrorCode } from '../terminal/protocol'
 import type { TerminalSession } from '../terminal/useTerminal'
@@ -42,7 +46,15 @@ function isRecoverable(error: { code: string } | null): boolean {
   return error.code === TerminalErrorCode.streamUnstable || error.code === TerminalErrorCode.internal
 }
 
-export function ProjectTerminal({ session }: { session: TerminalSession }) {
+interface ProjectTerminalProps {
+  session: TerminalSession
+  /** The terminal's text size, which is the one thing a display mode changes. */
+  fontSize: number
+  /** False in the grid, where the action lives in the panel's menu instead. */
+  showRedraw?: boolean
+}
+
+export function ProjectTerminal({ session, fontSize, showRedraw = true }: ProjectTerminalProps) {
   const connected = session.status.state === 'open'
   const busy = session.status.state === 'connecting' || session.status.state === 'reconnecting'
   const notice = session.ended
@@ -57,18 +69,20 @@ export function ProjectTerminal({ session }: { session: TerminalSession }) {
         <span className={`terminal__state terminal__state--${session.status.state}`}>
           {describeConnection(session)}
         </span>
-        <button
-          type="button"
-          className="button button--small"
-          onClick={session.askAgain}
-          disabled={busy}
-          title="Ask the server to send this terminal again from a fresh screen"
-        >
-          Redraw
-        </button>
+        {showRedraw && (
+          <button
+            type="button"
+            className="button button--small"
+            onClick={session.askAgain}
+            disabled={busy}
+            title="Ask the server to send this terminal again from a fresh screen"
+          >
+            Redraw
+          </button>
+        )}
       </div>
 
-      <TerminalView session={session} interactive={connected} />
+      <TerminalView session={session} interactive={connected} fontSize={fontSize} />
 
       {notice !== '' && (
         <div className="terminal__notice" role="status">

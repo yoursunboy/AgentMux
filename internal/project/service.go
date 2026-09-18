@@ -109,6 +109,58 @@ func (s *Service) Get(ctx context.Context, id string) (*Project, error) {
 	return s.withDerivedStatus(p), nil
 }
 
+// MaxSlot bounds a pinned workspace slot.
+//
+// The bound exists so that "put this project at position 999999" is refused
+// rather than stored. A slot index is what a page and a position are derived
+// from, and an unbounded index is a workspace with an unreachable page in it.
+// 200 is forty pages of five, which is well past the point where a grid of
+// terminals is a workspace rather than a list.
+const MaxSlot = 199
+
+// SetSlot pins a project to a workspace slot, or clears the pin when slot is
+// nil.
+//
+// This is the one piece of workspace layout the server owns, and it owns it
+// because it is the answer to a question two devices have to agree on: where
+// does this project live. Everything else about the workspace - which projects
+// a page is showing, which one has focus, where a terminal is scrolled, how
+// large its text is - is a property of one browser at one moment and is not
+// stored, here or anywhere else.
+//
+// Unpinning is not the same as pinning to the end. A project with no slot
+// takes the first position its own project list leaves free, which is what
+// makes "the order I registered them in" the default a new user sees.
+func (s *Service) SetSlot(ctx context.Context, id string, slot *int) (*Project, error) {
+	if !ValidID(id) {
+		return nil, newError(CodeNotFound, "no project with id %q", id)
+	}
+	if slot != nil && (*slot < 0 || *slot > MaxSlot) {
+		return nil, newError(CodeInvalidInput,
+			"a workspace slot must be between 0 and %d", MaxSlot).withDetail("pinnedSlot", *slot)
+	}
+
+	stored, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, mapNotFound(err, id)
+	}
+
+	// Clone before modifying: a repository is free to hand back a pointer it
+	// still holds, and the stored value must not be edited in place.
+	updated := stored.Clone()
+	updated.PinnedSlot = nil
+	if slot != nil {
+		value := *slot
+		updated.PinnedSlot = &value
+	}
+	updated.UpdatedAt = s.now().UTC()
+	if err := s.repo.Update(ctx, updated); err != nil {
+		return nil, err
+	}
+	s.log.Info("workspace slot changed", "projectId", updated.ID, "pinnedSlot", updated.PinnedSlot)
+	return s.withDerivedStatus(updated), nil
+}
+
 // RegisterInput describes an explicit registration of an existing directory.
 type RegisterInput struct {
 	// HostPath is the directory to register. Required.

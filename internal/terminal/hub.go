@@ -355,7 +355,6 @@ func (h *Hub) Close() error {
 	return nil
 }
 
-
 // canonicalSize reports the size the hub believes a project's terminal has.
 func (h *Hub) canonicalSize(projectID string) (size, bool) {
 	h.sizeMu.Lock()

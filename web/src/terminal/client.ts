@@ -140,6 +140,22 @@ export interface TerminalClientOptions {
 const PING_INTERVAL_MS = 30_000
 const PONG_TIMEOUT_MS = 10_000
 
+/**
+ * How long the socket survives with nothing subscribed to it.
+ *
+ * The rule this exists for is React's ordering rather than the network's. A
+ * workspace page change unmounts the panels that were showing and mounts the
+ * ones that will be, and React does the unmounting first - so for an instant
+ * nothing is subscribed, and a client that closed its socket on "the last
+ * release" closed it on every page change. Measured in a browser: paging from
+ * five panels to two dropped the WebSocket and opened another, and every
+ * terminal in the workspace flashed through Connecting on the way.
+ *
+ * A page that really has no terminals still ends up holding no connection; it
+ * just takes this much longer to get there, which nothing can observe.
+ */
+const IDLE_CLOSE_MS = 150
+
 /** WebSocket.OPEN, spelled out because a test double need not carry the class. */
 const SOCKET_OPEN = 1
 
@@ -175,6 +191,7 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
 
   let socket: WebSocket | null = null
   let status: ConnectionStatus = { state: 'idle', message: '', attempt: 0 }
+  let idleTimer: ReturnType<typeof setTimeout> | null = null
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null
   let pingTimer: ReturnType<typeof setInterval> | null = null
   let pongTimer: ReturnType<typeof setTimeout> | null = null
@@ -388,6 +405,29 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
     }
   }
 
+  /**
+   * keepAlive cancels a close that was only scheduled because nothing was
+   * subscribed for a moment - which is what a page change looks like.
+   */
+  function keepAlive(): void {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+
+  /** closeWhenIdle ends the connection once nothing has wanted it for a moment. */
+  function closeWhenIdle(): void {
+    keepAlive()
+    idleTimer = setTimeout(() => {
+      idleTimer = null
+      if (closed || wanted()) return
+      clearReconnect()
+      closeSocket()
+      setStatus('idle')
+    }, IDLE_CLOSE_MS)
+  }
+
   // -------------------------------------------------------------------------
   // Messages
 
@@ -557,6 +597,9 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
     if (size) registration.size = size
     if (!existing) registrations.set(projectId, registration)
 
+    // Something wants a terminal again, which is the common case after a page
+    // change replaced one set of panels with another.
+    keepAlive()
     resetIfGaveUp()
     connect()
     if (socket && socket.readyState === SOCKET_OPEN) {
@@ -605,11 +648,7 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
         registration.released = true
         registrations.delete(projectId)
         send({ type: Msg.unsubscribe, projectId })
-        if (!wanted()) {
-          clearReconnect()
-          closeSocket()
-          setStatus('idle')
-        }
+        if (!wanted()) closeWhenIdle()
       },
     }
   }
@@ -653,6 +692,7 @@ export function createTerminalClient(options: TerminalClientOptions = {}): Termi
     },
     close() {
       closed = true
+      keepAlive()
       clearReconnect()
       stopLiveness()
       const current = socket

@@ -159,6 +159,13 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/projects/register", s.handleRegisterProject)
 	mux.HandleFunc("GET /api/projects/{id}", s.handleGetProject)
 
+	// The one mutable field on a project: where it sits in the workspace. It is
+	// a PATCH on the project rather than a separate resource because it is a
+	// property of the project, and it is the only one this build lets a client
+	// change - see handleUpdateProject for why that is the whole of the
+	// endpoint.
+	mux.HandleFunc("PATCH /api/projects/{id}", s.handleUpdateProject)
+
 	// The runtime of one project. The operations are nested under the runtime
 	// because that is the resource they act on: the session is what is started,
 	// stopped, or removed, and a project is not.

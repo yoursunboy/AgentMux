@@ -37,3 +37,7 @@ docs/serverinfo.md
 # OS
 .DS_Store
 Thumbs.db
+
+# The end-to-end fixture description, written by web/e2e/run.mjs for one run
+# and true only of the machine that wrote it.
+web/e2e/fixtures.json

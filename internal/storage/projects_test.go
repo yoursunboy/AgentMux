@@ -22,6 +22,19 @@ func testProject(id, name, hostPath string) *project.Project {
 	}
 }
 
+// testProjectAt is testProject with a distinct registration time.
+//
+// Registration order is a project list's default order, and the list is sorted
+// by creation time, so a test about ordering needs projects that were created
+// at different moments. `order` is a day offset, which is enough to be strictly
+// increasing without spelling out a timestamp per project.
+func testProjectAt(id, name, hostPath string, order int) *project.Project {
+	p := testProject(id, name, hostPath)
+	p.CreatedAt = at(2026, time.September, order, 9)
+	p.UpdatedAt = p.CreatedAt
+	return p
+}
+
 func TestProjectStoreSatisfiesTheRepositoryContract(t *testing.T) {
 	// The compile-time assertion in projects.go is the real check; this makes
 	// the intent visible in the test suite as well.
@@ -284,17 +297,57 @@ func TestUpdateRejectsANilProject(t *testing.T) {
 	}
 }
 
-// TestListOrdersByNameThenID pins the ordering a client relies on: panels must
-// not reshuffle between refreshes.
-func TestListOrdersByNameThenID(t *testing.T) {
+// TestListOrdersByWorkspaceSlot pins the ordering the workspace grid is built
+// on.
+//
+// A pinned project comes before an unpinned one, pinned projects come in slot
+// order, and everything else follows in registration order. Name is
+// deliberately not part of it: two projects whose names sort next to each other
+// have no reason to sit next to each other on screen.
+func TestListOrdersByWorkspaceSlot(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
+	// Registration order is the creation order: Alpha, beta, zeta.
 	for _, p := range []*project.Project{
-		testProject("p_3", "zeta", "/data/zeta"),
-		testProject("p_1", "Alpha", "/data/alpha"),
-		testProject("p_2", "beta", "/data/beta"),
-		testProject("p_4", "Alpha", "/data/alpha-two"),
+		testProjectAt("p_1", "Alpha", "/data/alpha", 1),
+		testProjectAt("p_2", "zeta", "/data/zeta", 2),
+		testProjectAt("p_3", "beta", "/data/beta", 3),
+	} {
+		if err := store.Projects().Create(ctx, p); err != nil {
+			t.Fatalf("Create(%s) returned an error: %v", p.ID, err)
+		}
+	}
+
+	// beta is pinned to the front, zeta to the end.
+	pin(t, store, ctx, "p_3", 0)
+	pin(t, store, ctx, "p_2", 9)
+
+	got, err := store.Projects().List(ctx, project.ListFilter{})
+	if err != nil {
+		t.Fatalf("List returned an error: %v", err)
+	}
+
+	// beta (slot 0), then zeta (slot 9), then Alpha, which has no slot and is
+	// the oldest of the unpinned.
+	want := []string{"p_3", "p_2", "p_1"}
+	assertOrder(t, got, want)
+}
+
+// TestListKeepsUnpinnedProjectsInRegistrationOrder is the rule that makes a
+// grid of terminals usable: a project's position does not depend on its name,
+// on when it was last opened, or on anything that changes while the page is
+// open.
+func TestListKeepsUnpinnedProjectsInRegistrationOrder(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	// Registered in an order that is neither alphabetical nor reverse
+	// alphabetical, so a name sort would show up as a failure.
+	for _, p := range []*project.Project{
+		testProjectAt("p_c", "Charlie", "/data/c", 1),
+		testProjectAt("p_a", "alpha", "/data/a", 2),
+		testProjectAt("p_b", "Bravo", "/data/b", 3),
 	} {
 		if err := store.Projects().Create(ctx, p); err != nil {
 			t.Fatalf("Create(%s) returned an error: %v", p.ID, err)
@@ -305,17 +358,104 @@ func TestListOrdersByNameThenID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List returned an error: %v", err)
 	}
+	assertOrder(t, got, []string{"p_c", "p_a", "p_b"})
 
-	want := []string{"p_1", "p_4", "p_2", "p_3"}
+	// Opening a project is what last_opened_at records, and it must not move
+	// anything: the panel a person is looking at is where they left it.
+	opened, err := store.Projects().GetByID(ctx, "p_b")
+	if err != nil {
+		t.Fatalf("GetByID returned an error: %v", err)
+	}
+	when := at(2026, time.September, 18, 9)
+	opened.LastOpenedAt = &when
+	if err := store.Projects().Update(ctx, opened); err != nil {
+		t.Fatalf("Update returned an error: %v", err)
+	}
+
+	after, err := store.Projects().List(ctx, project.ListFilter{})
+	if err != nil {
+		t.Fatalf("List returned an error: %v", err)
+	}
+	assertOrder(t, after, []string{"p_c", "p_a", "p_b"})
+}
+
+// TestPinningMovesOneProjectAndLeavesTheRest keeps the two halves of the slot
+// model apart: a pinned slot is an absolute position, and the projects without
+// one close up behind it.
+func TestPinningMovesOneProjectAndLeavesTheRest(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	for _, p := range []*project.Project{
+		testProjectAt("p_1", "One", "/data/1", 1),
+		testProjectAt("p_2", "Two", "/data/2", 2),
+		testProjectAt("p_3", "Three", "/data/3", 3),
+	} {
+		if err := store.Projects().Create(ctx, p); err != nil {
+			t.Fatalf("Create(%s) returned an error: %v", p.ID, err)
+		}
+	}
+
+	// Pinning the last project to slot 0 puts it first without renumbering
+	// anybody: the others keep the order they already had.
+	pin(t, store, ctx, "p_3", 0)
+
+	got, err := store.Projects().List(ctx, project.ListFilter{})
+	if err != nil {
+		t.Fatalf("List returned an error: %v", err)
+	}
+	assertOrder(t, got, []string{"p_3", "p_1", "p_2"})
+
+	// Unpinning it puts it back where registration order says it belongs.
+	pin(t, store, ctx, "p_3", nil)
+	back, err := store.Projects().List(ctx, project.ListFilter{})
+	if err != nil {
+		t.Fatalf("List returned an error: %v", err)
+	}
+	assertOrder(t, back, []string{"p_1", "p_2", "p_3"})
+}
+
+// pin sets or clears a project's workspace slot.
+func pin(t *testing.T, store *Store, ctx context.Context, id string, slot any) {
+	t.Helper()
+	p, err := store.Projects().GetByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetByID(%s) returned an error: %v", id, err)
+	}
+	switch value := slot.(type) {
+	case nil:
+		p.PinnedSlot = nil
+	case int:
+		p.PinnedSlot = &value
+	default:
+		t.Fatalf("pin(%s): unsupported slot %v", id, slot)
+	}
+	if err := store.Projects().Update(ctx, p); err != nil {
+		t.Fatalf("Update(%s) returned an error: %v", id, err)
+	}
+}
+
+// assertOrder checks a listing against the identifiers it should hold, in
+// order, and names the position that differs when it does not.
+func assertOrder(t *testing.T, got []*project.Project, want []string) {
+	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("List returned %d projects, want %d", len(got), len(want))
 	}
 	for i, id := range want {
 		if got[i].ID != id {
-			t.Errorf("position %d is %q, want %q (names are ordered case-insensitively, then by identifier)",
-				i, got[i].ID, id)
+			t.Errorf("position %d is %q, want %q (list was %v)",
+				i, got[i].ID, id, projectIDs(got))
 		}
 	}
+}
+
+func projectIDs(projects []*project.Project) []string {
+	ids := make([]string, 0, len(projects))
+	for _, p := range projects {
+		ids = append(ids, p.ID)
+	}
+	return ids
 }
 
 func TestListHidesArchivedProjectsByDefault(t *testing.T) {

@@ -102,7 +102,11 @@ export function startServer({ runDir, repoDir, dataDir, port = PORT }) {
     `-web-dir "${repoDir}/web/dist" -log-level debug ` +
     `>> ${runDir}/server.log 2>&1`
 
-  const child = spawn('wsl', ['-d', DISTRO, '--', 'bash', '-lc', command], {
+  // `--exec` rather than the bare `--`, which is not the same thing: without it
+  // wsl.exe runs its command line through the distribution's default shell and
+  // expands it once on the way. The command below has no `$` in it today, which
+  // is the only reason it works; see the note on `wsl` in `lib/harness.mjs`.
+  const child = spawn('wsl', ['-d', DISTRO, '--exec', 'bash', '-lc', command], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, MSYS_NO_PATHCONV: '1' },

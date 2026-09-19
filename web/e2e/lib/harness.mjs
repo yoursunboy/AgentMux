@@ -47,10 +47,26 @@ export const sessionOf = (entry) => `amx-${entry.id}`
  * `|| true` throughout: almost everything these suites ask for is a read-only
  * probe, and a grep that finds nothing or a tmux that has gone away exits
  * non-zero. That is an answer, not a reason to throw.
+ *
+ * # `--exec`, and why every call to this needs it
+ *
+ * Without it, `wsl.exe` does not hand the script to the distribution as an
+ * argument. It joins its own command line into one string and runs that through
+ * the distribution's default shell, which expands it once on the way - so what
+ * arrives is not what was sent. Measured, with `p=hello; echo "p=[$p]"`: `$p`
+ * arrives empty, `$HOME` arrives expanded, `$$` arrives as that shell's own
+ * pid, and quoting does not help, because the expansion happens before the
+ * quotes are read. `--exec` execs the program directly and the string arrives
+ * as written.
+ *
+ * It is worth knowing because the failure is silent and reads as success. The
+ * `sessionAlive` below was written as `... has-session ...; echo $?`, and its
+ * `$?` was expanded before bash ran anything: it answered `0` for every
+ * session, including ones that did not exist. Nothing about it looked wrong.
  */
 export function wsl(script, input) {
   try {
-    return execFileSync('wsl', ['-d', DISTRO, 'bash', '-lc', `${script} || true`], {
+    return execFileSync('wsl', ['-d', DISTRO, '--exec', 'bash', '-lc', `${script} || true`], {
       encoding: 'utf8',
       input,
       env: { ...process.env, MSYS_NO_PATHCONV: '1' },
@@ -88,7 +104,7 @@ export function startServer() {
 /** wslAsync is `wsl` without blocking the event loop, for a long command. */
 export function wslAsync(script) {
   return new Promise((resolve) => {
-    const child = spawn('wsl', ['-d', DISTRO, 'bash', '-lc', `${script} || true`], {
+    const child = spawn('wsl', ['-d', DISTRO, '--exec', 'bash', '-lc', `${script} || true`], {
       env: { ...process.env, MSYS_NO_PATHCONV: '1' },
     })
     let out = ''

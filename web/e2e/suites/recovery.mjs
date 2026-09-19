@@ -53,7 +53,10 @@ function check(name, ok, detail) {
 // nothing or a curl that cannot connect exits non-zero. That is an answer, not
 // a reason to throw.
 function wsl(script) {
-  return execFileSync('wsl', ['-d', 'Ubuntu-24.04', 'bash', '-lc', `${script} || true`], {
+  // `--exec` matters: without it wsl.exe runs its command line through the
+  // distribution's default shell, which expands the script once on the way.
+  // See the note on `wsl` in lib/harness.mjs.
+  return execFileSync('wsl', ['-d', 'Ubuntu-24.04', '--exec', 'bash', '-lc', `${script} || true`], {
     encoding: 'utf8',
     env: { ...process.env, MSYS_NO_PATHCONV: '1' },
   })

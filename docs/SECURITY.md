@@ -243,6 +243,21 @@ deliberately **not** published by any endpoint: an identifier that is stable
 across every request from a machine is a tracking token whether or not it is
 called a credential.
 
+### 5.1 Nothing in the repository either
+
+The rule is kept outside the schema as well. No credential is stored anywhere in
+this repository: not in source, not in `config.json`, not in `.env`, not in a
+test fixture, and not in a shell or PowerShell script. Where a connection needs
+one, it is entered interactively at the moment it is needed and is not written
+down afterwards. The local note that names the runtime test machine
+(`docs/serverinfo.md`) gives the host, the account and the authentication method,
+and says that authentication is interactive — which is the whole of it.
+
+That file is in `.gitignore` because it names a machine, not because it holds a
+credential; it holds none. The distinction matters in both directions: ignoring
+a file is not what makes it safe, and a file worth ignoring is still governed by
+the rule above.
+
 ## 6. What it never logs
 
 Every log record carries four things and no more: a **timestamp**, a **level**, a

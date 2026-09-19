@@ -312,3 +312,24 @@ up again rather than giving up on it (`CLAUDE_ATTEMPTS` in `web/e2e/run.mjs`),
 which is what turns most of these into a slower green run: the retry shows in the
 run's own output as `attempt 1 did not come up` followed by the project coming up
 on the next one. What it cannot fix is a host that will not keep both.
+
+**The terminal suite's scroll-back check was measuring the machine rather than
+the terminal.** It types `seq 1 200` into the session, waited a fixed 1500ms, and
+then scrolled up with the wheel to assert that the way back to the bottom is
+offered. 1500ms is several times the round trip on an idle machine and
+occasionally not enough on one running five other suites, and the failure that
+produced was a thirty-second wait for an element that could not appear: with a
+buffer no taller than the screen there is nothing above the viewport, so the
+wheel scrolls nowhere and the indicator is *correctly* absent. It now waits for
+the buffer to hold more lines than the terminal can show — the condition the
+wheel actually needs, and one this run's own numbers put at 186 lines of
+scrollback against a 45-row screen — and reports the viewport, the pty size, the
+buffer length, the scroll position and the age of the last paint and the last
+output when they do not arrive.
+
+Those numbers are printed before and after the wheel on every run, not only on
+failure, so a failure that does reappear names which of the three it is: output
+that never arrived, output that arrived and was not painted, or a wheel that
+never moved the viewport. It also counts the terminals on the page, because the
+fourth possibility — this section measuring a different terminal from the one it
+typed into — is the one the other three would otherwise be mistaken for.

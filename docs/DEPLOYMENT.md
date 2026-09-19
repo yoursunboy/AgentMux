@@ -536,6 +536,12 @@ account and the loopback bind do and do not protect, §2 on the absent
 credentials, §4 on what the API deliberately does not report, and §7 on exactly
 what debug mode adds.
 
+The same holds for the repository and for the machine you deploy from: nothing
+in this tree stores a credential, and the one local note that names a machine —
+`docs/serverinfo.md`, the runtime test host — carries a host, an account and the
+statement that authentication is interactive, and is in `.gitignore` besides.
+`docs/SECURITY.md` §5.1 is the full statement.
+
 ## 7. Running it
 
 ```sh

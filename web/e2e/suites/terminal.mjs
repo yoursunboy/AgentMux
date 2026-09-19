@@ -38,7 +38,10 @@ function check(name, ok, detail) {
 }
 
 function wsl(script) {
-  return execFileSync('wsl', ['-d', 'Ubuntu-24.04', 'bash', '-lc', script], {
+  // `--exec` matters: without it wsl.exe runs its command line through the
+  // distribution's default shell, which expands the script once on the way.
+  // See the note on `wsl` in lib/harness.mjs.
+  return execFileSync('wsl', ['-d', 'Ubuntu-24.04', '--exec', 'bash', '-lc', script], {
     encoding: 'utf8',
     env: { ...process.env, MSYS_NO_PATHCONV: '1' },
   })
@@ -87,6 +90,142 @@ async function renderedLines(page) {
   return (await rendered(page)).split('\n').filter((line) => line.trim() !== '')
 }
 
+/**
+ * watchPaint records when xterm last painted, from inside the page.
+ *
+ * The distinction this exists for is the one between output arriving and
+ * output being drawn, and nothing outside the page can see it: a frame on the
+ * wire is timed by the test, and the moment its bytes reach a row is timed
+ * here. It watches the rows rather than the screen so that a repaint of an
+ * unchanged terminal is not counted as output.
+ */
+async function watchPaint(page) {
+  await page.evaluate(() => {
+    if (window.__amxPaint) return
+    window.__amxPaint = { renders: 0, lastRenderAt: 0 }
+    new MutationObserver((records) => {
+      for (const record of records) {
+        const target = record.target
+        const element = target instanceof Element ? target : target.parentElement
+        if (element && element.closest('.xterm-rows')) {
+          window.__amxPaint.renders++
+          window.__amxPaint.lastRenderAt = Date.now()
+          return
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true, characterData: true })
+  })
+}
+
+/**
+ * bufferShape is what the terminal holds and where its viewport is, from the
+ * DOM alone - cheap enough to poll while waiting for output to arrive.
+ *
+ * xterm keeps its buffer behind an object nothing in the DOM reaches, so these
+ * numbers are reconstructed rather than read: `.xterm-viewport` is xterm's own
+ * scrolling element, and its scrollHeight is the whole buffer times one row's
+ * height. Derived figures are worth distrusting, but these are the ones the
+ * wheel itself acts on, and the question a failure asks - was there anything to
+ * scroll, and did it move - is not a subtle one.
+ *
+ * `panels` and `screens` are here for the case where the answer is that this
+ * section typed into a terminal other than the one it measured.
+ */
+async function bufferShape(page) {
+  return page.evaluate(() => {
+    const viewport = document.querySelector('.xterm-viewport')
+    const rows = Array.from(document.querySelectorAll('.xterm-rows > div'))
+    const paint = window.__amxPaint ?? { renders: 0, lastRenderAt: 0 }
+    const cell = rows.length > 0 ? rows[0].getBoundingClientRect().height : 0
+    return {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      rows: rows.length,
+      cell,
+      lines: cell && viewport ? Math.round(viewport.scrollHeight / cell) : 0,
+      viewportY: cell && viewport ? Math.round(viewport.scrollTop / cell) : 0,
+      scrollTop: viewport ? Math.round(viewport.scrollTop) : null,
+      scrollHeight: viewport ? viewport.scrollHeight : null,
+      clientHeight: viewport ? viewport.clientHeight : null,
+      paints: paint.renders,
+      sincePaint: paint.lastRenderAt ? Date.now() - paint.lastRenderAt : null,
+      panels: Array.from(document.querySelectorAll('.panel--project')).map((p) =>
+        p.getAttribute('data-project-id'),
+      ),
+      screens: document.querySelectorAll('.xterm-screen').length,
+      showing: rows
+        .map((row) => row.textContent.replace(/\s+$/, ''))
+        .filter(Boolean)
+        .slice(-2),
+    }
+  })
+}
+
+/**
+ * scrollState is everything the scroll check depends on, in one line.
+ *
+ * The pty's own size comes from tmux rather than from the browser, because the
+ * browser's idea of how many columns fit and the server's are two different
+ * claims, and this is the one the program inside is actually drawn against.
+ */
+async function scrollState(page, frames) {
+  const shape = await bufferShape(page)
+  const pty = paneSize(SHELL)
+  const lastIn = [...frames].reverse().find((frame) => frame.dir === 'in')
+  const sinceOutput = lastIn?.t ? Date.now() - lastIn.t : null
+
+  return (
+    `viewport ${shape.width}x${shape.height} | pty ${pty} | rows ${shape.rows} | ` +
+    `buffer ${shape.lines} lines (baseY ${shape.lines - shape.rows}, viewportY ${shape.viewportY}) | ` +
+    `scroll ${shape.scrollTop}px of ${shape.scrollHeight}px, ${shape.clientHeight}px visible | ` +
+    `painted ${shape.paints} (last ${shape.sincePaint}ms ago) | last output ${sinceOutput}ms ago | ` +
+    `${shape.screens} screen(s) for ${shape.panels.length} panel(s) | ` +
+    `showing ${JSON.stringify(shape.showing)}`
+  )
+}
+
+/**
+ * waitForScrollback waits until the terminal holds more lines than it can show.
+ *
+ * That is the precondition the wheel has: with a buffer no taller than the
+ * screen there is nothing above the viewport to scroll into, no scroll event,
+ * and no way back to offer - so the check below would be asking the indicator
+ * to appear for a scroll that could not happen. Waiting for the buffer rather
+ * than for a number of milliseconds is the difference between measuring the
+ * terminal and measuring the machine it is running on.
+ *
+ * Returns the shape it settled on, or null if the lines never arrived.
+ */
+async function waitForScrollback(page, wanted, timeout = 20_000) {
+  const deadline = Date.now() + timeout
+  for (;;) {
+    const shape = await bufferShape(page)
+    if (shape.lines - shape.rows >= wanted) return shape
+    if (Date.now() >= deadline) return null
+    await page.waitForTimeout(100)
+  }
+}
+
+/**
+ * indicatorLabel is the way-back button's text, or null if it is not there.
+ *
+ * Bounded and explicit rather than left to the locator's default: asking a
+ * locator for its text waits thirty seconds for the element to show up, which
+ * turns "the indicator did not appear" into a half-minute stall and then says
+ * nothing about why. The scroll event, the state update and the render that
+ * produce this button are milliseconds apart, so five seconds is not a close
+ * call - and a missing indicator is now a result the check can report on.
+ */
+async function indicatorLabel(page, timeout = 5000) {
+  const button = page.locator('.terminal__more')
+  try {
+    await button.waitFor({ state: 'attached', timeout })
+  } catch {
+    return null
+  }
+  return ((await button.textContent()) ?? '').trim()
+}
+
 function normalize(text) {
   return text
     .split('\n')
@@ -108,11 +247,15 @@ async function openPage(browser, project, options = {}) {
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()))
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`))
   page.on('websocket', (socket) => {
-    socket.on('framesent', (f) => frames.push({ dir: 'out', payload: f.payload }))
-    socket.on('framereceived', (f) => frames.push({ dir: 'in', payload: f.payload }))
+    // Stamped, because "the bytes arrived" and "the screen shows them" are two
+    // different moments and the scroll check can only be diagnosed by telling
+    // them apart.
+    socket.on('framesent', (f) => frames.push({ dir: 'out', payload: f.payload, t: Date.now() }))
+    socket.on('framereceived', (f) => frames.push({ dir: 'in', payload: f.payload, t: Date.now() }))
   })
 
   await page.goto(URL, { waitUntil: 'domcontentloaded' })
+  await watchPaint(page)
   // This suite is about one terminal and what it draws, so the workspace is
   // narrowed to that project: at 1440px a three-column grid puts five terminals
   // on the page, and `.xterm-rows` would then be five terminals' worth of rows.
@@ -476,10 +619,26 @@ async function main() {
 
   // ---------------------------------------------------------------- G. scroll
   {
-    const { context, page } = await openPage(browser, SHELL)
+    const { context, page, frames } = await openPage(browser, SHELL)
     await freshPrompt(page)
     await typeInTerminal(page, 'seq 1 200\r')
-    await page.waitForTimeout(1500)
+
+    // The 200 lines are what the wheel has to scroll into, so this waits for
+    // them rather than for a number of milliseconds. A fixed 1500ms was here,
+    // and it is the whole of this check's flakiness: on an idle machine that is
+    // several times the round trip, and on a machine running the other five
+    // suites it is occasionally not enough - after which the wheel has nothing
+    // above the viewport to scroll into, no indicator can appear for a scroll
+    // that did not happen, and the failure reads as a defect in the indicator
+    // rather than as a slow machine.
+    const filled = await waitForScrollback(page, 100)
+    check(
+      'the session has produced enough to scroll back through',
+      filled !== null,
+      filled
+        ? `${filled.lines} lines in a ${filled.rows}-row terminal`
+        : `nothing to scroll after 20s: ${await scrollState(page, frames)}`,
+    )
 
     const indicatorBefore = await page.locator('.terminal__more').count()
     check('nothing is offered while the view is at the bottom', indicatorBefore === 0, '')
@@ -491,25 +650,33 @@ async function main() {
     await typeInTerminal(page, '(for i in $(seq 1 40); do echo live-$i; sleep 0.25; done &)\r')
     await page.waitForTimeout(1000)
 
+    // Printed whether or not what follows passes. The check it belongs to has
+    // failed by not finding an element, which on its own says nothing about
+    // why: this line is the difference between the buffer never filling, the
+    // wheel never moving it, and this section having measured a different
+    // terminal from the one it typed into.
+    console.log(`    [scroll] before the wheel: ${await scrollState(page, frames)}`)
+
     await page.mouse.move(400, 400)
     await page.mouse.wheel(0, -1500)
     await page.waitForTimeout(400)
 
     const scrolledTop = (await renderedLines(page))[0]
-    const labelAfterScroll = (await page.locator('.terminal__more').textContent()) ?? ''
+    const labelAfterScroll = await indicatorLabel(page)
+    console.log(`    [scroll] after the wheel:  ${await scrollState(page, frames)}`)
     check(
       'scrolling up offers a way back',
-      /Jump to latest|New output/.test(labelAfterScroll),
-      labelAfterScroll.trim(),
+      /Jump to latest|New output/.test(labelAfterScroll ?? ''),
+      labelAfterScroll ?? `no indicator appeared: ${await scrollState(page, frames)}`,
     )
 
     await page.waitForTimeout(2500)
-    const labelAfterOutput = (await page.locator('.terminal__more').textContent()) ?? ''
+    const labelAfterOutput = await indicatorLabel(page)
     const topAfterOutput = (await renderedLines(page))[0]
     check(
       'output that arrives while scrolled up is announced, not followed',
-      /New output/.test(labelAfterOutput),
-      labelAfterOutput.trim(),
+      /New output/.test(labelAfterOutput ?? ''),
+      labelAfterOutput ?? `no indicator appeared: ${await scrollState(page, frames)}`,
     )
     check(
       'new output does not yank the viewport to the bottom',

@@ -25,6 +25,24 @@
  *
  * Nothing it creates is inside the repository: the run directory is temporary
  * and removed at the end. `--keep` is the exception, and it says where.
+ *
+ * # When it is interrupted
+ *
+ * Ctrl-C, a SIGTERM from a task manager, a hung suite killed by hand: each of
+ * them arrives while fixtures exist, and the default answer to any of them is
+ * to stop where it stands - which leaves seven tmux servers, a server process
+ * and a temporary directory behind.
+ *
+ * The next run then starts on top of them, and does not see them. `provision`
+ * removes the run directory, which takes the socket files with it and leaves
+ * the servers running with nothing on disk to name them by, so they cannot be
+ * found by looking where they were made. Measured in Phase 6.5: 107 such
+ * servers had accumulated across a phase of interrupted runs, none of them
+ * visible in the directory that was supposed to hold them.
+ *
+ * So the signals are handled. The runtimes go through the API; whatever the API
+ * cannot reach is ended by socket and by process; what survives that is
+ * reported at the end rather than deleted on a guess.
  */
 import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
@@ -46,9 +64,31 @@ import {
  *
  * Spelled here rather than imported from the harness, because the harness reads
  * the fixture description at load time and this file runs before there is one.
+ *
+ * # `--exec`, and why every call to this needs it
+ *
+ * Without it, `wsl.exe` does not hand the script to the distribution as an
+ * argument. It joins its own command line into one string and runs that through
+ * the distribution's default shell, which expands it once on the way - so what
+ * arrives is not what was sent. Measured, with `p=hello; echo "p=[$p]"`:
+ * `$p` arrives empty, because the shell in between had no `p`; `$HOME` arrives
+ * expanded to the distribution's home directory; `$$` arrives as that shell's
+ * own pid; and quoting does not help, because the expansion happens before the
+ * quotes are read. `--exec` execs the program directly, and the string arrives
+ * as written.
+ *
+ * It is written down here because the failure is silent and reads as success.
+ * `... has-session ...; echo $?` was in this repository in three places; the
+ * `$?` was being expanded to the intermediate shell's status before bash ever
+ * ran the command, so the answer was `0` every time, including for a session
+ * that did not exist. Three checks passed on a value that never depended on
+ * what they were checking.
+ *
+ * The same trap is why `copyIntoWSL` and the suites' typing helpers put their
+ * payloads through stdin rather than in an argument.
  */
 function wsl(script, input) {
-  const result = spawnSync('wsl', ['-d', DISTRO, 'bash', '-lc', script], {
+  const result = spawnSync('wsl', ['-d', DISTRO, '--exec', 'bash', '-lc', script], {
     encoding: 'utf8',
     input,
     env: { ...process.env, MSYS_NO_PATHCONV: '1' },
@@ -78,6 +118,51 @@ const CLAUDE_START_TIMEOUT_MS = 40_000
 
 /** The socket of a fixture project's tmux session, before there is a fixture object. */
 const sockOf = (entry) => `${RUN_DIR}/data/tmux/${entry.id}.sock`
+
+/**
+ * What the run has made and has not yet unmade.
+ *
+ * Kept here rather than on the fixture object because the moment it matters
+ * most is the one where no fixture object exists: a signal during `provision`,
+ * before the thing the suites are handed has been built. Projects are recorded
+ * here as each one is registered rather than once the fixture is complete, so
+ * an interrupted provisioning is left holding a list to clean up rather than
+ * nothing to clean up.
+ */
+const state = {
+  /** `{name, id, socket}` for every project this run has registered. */
+  projects: [],
+  /** The suite process, while one is running. */
+  child: null,
+  /**
+   * The cleanup currently in flight, if any.
+   *
+   * A signal can arrive while a suite's own teardown is already running. A
+   * second caller is handed this promise instead of starting a second cleanup,
+   * which is what makes teardown re-entrant rather than merely repeatable.
+   */
+  cleaning: null,
+  /** Cleanup finished and the run directory is gone, so the fallback must not fire. */
+  cleaned: false,
+  /** The run was asked to keep its last fixture; nothing may end that one. */
+  keeping: false,
+  /** A signal has been seen, so the suite loop must not start another fixture. */
+  interrupted: false,
+  /** How many signals have arrived. The second one stops waiting for the first. */
+  signals: 0,
+  /**
+   * The runtimes the API could not destroy, across every teardown in the run.
+   *
+   * Kept after `teardown` has finished with them, because the decision they
+   * drive - whether the synchronous fallback is needed - belongs to the end of
+   * the run rather than to the teardown that recorded them.
+   */
+  failures: [],
+  /** What the process should exit with. 130 for SIGINT, 143 for SIGTERM. */
+  exitCode: 1,
+  /** The survey has been printed, so a second caller does not print it again. */
+  surveyed: false,
+}
 
 /** startClaude types the CLI into a project's session, at its shell prompt. */
 function startClaude(entry) {
@@ -210,21 +295,33 @@ function copyIntoWSL(windowsPath, wslPath) {
 }
 
 /**
+ * portHolder is the pid listening on the run's port, or null if it is free.
+ *
+ * Split out of `stopServer` because the survey asks the same question at the
+ * end of a run, and because the answer is the only one that is reliable here:
+ * `pkill -f` matches a command line, and a pattern one character off silently
+ * kills nothing - measured, with a pattern that looked right and matched no
+ * process at all.
+ */
+function portHolder() {
+  const listening = wsl(
+    `(ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep ":${PORT} " || true`,
+  )
+  return /pid=(\d+)/.exec(listening)?.[1] ?? /\s(\d+)\//.exec(listening)?.[1] ?? null
+}
+
+/**
  * stopServer ends whatever is holding the port.
  *
- * Two ways, because one is not enough. `pkill -f` matches a command line, and a
- * pattern that is one character off silently kills nothing - measured, with a
- * pattern that looked right and matched no process at all. The port is the fact
- * that matters, so it is asked directly and whatever holds it is killed by pid.
+ * Two ways, because one is not enough: the pattern, which catches the server
+ * this run started, and the port itself, which catches anything else that got
+ * there first.
  */
 async function stopServer() {
   wsl('pkill -f "agentmux-e2e/agentmux-server"')
   await sleep(300)
 
-  const listening = wsl(
-    `(ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep ":${PORT} " || true`,
-  )
-  const pid = /pid=(\d+)/.exec(listening)?.[1] ?? /\s(\d+)\//.exec(listening)?.[1]
+  const pid = portHolder()
   if (pid) {
     wsl(`kill ${pid}`)
     await sleep(500)
@@ -263,16 +360,30 @@ async function waitForHttp(url, timeoutMs) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
-/** api calls the server, failing loudly on a non-JSON or failing answer. */
+/**
+ * api calls the server, failing loudly on a non-JSON or failing answer.
+ *
+ * A refused connection is wrapped rather than left as Node's bare "fetch
+ * failed", because the caller that matters is the cleanup path: a server that
+ * died mid-suite is exactly the case where seven runtimes cannot be destroyed
+ * through it, and `POST /api/projects/p_x/runtime failed: connect ECONNREFUSED`
+ * says which call and which address, where `fetch failed` says neither.
+ */
 async function api(pathname, init = {}) {
-  const response = await fetch(`${SERVER_URL}/api${pathname}`, {
-    ...init,
-    headers: init.body ? { 'Content-Type': 'application/json' } : undefined,
-  })
+  const method = init.method ?? 'GET'
+  let response
+  try {
+    response = await fetch(`${SERVER_URL}/api${pathname}`, {
+      ...init,
+      headers: init.body ? { 'Content-Type': 'application/json' } : undefined,
+    })
+  } catch (error) {
+    throw new Error(`${method} /api${pathname}: ${error.cause?.message ?? error.message}`)
+  }
   const text = await response.text()
   const body = text.trim() === '' ? {} : JSON.parse(text)
   if (!response.ok) {
-    throw new Error(`POST ${pathname} failed with ${response.status}: ${text}`)
+    throw new Error(`${method} /api${pathname} failed with ${response.status}: ${text}`)
   }
   return body
 }
@@ -286,6 +397,14 @@ async function api(pathname, init = {}) {
  * cannot reach.
  */
 async function provision() {
+  // The suite before this one has been torn down by the time this runs, so its
+  // record is finished with. Forgetting it here - rather than in `teardown` -
+  // is what lets a signal during *this* provisioning clean up this run and not
+  // the one that came before it.
+  state.projects = []
+  state.cleaning = null
+  state.cleaned = false
+
   wsl(`rm -rf ${RUN_DIR} && mkdir -p ${RUN_DIR}/root ${RUN_DIR}/data`)
 
   // A short control grace, for two checks in the controller suite.
@@ -327,7 +446,14 @@ async function provision() {
       method: 'POST',
       body: JSON.stringify({ hostPath: `${RUN_DIR}/root/${fixture.name}` }),
     })
-    projects.push({ ...fixture, id: created.project.id })
+    const entry = { ...fixture, id: created.project.id, socket: sockOf(created.project) }
+    // Recorded here, before the runtime is started rather than after. A signal
+    // between these two lines arrives with a project that exists and a runtime
+    // that does not - and a DELETE of a runtime that was never started is a
+    // request the API answers with the stopped runtime it already has, so
+    // recording early costs nothing and leaves nothing unregistered.
+    state.projects.push(entry)
+    projects.push(entry)
   }
 
   // Every runtime is started, and each one is given a workspace slot in the
@@ -369,7 +495,7 @@ async function provision() {
     dataDir: `${RUN_DIR}/data`,
     repoDir: REPO_DIR,
     distro: DISTRO,
-    projects: projects.map((entry) => ({ ...entry, socket: `${RUN_DIR}/data/tmux/${entry.id}.sock` })),
+    projects,
   }
   // Written for a person to read while debugging, and pointed at through the
   // environment for the suites, which is what makes them runnable one at a time
@@ -387,18 +513,284 @@ async function provision() {
  * so the tmux servers go with them; the server is then killed and its directory
  * removed. A run that left seven tmux servers behind would be a run the next
  * one has to clean up after.
+ *
+ * # Called twice, and on purpose
+ *
+ * A signal can arrive while a suite's own teardown is already running, so this
+ * has to be safe to call from two places at once and to do the work once.
+ *
+ * The project list is emptied before anything is destroyed - `splice(0)` hands
+ * the caller the entries and leaves none - so a second call finds nothing to do
+ * rather than issuing the same seven DELETEs a second time. A caller that
+ * arrives while a cleanup is still in flight is handed the promise for the one
+ * already running. Destroying a runtime that is already gone is not an error
+ * even without that: the API reports a never-started runtime as stopped, and a
+ * DELETE of one answers with that same stopped runtime.
+ *
+ * # Failures are reported, never swallowed
+ *
+ * This used to catch the DELETE and say nothing, on the reading that a runtime
+ * which is already gone is the state being asked for. It is - but the same
+ * catch also hid the case where the server had died, which is the case where
+ * none of the seven can be destroyed, all seven tmux servers keep running, and
+ * the run directory is about to be deleted out from under them. That is the
+ * leak this file now exists to prevent, and it happened silently.
+ *
+ * So a failure names the project, the runtime and what the call said. There is
+ * no separate runtime id to print: a runtime is addressed as
+ * `/projects/{id}/runtime` and has no identity of its own, so the three things
+ * that name it are the project it belongs to, the session in the backend and
+ * the socket that session is on.
  */
-async function teardown(fixtures) {
-  for (const entry of fixtures.projects) {
-    try {
-      await api(`/projects/${entry.id}/runtime`, { method: 'DELETE' })
-    } catch {
-      // A project whose runtime is already gone is the state being asked for.
+async function teardown(reason) {
+  if (state.cleaning) return state.cleaning
+
+  state.cleaning = (async () => {
+    const failures = []
+    for (const entry of state.projects.splice(0)) {
+      try {
+        await api(`/projects/${entry.id}/runtime`, { method: 'DELETE' })
+      } catch (error) {
+        failures.push({ entry, error })
+      }
     }
-  }
-  await stopServer()
-  wsl(`rm -rf ${RUN_DIR}`)
+
+    await stopServer()
+    wsl(`rm -rf ${RUN_DIR}`)
+
+    // Recorded on the run, not only printed: whether the fallback is needed at
+    // the end of the run is decided by whether anything is in here.
+    state.failures.push(...failures)
+
+    if (failures.length > 0) {
+      console.log(`\n  cleanup could not reach ${failures.length} runtime(s) (${reason}):`)
+      for (const { entry, error } of failures) {
+        console.log(`    project id   ${entry.id}  (${entry.name})`)
+        console.log(`    runtime      amx-${entry.id}  on ${entry.socket}`)
+        console.log(`    cleanup err  ${error.message}`)
+      }
+      console.log('  their tmux servers are named again at the end of the run.')
+    }
+  })()
+
+  return state.cleaning
 }
+
+/**
+ * hardStop ends the run without waiting for anything.
+ *
+ * # Why it is synchronous
+ *
+ * It runs from the `exit` handler, where an `await` would never be reached -
+ * the process is already on its way out - so every step here is a blocking
+ * `spawnSync` through the same `wsl` helper the rest of the file uses.
+ *
+ * # Why it exists at all, given teardown
+ *
+ * Because the API teardown is the path that is unavailable exactly when it is
+ * needed. A server that died mid-suite cannot destroy the runtimes it was
+ * managing, and a tmux server whose socket file has been removed cannot be
+ * found by its socket or by the API - which is how the Phase 6.5 leak worked:
+ * the socket files went with `rm -rf`, and the servers kept running with
+ * nothing left to name them by. So this looks for them by process as well.
+ *
+ * # What it will not touch
+ *
+ * It never runs `pkill tmux` or `killall tmux`, and it never uses the default
+ * tmux socket. Whoever is running this has tmux sessions of their own on this
+ * machine, and a pattern wide enough to be convenient is a pattern that ends
+ * work this run has no business ending. Every kill below names either a socket
+ * path inside the run's own directory or a process whose command line contains
+ * one.
+ */
+function hardStop({ quiet = false } = {}) {
+  if (state.keeping) {
+    // Not a failure and not a fallback: the person asked for the fixture to
+    // stay, and ending it here would be doing the opposite of what they said.
+    state.cleaned = true
+    if (!quiet) console.log('  --keep: the fixture is left up, as asked')
+    return
+  }
+
+  if (state.child && state.child.exitCode === null && state.child.signalCode === null) {
+    // First, because it holds a browser and is driving a fixture that is about
+    // to stop existing.
+    state.child.kill('SIGKILL')
+  }
+
+  wsl(
+    [
+      '# The runtimes, by socket, for the servers whose socket file is still there.',
+      `for s in ${RUN_DIR}/data/tmux/*.sock; do`,
+      '  [ -S "$s" ] || continue',
+      '  tmux -S "$s" kill-server 2>/dev/null',
+      'done',
+      '',
+      '# And by process, for a server whose socket file is already gone: the case',
+      '# a `rm -rf` of the run directory leaves behind.',
+      'for p in /proc/[0-9]*; do',
+      '  pid=${p#/proc/}',
+      '  [ -r "$p/cmdline" ] || continue',
+      '  # This shell\'s own command line contains the path being matched - the',
+      '  # script being run is one of its arguments - so it is the one process the',
+      '  # pattern below would otherwise find and kill.',
+      '  [ "$pid" = "$$" ] && continue',
+      '  c=$(tr "\\0" " " < "$p/cmdline")',
+      `  case "$c" in *"-S ${RUN_DIR}/data/tmux/"*) kill "$pid" 2>/dev/null ;; esac`,
+      'done',
+      '',
+      '# The server, by pattern and then by the port it holds.',
+      'pkill -f "agentmux-e2e/agentmux-server" 2>/dev/null',
+      'sleep 0.4',
+      // `$( ( ... ) )` and not `$(( ... )`. Bash reads `$((` as an arithmetic
+      // expansion, and only re-reads it as command substitution when it reaches
+      // the end without finding the `))` that would close it. Measured: with no
+      // second parenthesis anywhere after it this line happens to work, and the
+      // moment one appears it becomes arithmetic instead - `(echo three) | cat`
+      // as an expression, then `missing )` and an empty result. The spacing is
+      // the whole difference, so it is spelled out rather than left to luck.
+      `pid=$( (ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null) | grep ":${PORT} " | grep -o "pid=[0-9]*" | head -1 | cut -d= -f2 )`,
+      '[ -n "$pid" ] && kill "$pid" 2>/dev/null',
+      'exit 0',
+    ].join('\n'),
+  )
+
+  // A blocking sleep rather than `await sleep`: this may be running inside the
+  // exit handler, where an await is scheduled but never resumed.
+  sleepSync(400)
+  wsl(`rm -rf ${RUN_DIR}`)
+  state.cleaned = true
+}
+
+/**
+ * sleepSync blocks this thread.
+ *
+ * Only for `hardStop`, and only because there is nowhere else to wait from:
+ * give a process that has just been signalled a moment to actually die before
+ * the directory underneath it is removed.
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * survey looks for what the run left behind, and says so.
+ *
+ * This is the check that would have caught the Phase 6.5 leak while it was
+ * happening rather than three weeks later. It runs after the cleanup, so
+ * anything it finds is either something the cleanup could not reach or
+ * something that was never the run's - and the two are not told apart by
+ * guessing.
+ *
+ * It reports and stops there. A warning that also cleans up is a warning nobody
+ * reads, and the case where it matters is the case where the thing found was
+ * not this run's to remove.
+ */
+function survey() {
+  if (state.surveyed) return
+  state.surveyed = true
+
+  // The lines carry no leading whitespace of their own; the indent is added
+  // once, below, where nothing can trim it off. They used to carry it, and the
+  // whole-output `trim()` that was here took it from whichever line came first
+  // - so the first thing found was reported flush against the margin and the
+  // rest were not.
+  const found = wsl(
+    [
+      'for p in /proc/[0-9]*; do',
+      '  pid=${p#/proc/}',
+      '  [ -r "$p/cmdline" ] || continue',
+      '  [ "$pid" = "$$" ] && continue',
+      '  c=$(tr "\\0" " " < "$p/cmdline")',
+      `  case "$c" in *"${RUN_DIR}/data/tmux/"*) echo "still running:  pid $pid  $c" ;; esac`,
+      'done',
+      `ls -1 ${RUN_DIR}/data/tmux/*.sock 2>/dev/null | sed 's/^/still on disk:  /'`,
+      'exit 0',
+    ].join('\n'),
+  )
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const holder = portHolder()
+  if (holder) found.push(`still listening: port ${PORT}  pid ${holder}`)
+
+  if (found.length === 0) {
+    console.log('  nothing this run made is still running')
+    return
+  }
+
+  console.log(`\n  ${found.length} thing(s) from this run are still up:`)
+  for (const line of found) console.log(`    ${line}`)
+  console.log(
+    `  Nothing outside ${RUN_DIR} and port ${PORT} was looked at, and nothing was removed.`,
+  )
+  console.log('  If these are this run\'s, they can be ended the same way:')
+  console.log(`    tmux -S ${RUN_DIR}/data/tmux/<project-id>.sock kill-server`)
+}
+
+/**
+ * interrupt ends the run the way a clean finish would, on a signal.
+ *
+ * # The two signals
+ *
+ * The first one is a person asking the run to stop, and it is answered by
+ * ending what the run started before the process goes. The second is a person
+ * saying they have stopped waiting for the first - so it does the parts that
+ * are instant and leaves, because a run that cannot be interrupted is worse
+ * than one that leaves a socket behind and says which.
+ *
+ * The API teardown is bounded for the same reason. Twenty seconds is generous
+ * for seven DELETEs and a kill by port; past it the synchronous fallback takes
+ * over, which is the path that works when the server is the thing that is
+ * stuck.
+ */
+async function interrupt(signal) {
+  state.signals += 1
+  state.exitCode = signal === 'SIGINT' ? 130 : 143
+
+  if (state.signals > 1) {
+    console.log(`\n${signal} again: stopping now`)
+    hardStop({ quiet: true })
+    process.exit(state.exitCode)
+  }
+
+  console.log(`\n${signal}: ending the run, and what it started`)
+  state.interrupted = true
+
+  // On a terminal this is already done: Ctrl-C goes to the whole foreground
+  // process group and the suite gets its own copy. It is here for the signal
+  // aimed at this process alone - a `kill` from a task manager, which the suite
+  // never sees.
+  if (state.child && state.child.exitCode === null) state.child.kill('SIGTERM')
+
+  const finished = await Promise.race([
+    teardown(signal).then(() => true),
+    sleep(20_000).then(() => false),
+  ])
+  if (!finished) {
+    console.log('  the API teardown did not finish in 20s; ending what it could not reach')
+  }
+
+  // Unconditionally, not only on failure. `provision` may still be part-way
+  // through when the signal lands and can leave a server running behind a
+  // teardown that has already been and gone; this is the pass that catches it,
+  // and it is cheap because it only looks where the run has been.
+  hardStop()
+  survey()
+  process.exit(state.exitCode)
+}
+
+process.on('SIGINT', () => void interrupt('SIGINT'))
+process.on('SIGTERM', () => void interrupt('SIGTERM'))
+
+// The last resort, for the paths that reach neither the loop's own teardown nor
+// `interrupt`: a suite process that throws in a way that escapes `main`, an
+// unhandled rejection, a `process.exit` from somewhere unexpected. It does
+// nothing when cleanup has already happened, which is the normal end of a run.
+process.on('exit', () => {
+  if (!state.cleaned) hardStop({ quiet: true })
+})
 
 /** runSuite runs one suite as its own process and reports what it said. */
 function runSuite(name) {
@@ -408,12 +800,18 @@ function runSuite(name) {
       stdio: 'inherit',
       env: process.env,
     })
+    // Recorded so that a signal arriving while the suite runs can end it. With
+    // `stdio: 'inherit'` a Ctrl-C reaches it anyway, but a signal aimed at this
+    // process alone does not, and the suite would keep driving a browser
+    // against a fixture that is being torn down underneath it.
+    state.child = child
     const timer = setTimeout(() => {
       console.log(`\n${name} timed out after ${SUITE_TIMEOUT_MS}ms`)
       child.kill('SIGKILL')
     }, SUITE_TIMEOUT_MS)
     child.on('close', (code) => {
       clearTimeout(timer)
+      state.child = null
       resolve({ name, ok: code === 0 })
     })
   })
@@ -440,6 +838,11 @@ async function main() {
     // own, the least useful kind of red there is. Rebuilding costs a few
     // seconds and makes a suite say the same thing in a run as it does alone.
     for (const [index, name] of options.suites.entries()) {
+      // A signal during the suite before this one has already ended its
+      // fixture. Building another now would put a new server on the port the
+      // cleanup is trying to free, so the loop stops at the next boundary.
+      if (state.interrupted) break
+
       step(`Fixture for ${name}`)
       const fixtures = await provision()
       console.log(
@@ -450,29 +853,65 @@ async function main() {
       const result = await runSuite(name)
       if (!result.ok) ok = false
 
+      if (state.interrupted) break
+
       if (options.keep && index === options.suites.length - 1) {
         kept = fixtures
+        // Set here rather than from the flag: `--keep` is about the *last*
+        // fixture, so an interruption during an earlier suite must still be
+        // allowed to end what that suite made.
+        state.keeping = true
       } else {
-        await teardown(fixtures)
+        await teardown(`after ${name}`)
       }
     }
   } finally {
     if (kept) {
+      state.cleaned = true
       step(`Kept: the server is on ${SERVER_URL} and the fixtures are in ${RUN_DIR}`)
       console.log('Destroy them by running the suites again without --keep')
-    } else if (options.keep) {
-      step('Nothing kept: the run did not get as far as a suite')
     } else {
-      step('Tearing down')
+      if (options.keep) step('Nothing kept: the run did not get as far as a suite')
+      else step('Tearing down')
+
+      // The last teardown normally ran in the loop above. This is for the paths
+      // that leave it: a suite that threw, a signal mid-suite, a fixture built
+      // by a run that had not yet reached its first suite. Running it twice
+      // costs nothing, which is what the emptying of the project list buys.
+      await teardown('at the end of the run')
+
+      // The API is the path that works, and this is the path for when it did
+      // not: a server that died mid-suite leaves seven tmux servers that no
+      // DELETE can reach, and their sockets are about to go with the run
+      // directory. Cheap when there is nothing to do - one directory and one
+      // port - and the difference between an interrupted run the next one can
+      // start on top of and one it cannot.
+      if (state.failures.length > 0) hardStop({ quiet: true })
+
+      // Only now, and only once the cleanup above has been given its chance:
+      // `hardStop` is the fallback for cleanup that did not happen, and it must
+      // not fire behind one that did.
+      state.cleaned = true
+      survey()
     }
   }
 
   console.log(`\n${'='.repeat(72)}`)
+  if (state.interrupted) {
+    // Not a failure: a suite that was still running when the signal arrived
+    // reports a non-zero code, and calling that a red run would be reporting
+    // the interruption as a result.
+    console.log('the run was interrupted; what it started has been ended')
+    process.exit(state.exitCode)
+  }
   console.log(ok ? 'every suite passed' : 'SOME SUITES FAILED')
   process.exit(ok ? 0 : 1)
 }
 
 main().catch((error) => {
-  console.error(`\nthe run could not start: ${error.message}`)
+  // Reached only for something that escaped `main`'s own `finally` - so either
+  // a fixture that could not be built or a teardown that threw. Anything left
+  // running by it is ended by the `exit` handler above.
+  console.error(`\nthe run stopped early: ${error.message}`)
   process.exit(1)
 })

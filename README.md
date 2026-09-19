@@ -438,6 +438,17 @@ It needs a WSL distribution with tmux and the Claude Code CLI, Go on the machine
 and Chrome (which Playwright drives as a channel rather than downloading). `docs/ROADMAP.md` Phase 5
 lists what the five suites cover and `docs/WORKSPACE.md` §6 is where the measured geometry is.
 
+**An interrupted run cleans up after itself.** Ctrl-C, a `SIGTERM`, or a suite killed by hand arrives
+while seven tmux servers and a server process exist, and stopping where it stands is what leaves them
+there — the next run then removes the temporary directory, which takes the socket files with it and
+leaves the servers running with nothing on disk to name them by. So the signals are handled: the
+runtimes are destroyed through the API, and whatever the API cannot reach — a server that died in the
+middle of a suite leaves seven runtimes no `DELETE` can be sent to — is ended by socket and by process.
+A cleanup that could not reach something says which project, which runtime and what the error was
+rather than reporting success; at the end of the run the leftovers are looked for and reported, and
+nothing found is deleted, because a check that also deletes cannot tell this run's leftovers from
+somebody else's tmux.
+
 The deployment in `deploy/linux/` is tested the same way — against a real installation rather than in
 a unit test:
 

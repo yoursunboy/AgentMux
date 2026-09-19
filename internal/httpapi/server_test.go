@@ -67,6 +67,15 @@ type harnessOptions struct {
 	// to disagree would be testing a state that does not exist.
 	runtimeAvailable bool
 
+	// debug turns on server.debug, which is the setting that decides whether
+	// GET /api/server reports where this server keeps its own files.
+	//
+	// It is set on the resolved configuration rather than passed through
+	// LoadOptions because turning it on is not what these tests are about: the
+	// loader's own behaviour with the flag, the environment variable and the
+	// file is asserted in the config package.
+	debug bool
+
 	// tmuxMissing is the third case on its own: an environment that could host
 	// a runtime with a tmux that is not installed in it.
 	tmuxMissing bool
@@ -134,6 +143,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if err != nil {
 		t.Fatalf("config.Load returned an error: %v", err)
 	}
+	cfg.Server.Debug = o.debug
 
 	store, err := storage.Open(context.Background(), storage.OpenOptions{Path: cfg.SQLitePath()})
 	if err != nil {
@@ -289,6 +299,23 @@ func (h *harness) call(method, target string, body string, headers ...string) *h
 	return recorder
 }
 
+// postWithOrigin sends a POST that carries an Origin header and a Host, the two
+// things a same-origin decision is made from. h.call cannot express this,
+// because setting a "Host" header on an httptest request does not change the
+// request's Host field - only the URL does.
+func (h *harness) postWithOrigin(target, body, host, origin string) *httptest.ResponseRecorder {
+	h.t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = host
+	if origin != "" {
+		req.Header.Set("Origin", origin)
+	}
+	recorder := httptest.NewRecorder()
+	h.server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
 // decode reads a JSON body and fails the test if it is not JSON.
 func decode[T any](t *testing.T, recorder *httptest.ResponseRecorder) T {
 	t.Helper()
@@ -380,21 +407,183 @@ func TestServerInfoReportsTheFoundation(t *testing.T) {
 	if len(info.ProjectsRoots) != 1 || info.ProjectsRoots[0] != h.root {
 		t.Errorf("projectsRoots = %v, want [%q]", info.ProjectsRoots, h.root)
 	}
-	if info.DataDirectory != h.dataDir {
-		t.Errorf("dataDirectory = %q, want %q", info.DataDirectory, h.dataDir)
-	}
-	if info.DatabasePath != filepath.Join(h.dataDir, "agentmux.db") {
-		t.Errorf("databasePath = %q, want it inside the data directory", info.DatabasePath)
-	}
 	if info.UptimeSeconds != 30 {
 		t.Errorf("uptimeSeconds = %d, want 30 from the injected clock", info.UptimeSeconds)
 	}
 	if info.StartedAt == "" {
 		t.Error("startedAt is empty")
 	}
+	// Compared against the manager rather than against the literal "tmux",
+	// because the field's contract is that it repeats what the runtime calls
+	// itself - the same string recorded with every runtime row. This harness's
+	// backend is a fake, and pinning the literal here would assert the name of
+	// a backend the test does not use.
+	if info.RuntimeBackend != h.runtime.BackendName() {
+		t.Errorf("runtimeBackend = %q, want %q, the name the runtime manager reports",
+			info.RuntimeBackend, h.runtime.BackendName())
+	}
+	if info.RuntimeBackend == "" {
+		t.Error("runtimeBackend is empty; a client cannot tell what would run a terminal")
+	}
 }
 
-// TestServerInfoDoesNotClaimATerminal is the honesty check. A build that
+// TestServerInfoWithholdsTheServersOwnPaths is the counterpart to the debug
+// test below, and the one that matters: this endpoint has no authentication, so
+// its default answer must not describe the disk it runs on.
+//
+// The four paths are asserted individually rather than through the struct,
+// because what is being checked is what a client receives - a field that was
+// populated and then removed by an omitempty tag would satisfy a struct
+// comparison and fail this.
+func TestServerInfoWithholdsTheServersOwnPaths(t *testing.T) {
+	h := newHarness(t)
+	recorder := h.call(http.MethodGet, "/api/server", "")
+
+	info := decode[serverInfoResponse](t, recorder)
+	if info.DataDirectory != "" {
+		t.Errorf("dataDirectory = %q, want it withheld; it is published only with server.debug", info.DataDirectory)
+	}
+	if info.DatabasePath != "" {
+		t.Errorf("databasePath = %q, want it withheld", info.DatabasePath)
+	}
+	if info.ConfigFile != "" {
+		t.Errorf("configFile = %q, want it withheld", info.ConfigFile)
+	}
+	if info.WebDirectory != "" {
+		t.Errorf("webDirectory = %q, want it withheld", info.WebDirectory)
+	}
+
+	// Withheld means absent from the document, not present and empty. A client
+	// that read a key would otherwise have to know which empty values mean
+	// "nothing" and which mean "not for you".
+	var raw map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("the response is not a JSON object: %v", err)
+	}
+	for _, key := range []string{"dataDirectory", "databasePath", "configFile", "webDirectory"} {
+		if _, present := raw[key]; present {
+			t.Errorf("the response contains %q; without debug mode it must be absent entirely", key)
+		}
+	}
+}
+
+// TestServerInfoReportsItsPathsInDebugMode is the other half: the information
+// is withheld by default, not lost. An operator diagnosing a misconfigured
+// deployment turns it on deliberately and gets the paths back.
+func TestServerInfoReportsItsPathsInDebugMode(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{debug: true})
+	recorder := h.call(http.MethodGet, "/api/server", "")
+
+	info := decode[serverInfoResponse](t, recorder)
+	if info.DataDirectory != h.dataDir {
+		t.Errorf("dataDirectory = %q, want %q", info.DataDirectory, h.dataDir)
+	}
+	if info.DatabasePath != filepath.Join(h.dataDir, "agentmux.db") {
+		t.Errorf("databasePath = %q, want it inside the data directory", info.DatabasePath)
+	}
+
+	// Debug mode widens what is reported and nothing else. A setting that also
+	// relaxed a check or changed a status would be a setting that breaks the
+	// server in the act of describing it.
+	if info.Status != "online" {
+		t.Errorf("status = %q with debug on, want %q", info.Status, "online")
+	}
+}
+
+// TestHealthAnswersWithLivenessAndReadiness checks the probe a supervisor
+// reads, in both machine states.
+//
+// The two cases are the ones that exist: a host where a terminal can run, and a
+// host where it cannot. The second is not a failure of the server, and the
+// status is asserted to be the same in both - a health endpoint that went
+// unhealthy over a missing tmux would have a supervisor restart a working
+// process until tmux appeared, which restarts do not do.
+func TestHealthAnswersWithLivenessAndReadiness(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		runtimeAvailable bool
+		wantRuntime      string
+	}{
+		{name: "a host that can run a terminal", runtimeAvailable: true, wantRuntime: "available"},
+		{name: "a host that cannot", runtimeAvailable: false, wantRuntime: "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarnessOpts(t, harnessOptions{runtimeAvailable: tc.runtimeAvailable})
+			recorder := h.call(http.MethodGet, "/health", "")
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body was %s", recorder.Code, recorder.Body.String())
+			}
+			health := decode[healthResponse](t, recorder)
+			if health.Status != "ok" {
+				t.Errorf("status = %q, want %q", health.Status, "ok")
+			}
+			if health.Version == "" {
+				t.Error("version is empty; a health check that cannot say which build answered cannot confirm an upgrade")
+			}
+			if health.Runtime != tc.wantRuntime {
+				t.Errorf("runtime = %q, want %q", health.Runtime, tc.wantRuntime)
+			}
+		})
+	}
+}
+
+// TestHealthSaysNothingElse is the disclosure check.
+//
+// Asserting the exact key set is the point rather than asserting the absence of
+// particular fields: a field added later by somebody who did not read
+// docs/SECURITY.md fails this test, and a list of forbidden names would not
+// have caught it.
+func TestHealthSaysNothingElse(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{debug: true})
+	recorder := h.call(http.MethodGet, "/health", "")
+
+	var raw map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("the response is not a JSON object: %v", err)
+	}
+
+	// `commit` is absent for a binary built without the linker flag, which is
+	// every binary `go test` produces.
+	allowed := map[string]bool{"status": true, "version": true, "runtime": true, "commit": true}
+	for key := range raw {
+		if !allowed[key] {
+			t.Errorf("the health response contains %q; it is documented as carrying status, version and runtime only", key)
+		}
+	}
+
+	// Debug mode is the setting that widens GET /api/server, and it must not
+	// reach this endpoint at all: a probe answered every few seconds by a
+	// supervisor is not where a filesystem layout belongs.
+	for _, key := range []string{"dataDirectory", "databasePath", "configFile", "webDirectory"} {
+		if _, present := raw[key]; present {
+			t.Errorf("the health response contains %q, even with debug on", key)
+		}
+	}
+}
+
+// TestHealthIsNotPartOfTheAPISurface pins the path's placement.
+//
+// /health is outside /api on purpose: it is not versioned with the product's
+// protocol, and a monitor must not have to track the protocol version to ask
+// whether the process is alive. This asserts the path is where the deployment
+// documentation says it is, including that the SPA fallback does not answer it.
+func TestHealthIsNotPartOfTheAPISurface(t *testing.T) {
+	h := newHarness(t)
+	recorder := h.call(http.MethodGet, "/health", "")
+
+	if recorder.Code != http.StatusOK {
+		t.Errorf("GET /health = %d, want 200", recorder.Code)
+	}
+	// The SPA fallback answers an unmatched path with a page and an unmatched
+	// API path with a JSON error. A client following the documented URL must
+	// reach the handler rather than a fallback that happens to return 200, and
+	// the content type is what tells the two apart.
+	if contentType := recorder.Header().Get("Content-Type"); !strings.Contains(contentType, "application/json") {
+		t.Errorf("GET /health answered with Content-Type %q, want JSON", contentType)
+	}
+}
+
 // contains the runtime still must not claim a terminal works on a host that
 // cannot run one, and the provider switch must stay off until it is integrated.
 func TestServerInfoDoesNotClaimATerminal(t *testing.T) {
@@ -1176,6 +1365,114 @@ func TestPreflightIsAnswered(t *testing.T) {
 	}
 	if got := recorder.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "POST") {
 		t.Errorf("Access-Control-Allow-Methods = %q, want it to include POST", got)
+	}
+}
+
+// TestACrossOriginWriteIsRefused is the half of the browser-origin policy that
+// CORS cannot express.
+//
+// Withholding Access-Control-Allow-Origin stops another site from reading a
+// reply. It does not stop the request from arriving: a POST with a simple
+// content type needs no preflight, so the browser delivers it and this server
+// acts on it. Measured against a running installation, a page on
+// https://evil.example registered a project with a 201 before this check
+// existed.
+func TestACrossOriginWriteIsRefused(t *testing.T) {
+	h := newHarness(t)
+	target := h.mkdir(filepath.FromSlash("write-from-elsewhere"))
+
+	for _, origin := range []string{
+		"https://evil.example.com",
+		"http://192.168.1.10:8080",
+		"null",
+		"file://",
+	} {
+		t.Run(origin, func(t *testing.T) {
+			recorder := h.postWithOrigin("/api/projects/register",
+				`{"hostPath":`+jsonString(target)+`}`, "127.0.0.1:8787", origin)
+
+			if recorder.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body was %s", recorder.Code, recorder.Body.String())
+			}
+			if body := decode[errorResponse](t, recorder); body.Error.Code != CodeForbidden {
+				t.Errorf("code = %q, want %q", body.Error.Code, CodeForbidden)
+			}
+		})
+	}
+
+	// The refusal has to be a refusal, not a message: nothing was created.
+	recorder := h.call(http.MethodGet, "/api/projects", "")
+	if strings.Contains(recorder.Body.String(), "write-from-elsewhere") {
+		t.Error("a refused cross-origin request still created a project")
+	}
+}
+
+// TestACrossOriginReadIsStillAnswered records the asymmetry as intended rather
+// than as an oversight. A read from another origin is answered and simply not
+// readable by the caller, which is what CORS is for; blocking it would break
+// nothing an attacker wants and would break a legitimate client that has been
+// listed in server.allowedOrigins.
+func TestACrossOriginReadIsStillAnswered(t *testing.T) {
+	h := newHarness(t)
+
+	recorder := h.call(http.MethodGet, "/api/server", "", "Origin", "https://evil.example.com")
+	if recorder.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200; a read has no effect to protect", recorder.Code)
+	}
+	if got := recorder.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Access-Control-Allow-Origin = %q, want it absent so the reply cannot be read", got)
+	}
+}
+
+// TestASameOriginWriteIsAccepted is the case the UI is in, and the reason the
+// check compares against the Host the request arrived on rather than against
+// the loopback list: a browser that reached this server at the address of the
+// machine is not a loopback origin and is still this server's own page.
+func TestASameOriginWriteIsAccepted(t *testing.T) {
+	h := newHarness(t)
+
+	for _, tc := range []struct{ host, origin string }{
+		{"127.0.0.1:8787", "http://127.0.0.1:8787"},
+		{"172.24.16.1:8787", "http://172.24.16.1:8787"},
+		{"agentmux.internal:8787", "https://agentmux.internal:8787"},
+	} {
+		t.Run(tc.origin, func(t *testing.T) {
+			target := h.mkdir(filepath.FromSlash("same-origin/" + strings.ReplaceAll(tc.host, ":", "_")))
+			recorder := h.postWithOrigin("/api/projects/register",
+				`{"hostPath":`+jsonString(target)+`}`, tc.host, tc.origin)
+
+			if recorder.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201; body was %s", recorder.Code, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// TestARequestWithNoOriginIsAccepted covers every client that is not a browser.
+// curl, the tests and the recovery script send no Origin, and a rule that
+// required one would refuse all of them.
+func TestARequestWithNoOriginIsAccepted(t *testing.T) {
+	h := newHarness(t)
+	target := h.mkdir(filepath.FromSlash("no-origin"))
+
+	recorder := h.postWithOrigin("/api/projects/register",
+		`{"hostPath":`+jsonString(target)+`}`, "127.0.0.1:8787", "")
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body was %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+// TestAListedOriginWriteIsAccepted is the configuration half: an operator who
+// names another origin means it, and a request from it is not an accident.
+func TestAListedOriginWriteIsAccepted(t *testing.T) {
+	h := newHarness(t)
+	h.server.cfg.Server.AllowedOrigins = []string{"https://tools.example.com"}
+	target := h.mkdir(filepath.FromSlash("listed-origin"))
+
+	recorder := h.postWithOrigin("/api/projects/register",
+		`{"hostPath":`+jsonString(target)+`}`, "127.0.0.1:8787", "https://tools.example.com")
+	if recorder.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body was %s", recorder.Code, recorder.Body.String())
 	}
 }
 

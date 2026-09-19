@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -74,6 +75,291 @@ func TestLoadAppliesDefaults(t *testing.T) {
 
 // TestLoadPrecedence pins the documented order: file, then environment, then
 // command line.
+// TestYAMLAndJSONProduceTheSameConfiguration is the reason the YAML reader is
+// a front end to the JSON one rather than a second decoder.
+//
+// The same settings are written in both formats, in YAML by hand so that the
+// test proves YAML syntax is read rather than that a marshaller can round-trip
+// its own output, and the two resolved configurations are compared whole. A key
+// that one format accepted and the other ignored, a nested section that landed
+// in the wrong place, or a list that was read as a string would all show up
+// here as a difference - and would otherwise show up in production as a setting
+// that works in one file and is silently dropped in the other.
+func TestYAMLAndJSONProduceTheSameConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+
+	jsonPath := filepath.Join(dir, "config.json")
+	jsonBody, err := json.Marshal(map[string]any{
+		"server": map[string]any{
+			"host": "10.0.0.1", "port": 1111, "debug": true, "controlGraceSeconds": 8,
+		},
+		"storage":  map[string]any{"sqlitePath": "state.db"},
+		"runtime":  map[string]any{"mode": "native", "distro": "Ubuntu-24.04"},
+		"logging":  map[string]any{"level": "warn", "format": "json"},
+		"projects": map[string]any{"roots": []string{root}, "discoveryDepth": 2},
+		"web":      map[string]any{"dir": "public"},
+	})
+	if err != nil {
+		t.Fatalf("could not encode the JSON fixture: %v", err)
+	}
+	if err := os.WriteFile(jsonPath, jsonBody, 0o644); err != nil {
+		t.Fatalf("could not write the JSON fixture: %v", err)
+	}
+
+	// A comment, a blank line and a nested list, which is what the checked-in
+	// example in config/ is made of and what a JSON reader could not have.
+	yamlPath := filepath.Join(dir, "agentmux.yaml")
+	yamlBody := "# AgentMux configuration, in the format the deployment docs use.\n" +
+		"server:\n" +
+		"  host: 10.0.0.1\n" +
+		"\n" +
+		"  port: 1111\n" +
+		"  debug: true\n" +
+		"  controlGraceSeconds: 8\n" +
+		"storage:\n" +
+		"  sqlitePath: state.db\n" +
+		"runtime:\n" +
+		"  mode: native\n" +
+		"  distro: Ubuntu-24.04\n" +
+		"logging:\n" +
+		"  level: warn\n" +
+		"  format: json\n" +
+		"projects:\n" +
+		"  roots:\n" +
+		"    - " + root + "\n" +
+		"  discoveryDepth: 2\n" +
+		"web:\n" +
+		"  dir: public\n"
+	if err := os.WriteFile(yamlPath, []byte(yamlBody), 0o644); err != nil {
+		t.Fatalf("could not write the YAML fixture: %v", err)
+	}
+
+	load := func(path string) *Config {
+		t.Helper()
+		cfg, err := Load(LoadOptions{
+			Defaults:  Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+			Overrides: Overrides{ConfigPath: path},
+			Environ:   envMap(nil),
+		})
+		if err != nil {
+			t.Fatalf("Load(%s) returned an error: %v", filepath.Base(path), err)
+		}
+		// The file it came from is the one thing that is meant to differ.
+		cfg.SourceFile = ""
+		return cfg
+	}
+
+	fromJSON := load(jsonPath)
+	fromYAML := load(yamlPath)
+
+	// Spot checks first, so a failure says which setting is wrong before a
+	// whole-struct diff says only that something is.
+	for _, tc := range []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"server.host", fromYAML.Server.Host, "10.0.0.1"},
+		{"server.port", fromYAML.Server.Port, 1111},
+		{"server.debug", fromYAML.Server.Debug, true},
+		{"server.controlGraceSeconds", fromYAML.Server.ControlGraceSec, 8},
+		{"storage.sqlitePath", fromYAML.Storage.SQLitePath, "state.db"},
+		{"runtime.mode", fromYAML.Runtime.Mode, RuntimeModeNative},
+		{"runtime.distro", fromYAML.Runtime.Distro, "Ubuntu-24.04"},
+		{"logging.level", fromYAML.Logging.Level, "warn"},
+		{"logging.format", fromYAML.Logging.Format, "json"},
+		{"projects.discoveryDepth", fromYAML.Projects.DiscoveryDepth, 2},
+		{"web.dir", fromYAML.Web.Dir, "public"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s from YAML = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+	if len(fromYAML.Projects.Roots) != 1 || fromYAML.Projects.Roots[0] != root {
+		t.Errorf("projects.roots from YAML = %v, want [%q]", fromYAML.Projects.Roots, root)
+	}
+
+	if !reflect.DeepEqual(fromJSON, fromYAML) {
+		t.Errorf("the two formats produced different configurations:\nJSON: %+v\nYAML: %+v",
+			fromJSON, fromYAML)
+	}
+}
+
+// TestYAMLFilesAreRecognisedByName pins which names ask for the YAML reader, so
+// that a file called config.yaml is never handed to the JSON decoder and
+// reported as a syntax error.
+func TestYAMLFilesAreRecognisedByName(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{"agentmux.yaml", true},
+		{"agentmux.yml", true},
+		{"AGENTMUX.YAML", true},
+		{"config.json", false},
+		{"config", false},
+		{"config.yaml.bak", false},
+	} {
+		if got := isYAMLPath(tc.path); got != tc.want {
+			t.Errorf("isYAMLPath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// TestEmptyYAMLFileIsAnEmptyConfiguration covers the file a person leaves
+// behind after emptying it to start again: comments and nothing else. It is an
+// empty configuration, not a parse failure, and the defaults apply.
+func TestEmptyYAMLFileIsAnEmptyConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+	path := filepath.Join(dir, "agentmux.yaml")
+
+	body := "# Everything here has been removed. The defaults apply.\n\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("could not write the fixture: %v", err)
+	}
+
+	cfg, err := Load(LoadOptions{
+		Defaults:  Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+		Overrides: Overrides{ConfigPath: path},
+		Environ:   envMap(nil),
+	})
+	if err != nil {
+		t.Fatalf("Load returned an error: %v", err)
+	}
+	if cfg.Server.Port != DefaultServerPort {
+		t.Errorf("Server.Port = %d, want the default %d", cfg.Server.Port, DefaultServerPort)
+	}
+	if cfg.SourceFile != path {
+		t.Errorf("SourceFile = %q, want %q; an empty file was still read", cfg.SourceFile, path)
+	}
+}
+
+// TestYAMLSyntaxErrorNamesTheFile checks the failure a person is most likely to
+// meet: a typo in a file they are editing.
+func TestYAMLSyntaxErrorNamesTheFile(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+	path := filepath.Join(dir, "agentmux.yaml")
+
+	// A tab where the indentation needs spaces. This is the classic mistake and
+	// the reason the parser's own message, with its line number, is passed
+	// through rather than replaced with something the config package wrote.
+	if err := os.WriteFile(path, []byte("server:\n\tport: 1111\n"), 0o644); err != nil {
+		t.Fatalf("could not write the fixture: %v", err)
+	}
+
+	_, err := Load(LoadOptions{
+		Defaults:  Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+		Overrides: Overrides{ConfigPath: path},
+		Environ:   envMap(nil),
+	})
+	if err == nil {
+		t.Fatal("Load accepted a file that is not valid YAML")
+	}
+	if !strings.Contains(err.Error(), path) {
+		t.Errorf("error %q does not name the file it came from", err)
+	}
+}
+
+// TestYAMLScalarDocumentIsRefused covers a file that parses but is not a
+// configuration: a bare string, a list, a number. It must be an error rather
+// than a silent no-op, because a person who wrote one believes they configured
+// something.
+func TestYAMLScalarDocumentIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+
+	for _, body := range []string{"just a string\n", "- one\n- two\n", "42\n"} {
+		path := filepath.Join(dir, "agentmux.yaml")
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatalf("could not write the fixture: %v", err)
+		}
+		_, err := Load(LoadOptions{
+			Defaults:  Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+			Overrides: Overrides{ConfigPath: path},
+			Environ:   envMap(nil),
+		})
+		if err == nil {
+			t.Errorf("Load accepted %q as a configuration file", strings.TrimSpace(body))
+		}
+	}
+}
+
+// TestDebugPrecedence pins server.debug to the documented order, and pins the
+// direction it can be moved in.
+//
+// The flag can only turn debug on. That is deliberate and is asserted here
+// rather than left to a comment: a configuration file that turned debug on can
+// be turned off again by editing the file, and a test that expected
+// "-debug=false" to beat the file would be asserting a behaviour the flag does
+// not have.
+func TestDebugPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	root := t.TempDir()
+	path := filepath.Join(dir, "agentmux.yaml")
+
+	if err := os.WriteFile(path, []byte("server:\n  debug: true\n"), 0o644); err != nil {
+		t.Fatalf("could not write the fixture: %v", err)
+	}
+	base := func() LoadOptions {
+		return LoadOptions{
+			Defaults:  Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+			Overrides: Overrides{ConfigPath: path},
+			Environ:   envMap(nil),
+		}
+	}
+
+	t.Run("off by default", func(t *testing.T) {
+		cfg, err := Load(LoadOptions{
+			Defaults: Defaults{ProjectsRoots: []string{root}, DataDir: dir},
+			Environ:  envMap(nil),
+		})
+		if err != nil {
+			t.Fatalf("Load returned an error: %v", err)
+		}
+		if cfg.Server.Debug {
+			t.Error("Server.Debug is on with nothing asking for it; it must be opt-in")
+		}
+	})
+
+	t.Run("the file turns it on", func(t *testing.T) {
+		cfg, err := Load(base())
+		if err != nil {
+			t.Fatalf("Load returned an error: %v", err)
+		}
+		if !cfg.Server.Debug {
+			t.Error("Server.Debug is off though the config file set it")
+		}
+	})
+
+	t.Run("the environment overrides the file", func(t *testing.T) {
+		opts := base()
+		opts.Environ = envMap(map[string]string{EnvDebug: "false"})
+		cfg, err := Load(opts)
+		if err != nil {
+			t.Fatalf("Load returned an error: %v", err)
+		}
+		if cfg.Server.Debug {
+			t.Errorf("Server.Debug is on though %s said false", EnvDebug)
+		}
+	})
+
+	t.Run("a flag turns it on where the environment said no", func(t *testing.T) {
+		opts := base()
+		opts.Environ = envMap(map[string]string{EnvDebug: "false"})
+		opts.Overrides.Debug = true
+		cfg, err := Load(opts)
+		if err != nil {
+			t.Fatalf("Load returned an error: %v", err)
+		}
+		if !cfg.Server.Debug {
+			t.Error("Server.Debug is off though the flag asked for it")
+		}
+	})
+}
+
 func TestLoadPrecedence(t *testing.T) {
 	dataDir := t.TempDir()
 	root := t.TempDir()

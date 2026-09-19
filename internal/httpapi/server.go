@@ -153,6 +153,12 @@ func (s *Server) routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/server", s.handleServerInfo)
+
+	// The probe a supervisor, a load balancer or a person with curl asks. It is
+	// deliberately outside /api: it is not part of the product's API surface,
+	// it is not versioned with it, and a monitor should not have to track the
+	// protocol version to ask whether the process is alive.
+	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("GET /api/projects/discover", s.handleDiscoverProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -311,12 +317,34 @@ func (s *Server) withRequestLog(next http.Handler) http.Handler {
 }
 
 // withCORS permits loopback browser origins, plus anything explicitly listed
-// in the configuration.
+// in the configuration, and refuses cross-origin requests that would change
+// something.
 //
 // The development setup proxies /api through Vite and needs no CORS at all;
 // this exists so that running the frontend on its own dev port also works.
-// Only loopback origins are allowed by default, so a page on the public
-// internet cannot reach a local AgentMux through a browser.
+//
+// Two different things are being defended here, and only one of them is CORS.
+//
+// CORS protects the *reply*: withholding Access-Control-Allow-Origin stops a
+// page on another origin from reading what this server said. That is all the
+// header alone can do, and it is not enough, because the browser still sends
+// the request and the server still acts on it. A cross-origin POST with a
+// simple content type - text/plain, say, carrying a JSON body - needs no
+// preflight and is delivered whatever this middleware sets, so a page the user
+// happened to open could register a project, start a runtime or start an agent
+// in one, and simply not be able to read the answer. That was measured against
+// a running installation, not reasoned about: it answered 201.
+//
+// The origin check below protects the *effect*. It is not a second policy: it
+// is the same browserOriginAllowed the terminal socket already applies at its
+// own upgrade, asked here as well, because a browser can reach this server in
+// two ways and a check made at one of them is a check with a way around it. A
+// request that carries no Origin is not from a browser and is unaffected, which
+// is what keeps curl, the tests and the recovery script working.
+//
+// A read from another origin is still answered, and still not readable by the
+// caller. There is no effect to protect, and refusing it would break a listed
+// origin for no gain.
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -331,8 +359,28 @@ func (s *Server) withCORS(next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+		if changesSomething(r.Method) && !s.browserOriginAllowed(r) {
+			s.log.Warn("refused a request that would change something from an unpermitted origin",
+				"origin", origin, "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
+			writeError(w, http.StatusForbidden, CodeForbidden,
+				"this origin may not change anything on this server", nil)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// changesSomething reports whether a method is one a cross-origin page can send
+// without asking the browser first. GET, HEAD and OPTIONS are the methods that
+// need no preflight, and they are also the methods that must have no effect;
+// everything else is treated as a change and has to say where it came from.
+func changesSomething(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *Server) originAllowed(origin string) bool {

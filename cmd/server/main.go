@@ -55,10 +55,16 @@ func run(args []string) error {
 
 	// Logs go to stderr so that stdout stays free for anything a future
 	// command might print as its actual output.
+	//
+	// Every subsystem below is handed a logger tagged with its component, which
+	// is what makes every record say where it came from. See the record shape in
+	// internal/logging.
 	logger := logging.New(cfg.Logging.Level, cfg.Logging.Format, os.Stderr)
+	serverLog := logging.Component(logger, logging.ComponentServer)
 
-	logger.Info("configuration loaded",
+	serverLog.Info("configuration loaded",
 		"version", version.Version,
+		"commit", orNone(version.ShortCommit()),
 		"phase", version.Phase,
 		"configFile", orNone(cfg.SourceFile),
 		"dataDir", cfg.DataDir,
@@ -66,21 +72,28 @@ func run(args []string) error {
 		"discoveryDepth", cfg.Projects.DiscoveryDepth,
 		"runtimeMode", cfg.Runtime.Mode,
 		"logLevel", cfg.Logging.Level,
+		"debug", cfg.Server.Debug,
 	)
 	for _, warning := range cfg.Warnings {
-		logger.Warn("configuration warning", "detail", warning)
+		serverLog.Warn("configuration warning", "detail", warning)
 	}
 
 	// Leave a documented, editable configuration behind on first run, so that
 	// "how do I change the Projects Root" has an answer in the file itself.
+	//
+	// Only when the configuration was not read from an explicit file: a server
+	// started with -config /etc/agentmux/agentmux.yaml has been configured by
+	// somebody who knows where the file is, and writing a second one inside the
+	// data directory would leave two files that disagree, one of which is
+	// ignored.
 	configPath := cfg.SourceFile
 	if configPath == "" {
 		configPath = filepath.Join(cfg.DataDir, config.DefaultConfigFileName)
 	}
 	if created, err := config.WriteDefaultFile(configPath, cfg, 0o644); err != nil {
-		logger.Warn("could not write a default config file", "path", configPath, "error", err)
+		serverLog.Warn("could not write a default config file", "path", configPath, "error", err)
 	} else if created {
-		logger.Info("wrote default config file", "path", configPath)
+		serverLog.Info("wrote default config file", "path", configPath)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -92,20 +105,21 @@ func run(args []string) error {
 	}
 	defer func() {
 		if err := store.Close(); err != nil {
-			logger.Warn("could not close the metadata database", "error", err)
+			serverLog.Warn("could not close the metadata database", "error", err)
 		}
 	}()
-	logger.Info("metadata database opened", "path", store.Path())
+	storageLog := logging.Component(logger, logging.ComponentStorage)
+	storageLog.Info("metadata database opened", "path", store.Path())
 
 	migration, err := store.Migrate(ctx)
 	if err != nil {
 		return err
 	}
 	if len(migration.Applied) > 0 {
-		logger.Info("schema migrations applied",
+		storageLog.Info("schema migrations applied",
 			"applied", migration.Applied, "schemaVersion", migration.Version)
 	} else {
-		logger.Info("schema is up to date", "schemaVersion", migration.Version)
+		storageLog.Info("schema is up to date", "schemaVersion", migration.Version)
 	}
 
 	// The identifier is created and kept in the settings table. It is not
@@ -127,7 +141,7 @@ func run(args []string) error {
 		return err
 	}
 	systemInfo := adapter.Info(ctx)
-	logger.Info("host adapter ready",
+	logging.Component(logger, logging.ComponentHost).Info("host adapter ready",
 		"hostOs", systemInfo.HostOS,
 		"runtimeMode", systemInfo.RuntimeMode,
 		"runtimeOs", systemInfo.RuntimeOS,
@@ -144,7 +158,7 @@ func run(args []string) error {
 	projectService, err := project.NewService(project.Options{
 		Repository: store.Projects(),
 		Host:       adapter,
-		Logger:     logger,
+		Logger:     logging.Component(logger, logging.ComponentProject),
 		Runtime:    bridge,
 	})
 	if err != nil {
@@ -162,29 +176,32 @@ func run(args []string) error {
 	if socketDir == "" {
 		socketDir = filepath.Join(cfg.DataDir, session.DefaultTmuxSocketDirName)
 	}
+	runtimeLog := logging.Component(logger, logging.ComponentRuntime)
 	backends, err := session.NewProjectRuntimes(session.ProjectRuntimesOptions{
 		Binary:    cfg.TmuxBinary(),
 		SocketDir: socketDir,
-		Logger:    logger,
+		Logger:    runtimeLog,
 	})
 	if err != nil {
 		return err
 	}
-	logger.Info("project runtimes", "tmuxBinary", backends.Status(ctx).Binary, "socketDir", backends.Sockets().Dir())
+	runtimeLog.Info("project runtimes",
+		"tmuxBinary", backends.Status(ctx).Binary, "socketDir", backends.Sockets().Dir())
 
 	// The coding agent a runtime hosts. Resolving it is a probe, not a
 	// requirement: a machine with no Claude Code still runs AgentMux, still
 	// manages projects, and still hosts terminals - it just has no agent to put
 	// in one, and says so in the API rather than failing to start.
-	agents := claude.New(claude.Options{Binary: cfg.ClaudeBinary(), Logger: logger})
+	agentLog := logging.Component(logger, logging.ComponentAgent)
+	agents := claude.New(claude.Options{Binary: cfg.ClaudeBinary(), Logger: agentLog})
 	installation := agents.Resolve(ctx)
 	if installation.Available {
-		logger.Info("coding agent ready",
+		agentLog.Info("coding agent ready",
 			"agent", installation.Type,
 			"version", installation.Version,
 			"binary", installation.Path)
 	} else {
-		logger.Warn("no coding agent is available; runtimes will host terminals only",
+		agentLog.Warn("no coding agent is available; runtimes will host terminals only",
 			"agent", installation.Type, "reason", installation.Message)
 	}
 
@@ -199,7 +216,7 @@ func run(args []string) error {
 		HistoryChunks: cfg.Terminal.HistoryChunks,
 		HistoryBytes:  cfg.Terminal.HistoryBytes,
 		Agent:         agentSpecs{agents},
-		Logger:        logger,
+		Logger:        runtimeLog,
 	})
 	if err != nil {
 		return err
@@ -211,11 +228,11 @@ func run(args []string) error {
 	// restarted would make the runtime pointless.
 	defer func() {
 		if err := runtimes.Close(); err != nil {
-			logger.Warn("could not close the runtime manager", "error", err)
+			runtimeLog.Warn("could not close the runtime manager", "error", err)
 		}
 	}()
 
-	reconcileRuntimes(ctx, runtimes, logger)
+	reconcileRuntimes(ctx, runtimes, runtimeLog)
 
 	discoverer, err := project.NewDiscoverer(project.DiscovererOptions{
 		Host:           adapter,
@@ -223,7 +240,7 @@ func run(args []string) error {
 		MaxCandidates:  cfg.Projects.MaxCandidates,
 		MaxScannedDirs: cfg.Projects.MaxScanDirs,
 		Timeout:        time.Duration(cfg.Projects.ScanTimeoutSec) * time.Second,
-		Logger:         logger,
+		Logger:         logging.Component(logger, logging.ComponentProject),
 	})
 	if err != nil {
 		return err
@@ -240,7 +257,7 @@ func run(args []string) error {
 	// process's: it has to be closed before the runtime manager is, so that
 	// every browser sees an ordinary close instead of a connection that dies
 	// when the process does.
-	hubOptions := terminal.HubOptions{Logger: logger}
+	hubOptions := terminal.HubOptions{Logger: logging.Component(logger, logging.ComponentTerminal)}
 	// Zero is left as zero: the terminal package has its own default for how
 	// long a disconnected controller keeps its lease, and restating the number
 	// here would be a second place for it to be wrong.
@@ -260,7 +277,7 @@ func run(args []string) error {
 		Runtime:    runtimes,
 		Agent:      agents,
 		Terminal:   terminalHub,
-		Logger:     logger,
+		Logger:     logging.Component(logger, logging.ComponentAPI),
 		WebDir:     webDir,
 	})
 	if err != nil {
@@ -274,13 +291,14 @@ func run(args []string) error {
 		ReadTimeout:       time.Duration(cfg.Server.ReadTimeoutSec) * time.Second,
 		WriteTimeout:      time.Duration(cfg.Server.WriteTimeoutSec) * time.Second,
 		IdleTimeout:       time.Duration(cfg.Server.IdleTimeoutSec) * time.Second,
-		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+		ErrorLog:          slog.NewLogLogger(serverLog.Handler(), slog.LevelWarn),
 	}
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("AgentMux server listening",
+		serverLog.Info("AgentMux server listening",
 			"address", cfg.Address(),
+			"health", fmt.Sprintf("http://%s/health", displayAddress(cfg)),
 			"serverInfo", fmt.Sprintf("http://%s/api/server", displayAddress(cfg)),
 			"webDir", orNone(webDir),
 		)
@@ -293,7 +311,7 @@ func run(args []string) error {
 	case err := <-serveErr:
 		return fmt.Errorf("http server: %w", err)
 	case <-ctx.Done():
-		logger.Info("shutdown signal received; stopping the server")
+		serverLog.Info("shutdown signal received; stopping the server")
 	}
 
 	// Browser sockets are closed deliberately, and before the runtime manager
@@ -302,7 +320,7 @@ func run(args []string) error {
 	// dying, which is the one signal it cannot tell apart from a network that
 	// went away.
 	if err := terminalHub.Close(); err != nil {
-		logger.Warn("could not close the terminal hub", "error", err)
+		logging.Component(logger, logging.ComponentTerminal).Warn("could not close the terminal hub", "error", err)
 	}
 
 	// Browser disconnects must never affect project runtime, and a shutdown
@@ -317,7 +335,7 @@ func run(args []string) error {
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		return fmt.Errorf("http server shutdown: %w", err)
 	}
-	logger.Info("AgentMux server stopped")
+	serverLog.Info("AgentMux server stopped")
 	return nil
 }
 
@@ -336,10 +354,11 @@ func loadConfig(args []string) (*config.Config, error) {
 	}
 
 	var (
-		configPath    = flags.String("config", "", "JSON config file (default <data-dir>/config.json)")
+		configPath    = flags.String("config", "", "config file, JSON or (with a .yaml/.yml name) YAML (default <data-dir>/config.json)")
 		dataDir       = flags.String("data-dir", "", "directory for AgentMux state (default: platform config directory)")
 		hostFlag      = flags.String("host", "", "HTTP listen address (default "+config.DefaultServerHost+")")
 		port          = flags.Int("port", 0, "HTTP listen port (default 8787)")
+		debug         = flags.Bool("debug", false, "include this machine's filesystem layout in GET /api/server; see docs/SECURITY.md")
 		logLevel      = flags.String("log-level", "", "log level: debug, info, warn, error")
 		logFormat     = flags.String("log-format", "", "log format: text or json")
 		runtimeMode   = flags.String("runtime-mode", "", "runtime mode: auto, native, wsl")
@@ -361,7 +380,12 @@ func loadConfig(args []string) (*config.Config, error) {
 		return nil, err
 	}
 	if *showVersion {
-		fmt.Printf("%s %s (%s)\n", version.AppName, version.Version, version.Phase)
+		// The commit is printed when the binary carries one, which a release
+		// build does and a plain `go build` does not. See internal/version.
+		fmt.Printf("%s (%s)\n", version.StringWithCommit(), version.Phase)
+		if version.BuildDate != "" {
+			fmt.Printf("built %s\n", version.BuildDate)
+		}
 		os.Exit(0)
 	}
 	if flags.NArg() > 0 {
@@ -379,6 +403,7 @@ func loadConfig(args []string) (*config.Config, error) {
 			DataDir:       *dataDir,
 			Host:          *hostFlag,
 			Port:          *port,
+			Debug:         *debug,
 			ProjectsRoots: projectsRoots,
 			LogLevel:      *logLevel,
 			LogFormat:     *logFormat,

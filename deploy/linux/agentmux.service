@@ -1,0 +1,165 @@
+# AgentMux server, as a systemd service.
+#
+# Installed by deploy/linux/install.sh, which substitutes the paths below for
+# the ones it was given. deploy/linux/README.md is the operator's guide; this
+# file is annotated for whoever has to change it.
+#
+#     sudo install -m 0644 deploy/linux/agentmux.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now agentmux
+#
+# Platform: Linux with systemd. AgentMux's runtime is tmux, which is not
+# available as a native Windows service, so on Windows the server belongs inside
+# WSL2 with systemd enabled (`systemd=true` in /etc/wsl.conf). There is no
+# Windows-native variant of this unit and there will not be one.
+
+[Unit]
+Description=AgentMux server
+Documentation=https://github.com/yoursunboy/AgentMux
+
+# One Documentation line, and it points at the repository. A second one naming
+# a file under the install prefix used to be here, and it was a lie: install.sh
+# installs the binary and the frontend, never the documentation, so the path it
+# named did not exist on any machine that had run it. A path in a unit file is
+# a claim that something is at that path, and systemctl status will happily
+# print a claim that is false.
+
+# Started after the network is up, because the listener binds an address and,
+# with a non-loopback one, a bind before the interface exists fails outright.
+# Wants rather than Requires: a machine that reaches multi-user.target without
+# a network still runs AgentMux perfectly well on loopback.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentmux
+Group=agentmux
+
+# The working directory is load-bearing, not cosmetic: the built frontend's
+# default path (web/dist) is relative, and it is resolved against this.
+WorkingDirectory=/opt/agentmux
+ExecStart=/opt/agentmux/agentmux-server
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+#
+# Two values, and the list is short on purpose.
+#
+# Anything set here wins over the configuration file, because the documented
+# precedence is CLI > environment > file > defaults. So a setting that belongs
+# in /etc/agentmux/agentmux.yaml must not also appear here: an operator who
+# edited the file and saw no effect would be looking at a value this unit had
+# already overridden.
+#
+# These two are here because the file cannot carry them. The config file's
+# location cannot be inside the file, and the data directory is deliberately
+# not settable from it — the default config file lives inside the data
+# directory, so a file that could move the data directory would be deciding
+# where it itself is. See the note at the foot of config/agentmux.example.yaml.
+Environment=AGENTMUX_CONFIG=/etc/agentmux/agentmux.yaml
+Environment=AGENTMUX_DATA_DIR=/var/lib/agentmux
+
+# ---------------------------------------------------------------------------
+# Restart
+# ---------------------------------------------------------------------------
+#
+# A server that stopped is a server whose terminals stopped being reachable.
+# `always` covers both an exit and a crash, and it covers the case that matters
+# most here: a machine that came back up. Combined with `systemctl enable`, this
+# is what makes "the server restarts itself" true rather than aspirational —
+# see §Recovery in deploy/linux/README.md for what does and does not come back.
+Restart=always
+RestartSec=2
+
+# The gap between restarts doubles rather than staying at two seconds. A server
+# that cannot start because its port is taken or its database is unreadable
+# would otherwise be restarted twice a second forever, filling the journal with
+# the same failure and making the one useful line impossible to find.
+#
+# These two directives need systemd 254 or newer — Ubuntu 24.04, Debian 13,
+# RHEL 10. On an older systemd (Ubuntu 22.04 has 249) they are reported as
+# unknown keys and ignored, and what applies instead is the built-in start rate
+# limit: five restarts in ten seconds, after which the unit is left failed. That
+# is a worse answer than a backoff but not a wrong one, and it is not worth the
+# complexity of shipping two unit files. `systemd-analyze verify` on the target
+# machine will say which case you are in.
+RestartSteps=5
+RestartMaxDelaySec=30
+
+# Bounded, because the server drains in-flight requests on SIGTERM and its own
+# shutdown grace is ten seconds by default. Ninety would leave a stuck client
+# holding the unit in "deactivating" for a minute and a half.
+TimeoutStopSec=30
+
+# ---------------------------------------------------------------------------
+# KillMode — the line that decides whether a restart survives
+# ---------------------------------------------------------------------------
+#
+# `process` sends the stop signal to the server alone. The default,
+# `control-group`, sends it to every process in the unit's cgroup — and a
+# project's tmux server is one of those: AgentMux starts it as a child, and
+# tmux detaches by forking, which changes the terminal but not the cgroup.
+#
+# With the default, `systemctl restart agentmux` would kill every tmux server,
+# and with them every session and everything running in one. The server would
+# come back up, reconcile, and correctly report every runtime as stopped —
+# having destroyed them itself.
+#
+# With `process`, the sessions outlive the server exactly as they outlive a
+# Ctrl-C on the command line. That is the whole of runtime recovery on a service
+# restart, and deploy/linux/README.md §Recovery has the test.
+#
+# What this does not do is survive a reboot: a reboot ends every process on the
+# machine, tmux servers included, and no unit setting can change that. Runtimes
+# come back stopped after a reboot, and resuming one is a person's decision.
+KillMode=process
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+#
+# One file descriptor per browser socket, per pty, and per tmux control client,
+# and a workspace of ten viewers over several projects is not a small number.
+# systemd's default soft limit of 1024 is reachable; this is not.
+LimitNOFILE=65536
+
+# Files the server creates are group-readable and not world-readable. It does
+# not replace filesystem permissions on the data directory — install.sh sets
+# those to 0750 — it is the second of the two.
+UMask=0027
+
+# Everything the server writes goes to the journal. This is the whole of §Logs:
+# journald owns the file, rotates it by size and age, and vacates old entries,
+# so AgentMux ships no log rotation of its own and no configuration for one.
+# docs/DEPLOYMENT.md §Logs has the queries and the retention settings.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentmux
+
+# ---------------------------------------------------------------------------
+# Hardening — deliberately absent
+# ---------------------------------------------------------------------------
+#
+# There is no ProtectSystem, no ProtectHome, no PrivateTmp and no
+# NoNewPrivileges here, and the omission is a decision rather than an oversight.
+#
+# AgentMux's whole job is to run programs a person asks for, in a terminal, as
+# this account. Those programs are the user's own: a build that writes into the
+# projects root, a test that binds a port, an editor that keeps state in $HOME,
+# and — routinely — a `sudo` in a terminal. A sandbox tight enough to be worth
+# having is a sandbox that breaks some of them, and it breaks them in the one
+# place a person cannot see the error: inside a pane that simply stops working.
+#
+# So the decision belongs to the deployment, not to this file. A machine where
+# AgentMux only ever builds code in one directory can be locked down hard, and
+# deploy/linux/README.md §Hardening lists the directives worth adding and the
+# exact thing each one would break. Read that before adding any of them.
+#
+# What is true without any of them: the service runs as an unprivileged system
+# account with no sudo rights, it binds loopback by default, and it holds no
+# credentials to leak. docs/SECURITY.md §2.
+
+[Install]
+WantedBy=multi-user.target

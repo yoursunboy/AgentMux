@@ -284,7 +284,12 @@ func (s *controlStream) handleLine(line []byte, pending *[]byte, log *slog.Logge
 		// A command response line. AgentMux sends no commands through this
 		// client, so this is either stale output or something new in tmux; it
 		// is logged rather than guessed at.
-		log.Debug("tmux control: unexpected command output", "session", s.session, "line", string(line))
+		//
+		// The line itself is not logged, only its length. A control-mode line is
+		// the terminal's own bytes on the way past - a %output payload is what
+		// the program in the pane wrote - and a log is not a place to put a
+		// user's terminal. See the logging rules in docs/ARCHITECTURE.md.
+		log.Debug("tmux control: unexpected command output", "session", s.session, "bytes", len(line))
 		return
 	}
 
@@ -294,7 +299,10 @@ func (s *controlStream) handleLine(line []byte, pending *[]byte, log *slog.Logge
 		if payload, ok := controlPayload(rest); ok {
 			*pending = decodeControlEscapes(*pending, payload)
 		} else {
-			log.Debug("tmux control: unparseable %output record", "session", s.session, "line", string(line))
+			// Length, not content, for the same reason as above: this branch is
+			// reached precisely when the record is not understood, which is when
+			// it is least safe to assume it holds no terminal text.
+			log.Debug("tmux control: unparseable %output record", "session", s.session, "bytes", len(line))
 		}
 
 	case "extended-output":

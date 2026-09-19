@@ -561,6 +561,49 @@ destroying one project's runtime, must not be observable from the others.
 just check status: the survivors must still answer on their own sockets and must still produce output
 that reaches the history buffer, so a runtime that survived but stopped being watched fails the test.
 
+### The Phase 6.5 deployment run
+
+The same ground once more, and this time under the thing that is supposed to keep it alive. Installed
+as a real systemd service by `deploy/linux/install.sh` on Ubuntu 24.04 under WSL2, with systemd 255 and
+tmux 3.4, and driven through `deploy/linux/recovery-test.sh` — eleven checks, all passing, against the
+installed service rather than a server someone started by hand.
+
+The load-bearing measurement is that **the tmux server survives the service restart**, and it is
+recorded as a pid rather than as a status: the same server process before and after
+`systemctl restart agentmux`, read from `tmux -S <socket> display -p '#{pid}'`. The server comes back,
+finds the socket, and reports the runtime `RUNNING` without having started anything. That is the whole
+of runtime recovery across a restart, and it holds because of `KillMode=process` in the unit — under
+the default the unit's cgroup is signalled, the tmux server is in it, and the restart destroys exactly
+what it was supposed to preserve. `docs/ARCHITECTURE.md` §15 has the mechanism.
+
+The three recovery cases, run on that installation:
+
+| Case | What was made to happen | What the server reported |
+| --- | --- | --- |
+| A | Service restarted, tmux alive | `RUNNING`, same tmux server pid, nothing restarted |
+| B | tmux server killed — what a reboot leaves | `STOPPED`, socket gone, and nothing started until asked |
+| C | A socket for a project that does not exist | Reported in the journal, session left running |
+
+Case C is the one worth reading twice, because the correct answer is to do nothing. The socket was
+created as the service account with a well-formed id and an `amx-` session name, which is what makes
+it recognisable as AgentMux's rather than as somebody else's; the server logged
+`a terminal session belongs to no registered project; it is left running` and left it alone. Two
+earlier attempts at that case failed for instructive reasons: a socket owned by root is a *different*
+case with a different correct answer (`could not be classified; it is left untouched`), and an orphan
+is not exposed over the HTTP API at all — the journal is the only place it is observable.
+
+The measured baseline at three loads is in `docs/DEPLOYMENT.md` §14: 0.3 % of one core and 18 MB at one
+project and one viewer, 1.0 % and 23 MB at five projects and ten viewers, with WebSocket subscribe p95
+under a millisecond at every load. `deploy/linux/loadtest.py` reproduces it.
+
+Two limits, stated rather than implied. The installer's in-script build path could not be exercised in
+that distribution — it has no Go or Node toolchain — so the `--binary` and `--web` paths were used and
+the builds happened on the Windows side. And the final link in `AgentMux → tmux → Claude` was not
+exercised end to end there: Claude Code is a per-user install under a human's home directory
+(`drwxr-x---`), which the service account cannot traverse, so a runtime on that host hosts a shell and
+not an agent. That is correct Unix behaviour and a deployment decision, not a defect in the runtime;
+`docs/DEPLOYMENT.md` §9 and `terminal.claudeBinary` are where it is resolved.
+
 ## 10. Limitations
 
 Stated rather than hidden.

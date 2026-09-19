@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-As of version 0.1.0:
+As of version 0.6.5:
 
 | Phase | Status | Note |
 | --- | --- | --- |
@@ -14,6 +14,7 @@ As of version 0.1.0:
 | Phase 4 — Web terminal | **Done** | `/api/ws` transport, snapshot and live output, raw input, Prompt Bar, resize, local scroll, reconnect and resync, touch keys. Verified in a real browser, including a tablet in emulation. See below. |
 | Phase 5 — Multi-project workspace | **Done** | The workspace grid, slots, the Project Manager as the last cell, pagination, Focus and full screen, and the browser suites moved into the repository. Verified against real Chrome at four viewports. See below. |
 | Phase 6 — Multi-device control | **Done** | One controller and many viewers per project, a lease with a grace period, a handshake for handing control over, and input and resize authority on the server. Verified in two real browser contexts at once — a desktop and an emulated tablet. See below. |
+| Phase 6.5 — Stabilization | **Done** | Not a capability phase. systemd unit, installer, configuration file, health endpoint, log components, version reporting, a documented recovery model with a script that exercises it, and a measured performance baseline. Validated on a real Linux server. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -412,6 +413,46 @@ not work.
 lapses, or until they reopen the panel and release it. There is no control anywhere in the interface
 that gives up a lease for a project that is not on screen. It is a gap in the UI rather than in the
 server — the message exists and is handled — and it is recorded here rather than left to be discovered.
+
+## Phase 6.5 — Stabilization: deployable, upgradeable, recoverable
+
+**Done.** No new product capability, deliberately. The goal was that what already existed could be put
+on a server and left there. Concretely:
+
+| Deliverable | What it is |
+| --- | --- |
+| `deploy/linux/install.sh` | Installs, and re-run, upgrades. Prints every change before making it; `--uninstall` keeps your data. |
+| `deploy/linux/agentmux.service` | The systemd unit, annotated in place. `Restart=always` and **`KillMode=process`** — the second is what makes a restart survive. |
+| `deploy/linux/README.md` | The operator's guide. |
+| `deploy/linux/recovery-test.sh` | The three recovery cases, run against a real installation. |
+| `deploy/linux/loadtest.py` | The performance baseline, with its own dependency-free WebSocket client. |
+| `config/agentmux.example.yaml` | Every setting and its default. |
+| YAML configuration | YAML or JSON, behind exactly one decoder, so the two cannot drift. |
+| `GET /health` | Liveness and readiness for a supervisor. Always 200; carries no credential, filesystem detail or secret. |
+| `-debug` / `AGENTMUX_DEBUG` / `server.debug` | Gates the four private paths in `GET /api/server`. Separate from `logging.level` on purpose. |
+| Log components | A `component` on every record, and the four forbidden things stated in the package doc. |
+| `internal/version` | `0.6.5`, plus a git commit and build date injected by the linker. |
+
+**The one setting that changes what the product does is `KillMode=process`.** The default,
+`control-group`, signals every process in the unit's cgroup on stop, and a project's tmux server is in
+that cgroup — AgentMux starts it as a child and tmux detaches by forking, which changes the terminal
+but not the cgroup. Under the default, `systemctl restart agentmux` would kill every session and the
+server would then report every runtime stopped, having destroyed them itself.
+
+**Validated on a real Linux server**, not argued: systemd 255, tmux 3.4, Ubuntu 24.04 under WSL2.
+Install, start, stop, restart, all three recovery cases, the upgrade path, the health endpoint, the
+WebSocket terminal round trip, and the frontend served by the server. The measured baseline is in
+`docs/DEPLOYMENT.md` §14, Performance baseline: at 5 projects and 10 viewers the server used 1.0 % of
+one core and 23 MB at peak.
+
+**Two limits, stated rather than glossed.** The installer's in-script build path (`go build`,
+`npm run build`) could not be exercised inside the test distribution, which has no Go or Node
+toolchain; both builds run on the Windows side and the installer's `--binary` and `--web` paths were
+used instead. And the final `claude` link in `AgentMux Server → WSL → tmux → Claude` was not exercised
+end to end on that host: the CLI is a per-user install under a human's home directory, which the
+unprivileged service account cannot traverse, and that is the correct arrangement rather than a
+defect. Everything up to it — the runtime, the pty, the terminal, the WebSocket — was verified end to
+end.
 
 ## Phase 7 — Claude state awareness
 

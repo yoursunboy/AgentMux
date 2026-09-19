@@ -63,7 +63,7 @@ func (s *Server) newUpgrader() websocket.Upgrader {
 		ReadBufferSize:   wsReadBufferBytes,
 		WriteBufferSize:  wsWriteBufferBytes,
 		CheckOrigin: func(r *http.Request) bool {
-			return s.websocketOriginAllowed(r)
+			return s.browserOriginAllowed(r)
 		},
 		// The subprotocol is named here and therefore echoed to a client that
 		// offers it. That matters for a browser specifically: a browser that
@@ -82,23 +82,31 @@ func (s *Server) newUpgrader() websocket.Upgrader {
 	}
 }
 
-// websocketOriginAllowed decides whether a browser page may open a terminal.
+// browserOriginAllowed decides whether a browser page may talk to this server.
 //
 // It is the same policy CORS uses, plus one case CORS cannot express: a page
 // served by this server is allowed to talk to it, wherever this server is
 // reachable. That case is what makes AgentMux usable from a tablet on a LAN
 // without configuring anything, and it is safe for the obvious reason - the
 // page came from here.
-func (s *Server) websocketOriginAllowed(r *http.Request) bool {
+//
+// It is applied at two places, and they are the two places a browser can reach
+// this server. The terminal socket asks it before upgrading, because a
+// WebSocket is not subject to the same-origin policy and a check that is not
+// made there is not made at all. withCORS asks it before serving a request
+// that would change something, because CORS governs what a page may read and
+// says nothing about what it may do.
+func (s *Server) browserOriginAllowed(r *http.Request) bool {
 	origin := strings.TrimSpace(r.Header.Get("Origin"))
 	if origin == "" {
 		// Not a browser page. Browsers always send Origin on a WebSocket
-		// handshake, so a request without one comes from a program on this
-		// machine or on the network, and such a program has no need of a
-		// browser's origin to reach a local server. Refusing it would break
-		// every non-browser client - including this project's own tests -
-		// without protecting anything: the cross-origin attack this check
-		// exists to stop requires a browser.
+		// handshake and on any request that is not a plain read, so a request
+		// without one comes from a program on this machine or on the network,
+		// and such a program has no need of a browser's origin to reach a local
+		// server. Refusing it would break every non-browser client - including
+		// this project's own tests, its recovery script and curl - without
+		// protecting anything: the cross-origin attack this check exists to
+		// stop requires a browser.
 		return true
 	}
 	if sameOrigin(origin, r.Host) {
@@ -131,7 +139,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			"this server was started without a terminal transport", nil)
 		return
 	}
-	if !s.websocketOriginAllowed(r) {
+	if !s.browserOriginAllowed(r) {
 		s.log.Warn("refused a terminal connection from an unpermitted origin",
 			"origin", r.Header.Get("Origin"), "remote", r.RemoteAddr)
 		writeError(w, http.StatusForbidden, CodeForbidden,

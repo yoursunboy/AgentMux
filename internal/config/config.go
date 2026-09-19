@@ -1,13 +1,41 @@
 // Package config resolves the AgentMux server configuration.
 //
-// Sources, in order of increasing precedence:
+// # Sources and precedence
 //
-//	built-in defaults -> JSON config file -> AGENTMUX_* environment -> CLI flags
+// Four sources, each overriding the ones before it:
+//
+//	CLI arguments  >  AGENTMUX_* environment  >  config file  >  built-in defaults
+//
+// The order is not a preference. A flag is what a person types when they want
+// this run to differ; an environment variable is what a service manager sets
+// for every run; the config file is what persists and is edited rarely; and the
+// defaults are what happens when nobody has said anything. A more specific
+// statement beats a less specific one, which is why the file cannot override
+// the flag.
+//
+// # File format
+//
+// The file is JSON by default, and YAML when its name ends in .yaml or .yml.
+// YAML is not a second configuration language: the document is decoded into a
+// generic structure and then handed to the same JSON decoder, so there is one
+// set of key names, one set of type rules and one error path. What YAML adds is
+// comments, which is what lets the checked-in example in config/ explain
+// itself.
+//
+// The file is located from -config, then AGENTMUX_CONFIG, then
+// <data-dir>/config.json. The last of those is written on first run so that a
+// fresh installation has something to edit.
+//
+// # What is not configurable here
 //
 // The package deliberately contains no OS-specific knowledge. Anything that
 // depends on the host platform (the default Projects Root, the default data
 // directory) is injected by the caller through Defaults. This is what keeps
 // "D:\AI\Projects" and "/mnt/d/AI/Projects" out of business logic.
+//
+// No secret belongs in this file. There is nothing here to configure a
+// credential in: AgentMux holds no credentials of its own, and the Claude Code
+// CLI keeps its own, outside AgentMux's reach. See docs/SECURITY.md.
 package config
 
 import (
@@ -20,6 +48,8 @@ import (
 	"strconv"
 	"strings"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/kutonlagos/agentmux/internal/pathutil"
 )
 
@@ -31,6 +61,7 @@ const (
 	EnvDataDir       = EnvPrefix + "DATA_DIR"
 	EnvHost          = EnvPrefix + "HOST"
 	EnvPort          = EnvPrefix + "PORT"
+	EnvDebug         = EnvPrefix + "DEBUG"
 	EnvProjectsRoots = EnvPrefix + "PROJECTS_ROOTS"
 	EnvLogLevel      = EnvPrefix + "LOG_LEVEL"
 	EnvLogFormat     = EnvPrefix + "LOG_FORMAT"
@@ -134,6 +165,25 @@ type ServerConfig struct {
 	// WebSocket upgrade's Origin check, on top of the always-allowed loopback
 	// origins. Empty means loopback only.
 	AllowedOrigins []string `json:"allowedOrigins"`
+
+	// Debug widens what the API reports about the machine this server runs on.
+	//
+	// It is off by default, and it is a deliberate act rather than a consequence
+	// of something else. With it off, GET /api/server omits the four paths that
+	// describe the server's own filesystem layout - the data directory, the
+	// database file, the config file, and the built frontend's directory -
+	// because those are reconnaissance: an unauthenticated endpoint should not
+	// hand a caller a map of the disk. With it on, they are included, which is
+	// what makes a bug report about a misconfigured deployment answerable.
+	//
+	// It is separate from logging.level on purpose. An operator who turns up log
+	// verbosity to chase a problem has not thereby decided to publish filesystem
+	// paths, and a setting that coupled the two would publish them by surprise.
+	//
+	// It affects nothing else: no handler is skipped, no check is relaxed, and
+	// no credential exists to reveal. docs/SECURITY.md §7 has the reasoning for
+	// what is and is not gated.
+	Debug bool `json:"debug"`
 }
 
 // StorageConfig configures the metadata store.
@@ -285,6 +335,11 @@ type Overrides struct {
 	WebDir        string
 	TerminalShell string
 
+	// Debug widens what GET /api/server reports about this machine. Only the
+	// true value is meaningful: the default is off, and there is no flag syntax
+	// for "off" that would differ from not passing the flag.
+	Debug bool
+
 	// TmuxSocket is the deprecated shared socket name. It is accepted and
 	// warned about rather than rejected, so that an existing invocation keeps
 	// starting.
@@ -366,7 +421,7 @@ func Load(o LoadOptions) (*Config, error) {
 	switch {
 	case err == nil:
 		dataDirBefore := cfg.DataDir
-		if err := json.Unmarshal(data, cfg); err != nil {
+		if err := decodeConfigFile(path, data, cfg); err != nil {
 			return nil, fmt.Errorf("config: parse %s: %w", path, err)
 		}
 		if !pathutil.Same(cfg.DataDir, dataDirBefore) {
@@ -395,6 +450,51 @@ func Load(o LoadOptions) (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// decodeConfigFile fills cfg from a configuration file's bytes.
+//
+// The format is chosen by extension: .yaml and .yml are YAML, anything else is
+// JSON. There is only one decoder underneath - a YAML document is read into a
+// generic structure and then re-encoded and handed to the same json.Unmarshal
+// the JSON path uses - so the two formats cannot drift apart, cannot disagree
+// about a key name, and cannot differ in how they treat an unknown key, a
+// wrong type, or a missing section.
+//
+// The generic round trip is what keeps this short. Decoding YAML directly into
+// Config would need a second set of struct tags and a second set of matching
+// rules, and the day the two sets disagreed would be the day a setting worked
+// in one format and was silently ignored in the other.
+func decodeConfigFile(path string, data []byte, cfg *Config) error {
+	if !isYAMLPath(path) {
+		return json.Unmarshal(data, cfg)
+	}
+	var document any
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		return err
+	}
+	// An empty file, or one holding only comments, is an empty configuration
+	// rather than a parse failure: a person who has emptied the file to start
+	// again means to fall back to the defaults.
+	if document == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return fmt.Errorf("the document is not a mapping of setting names to values: %w", err)
+	}
+	return json.Unmarshal(encoded, cfg)
+}
+
+// isYAMLPath reports whether a configuration file's name asks for the YAML
+// reader.
+func isYAMLPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".yaml", ".yml":
+		return true
+	default:
+		return false
+	}
 }
 
 func defaultsFrom(d Defaults) *Config {
@@ -436,6 +536,11 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	}
 	if v, ok := envInt(env, EnvPort); ok {
 		cfg.Server.Port = v
+	}
+	if v, ok := env(EnvDebug); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Server.Debug = b
+		}
 	}
 	if v, ok := env(EnvProjectsRoots); ok {
 		if roots := splitRoots(v); len(roots) > 0 {
@@ -483,6 +588,18 @@ func applyOverrides(cfg *Config, o Overrides) {
 	}
 	if o.Port != 0 {
 		cfg.Server.Port = o.Port
+	}
+	// Debug is a boolean, so the flag can only ever turn it on. That is the
+	// whole of what the flag is for - a person who wants it for one run does not
+	// want to edit a file first - and the way to turn it off is to remove it
+	// from the file or the environment, which is where it was turned on.
+	//
+	// A tri-state pointer would make "-debug=false" beat a file that says true,
+	// at the cost of a field every reader has to dereference to answer "is this
+	// on". For a switch whose default is off and whose on-state is deliberate,
+	// that is a poor trade.
+	if o.Debug {
+		cfg.Server.Debug = true
 	}
 	if len(o.ProjectsRoots) > 0 {
 		cfg.Projects.Roots = append([]string(nil), o.ProjectsRoots...)

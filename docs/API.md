@@ -15,35 +15,94 @@ the WebSocket at `/api/ws`, documented in `docs/TERMINAL.md`. This document cove
 surface only, and the diagnostic endpoints that used to stand in for the terminal are gone: `/api/debug`
 is not routed, not flag-gated, and answers `404 not_found` on an ordinary build and on every other one.
 
+## Requests that change something have to say where they came from
+
+This applies to every endpoint below, so it is stated once, here.
+
+**A request that carries an `Origin` header from somewhere other than this server, and is not a plain
+read, is refused with `403 forbidden`.** A read — `GET`, `HEAD`, `OPTIONS` — from another origin is
+still answered, and still not readable by the caller, which is what CORS is for.
+
+The rule exists because the CORS header alone protects only the reply. Withholding
+`Access-Control-Allow-Origin` stops another page from reading what this server said, and does nothing
+about the request arriving: a `POST` with a simple content type — `text/plain` carrying a JSON body —
+needs no preflight, so the browser delivers it and the server acts on it. Measured against a running
+installation before this check existed, a page on `https://evil.example` registered a project and got
+a `201 Created`.
+
+What is accepted, and why each case is here:
+
+| The request | Answered | Why |
+| --- | --- | --- |
+| No `Origin` at all | yes | Not a browser. `curl`, the recovery script, the tests and every native client send none, and requiring one would refuse all of them. |
+| `Origin` matching the `Host` it was sent to | yes | The UI's own case, and the reason the check compares against the Host rather than a loopback list: a browser that reached this server at the address of the machine is not a loopback origin and is still this server's own page. |
+| `Origin` listed in `server.allowedOrigins` | yes | An operator who names another origin means it. |
+| Anything else, on a method that is not `GET`/`HEAD`/`OPTIONS` | **no — `403 forbidden`** | The case the rule is for. |
+| Anything else, on a read | yes, unreadable | There is no effect to protect, and refusing would break a listed origin for no gain. |
+
+It is the same policy the terminal socket applies before it upgrades, from the same function in the
+server. A browser can reach this server two ways, and a check made at one of them is a check with a
+way around it.
+
+## GET /health
+
+**Not under `/api`, and that is deliberate.** It is not part of the product's API surface, it is not
+versioned with it, and a monitor should not have to track the protocol version to ask whether the
+process is alive.
+
+```json
+{"status":"ok","version":"0.6.5","commit":"31e0f208a3aa","runtime":"available"}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `status` | Liveness. `ok` when the process is serving. |
+| `version` | The version this binary was built as. |
+| `commit` | The git revision it was built from, or absent when it was built without the linker flags — the honest answer rather than a placeholder. |
+| `runtime` | Readiness. `available` when a terminal runtime can run here, `unavailable` when it cannot — which is a working server that manages projects and hosts no terminals. |
+
+**It always returns 200.** A supervisor, a load balancer with no body parser, or a `curl` in a health
+check should not have to read a body to learn that a process is alive; `runtime` is what says whether
+it is useful. It returns no credential, no filesystem detail and no secret — nothing that would make
+an unauthenticated endpoint worth probing for more than this.
+
 ## GET /api/server
 
 Server identity, host and runtime description, capability flags, and the configuration summary.
 Contains no credentials, no tokens, and no provider keys.
 
-This is a server running inside WSL, where the runtime works:
+Since Phase 6.5 the response also carries `runtimeBackend` (the backend name, `tmux`), `tmuxAvailable`
+(whether a terminal runtime can run here), and a `version` and `phase` that name this build. Four
+fields — `dataDirectory`, `databasePath`, `configFile` and `webDirectory` — are **withheld by
+default** and appear only when debug mode is on (`-debug`, `AGENTMUX_DEBUG`, or `server.debug`). Debug
+is deliberately separate from `logging.level`: an operator who turned up log verbosity has not thereby
+decided to publish a map of the disk from an endpoint that has no authentication.
+`docs/SECURITY.md` §7 is the full statement.
+
+This is the installed server, running as a systemd service inside WSL, with the frontend served from
+the same origin. It is one call to a real deployment, not a mock-up:
 
 ```json
 {
   "appName": "AgentMux",
-  "version": "0.1.0",
-  "phase": "Phase 3 - Real Claude Code runtime",
+  "version": "0.6.5",
+  "phase": "Phase 6.5 - Stabilization",
   "status": "online",
-  "startedAt": "2026-09-17T13:31:14Z",
-  "uptimeSeconds": 0,
+  "startedAt": "2026-09-19T01:16:03Z",
+  "uptimeSeconds": 239,
   "host": "linux",
   "hostArch": "amd64",
   "runtimeMode": "native",
   "runtimeOs": "linux",
-  "distro": "Ubuntu-24.04",
+  "distro": "Ubuntu",
   "pathMapper": "native",
   "environment": "wsl",
+  "runtimeBackend": "tmux",
+  "tmuxAvailable": true,
   "runtimeAvailable": true,
-  "projectsRoot": "/tmp/amx-cap/projects",
-  "projectsRoots": ["/tmp/amx-cap/projects"],
+  "projectsRoot": "/srv/projects",
+  "projectsRoots": ["/srv/projects"],
   "discoveryDepth": 3,
-  "dataDirectory": "/tmp/amx-cap/data",
-  "databasePath": "/tmp/amx-cap/data/agentmux.db",
-  "webDirectory": "/mnt/d/AI/projects/2026 AgentMux/web/dist",
   "terminalRuntimeImplemented": true,
   "dependencies": [
     {
@@ -60,12 +119,11 @@ This is a server running inside WSL, where the runtime works:
       "path": "/usr/bin/tmux",
       "required": true,
       "probedIn": "wsl",
-      "note": "The persistent terminal runtime. Sessions outlive the AgentMux server."
+      "note": "The persistent terminal runtime. Each project runs on its own tmux server."
     },
     {
       "name": "claude",
-      "available": true,
-      "path": "/home/you/.local/bin/claude",
+      "available": false,
       "required": false,
       "probedIn": "wsl",
       "note": "Claude Code CLI, started inside a project's runtime on request. Optional: without it a runtime still runs, it just cannot host an agent. This probe is a bare lookup on PATH; the launcher resolves the real binary and version."
@@ -80,28 +138,49 @@ This is a server running inside WSL, where the runtime works:
     }
   ],
   "provider": { "tool": "claude", "integrated": false, "status": "not_integrated" },
+  "tmux": {
+    "available": true,
+    "version": "3.4",
+    "binary": "/usr/bin/tmux",
+    "socketDir": "/var/lib/agentmux/tmux",
+    "minimumVersion": "3.0"
+  },
+  "claude": {
+    "type": "claude",
+    "available": false,
+    "binary": "claude",
+    "message": "claude was not found on PATH; set terminal.claudeBinary to its full path"
+  },
   "features": {
     "projectRegistration": true,
     "projectCreation": true,
     "projectDiscovery": true,
     "gitInit": true,
     "terminal": true,
-    "claudeRuntime": true,
+    "claudeRuntime": false,
     "providerSwitch": false,
     "claudeHooks": false,
     "controllerTransfer": false
   },
-  "claude": {
-    "type": "claude",
-    "available": true,
-    "version": "2.1.274",
-    "binary": "claude",
-    "path": "/home/you/.local/share/claude/versions/2.1.274",
-    "command": "'/home/you/.local/share/claude/versions/2.1.274'"
-  },
   "warnings": []
 }
 ```
+
+`claudeRuntime` is false and `claude.available` is false here, and that is the honest report rather
+than a defect: the service account is a system account with no Claude Code installation of its own,
+and `claude.message` says exactly what to set. `terminal` is true, so this deployment is useful — it
+runs terminals — and it cannot host an agent until somebody points `terminal.claudeBinary` at a
+binary that account can execute. The section below on the Windows example is the other way a
+capability flag goes false.
+
+`uptimeSeconds` is a snapshot, so a later call returns a larger number; `startedAt` is a constant for
+the life of the process and is what "did the service restart" is read from.
+
+Note what is **not** here. There is no `dataDirectory`, no `databasePath`, no `configFile` and no
+`webDirectory` — those four appear only in debug mode, and the paragraph above says why. The one path
+that is published in every mode is `tmux.socketDir`, because it is the directory an operator looks in
+to explain an orphaned session, and a diagnostic that could not name it could not explain one. That
+exception is stated in full in `docs/SECURITY.md` §7 rather than left to be discovered.
 
 Read it in this order, because each field answers a different question and a client that skips one
 will offer something the server cannot do:
@@ -112,6 +191,9 @@ will offer something the server cannot do:
 - `runtimeAvailable` is whether a persistent terminal runtime can execute **here**. It is false on a
   Windows-native server no matter what is installed anywhere, because a Windows process cannot own a
   Linux process tree.
+- `runtimeBackend` names which runtime implements a session — `tmux` — and `tmuxAvailable` is the
+  narrower question of whether the tmux binary was found. They answer differently in the case that
+  matters: a build whose backend is tmux, on a machine with no tmux, has a backend and no runtime.
 - `runtimeUnavailableReason` says what to do about it when it is false. Absent when `runtimeAvailable`
   is true.
 - `terminalRuntimeImplemented` is a statement about the **build**: whether this binary contains the
@@ -711,7 +793,7 @@ Every failure has the same shape:
 | `not_found` | 404 | No such endpoint. |
 | `path_not_accessible` | 403 | The directory exists but cannot be read. |
 | `path_outside_projects_root` | 403 | The path is not inside any configured Projects Root. |
-| `forbidden` | 403 | The request came from a place this server will not serve. Only the `/api/ws` handshake returns it, for an Origin that is neither the server's own nor in `server.allowedOrigins`. |
+| `forbidden` | 403 | The request came from a place this server will not serve. Two things return it: the `/api/ws` handshake, and any request that would change something, for an Origin that is neither the server's own nor in `server.allowedOrigins`. See the section at the top of this document. |
 | `project_already_registered` | 409 | That directory is already a project. |
 | `path_already_exists` | 409 | The create target exists and is not empty. |
 | `runtime_already_running` | 409 | Start was called for a runtime that is already running. |

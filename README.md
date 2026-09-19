@@ -6,18 +6,21 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.1.0, end of Phase 5**. The project model, the server foundation, the
-persistent session runtime, the real Claude Code runtime, the web terminal, and the multi-project
-workspace all exist and work.
+This repository is at **version 0.6.5, end of Phase 6.5**. The project model, the server foundation,
+the persistent session runtime, the real Claude Code runtime, the web terminal, and the multi-project
+workspace all exist and work — and Phase 6.5 added what a deployment needs: a systemd unit, an
+installer, a configuration file, a health endpoint, and a documented answer to what happens when the
+server restarts.
 
 | Works today | Does not exist yet |
 | --- | --- |
-| Server status and capability reporting | Controller / viewer roles, or any lease on typing |
-| Projects Root configuration, Windows/WSL and Linux path mapping | Claude Hooks, Waiting/Completed state detection |
-| Bounded discovery of project candidates | CC Switch / provider switching |
-| Register an existing project | Codex, Gemini, OpenCode |
-| Create a project, optionally with `git init` | SQLite metadata store with migrations | Persistent tmux sessions that outlive the server | Authentication |
-| Concurrent input authority on one project |
+| Server status and capability reporting | Claude Hooks, Waiting/Completed state detection |
+| Projects Root configuration, Windows/WSL and Linux path mapping | CC Switch / provider switching |
+| Bounded discovery of project candidates | Codex, Gemini, OpenCode |
+| Register an existing project | **Authentication** — see `docs/SECURITY.md` §1 |
+| Create a project, optionally with `git init` | Billing, accounts, multi-tenancy |
+| SQLite metadata store with migrations | |
+| Concurrent input authority on one project, with a lease and a handshake | |
 | Runtime start / stop / destroy, with reconciliation on restart | |
 | **One tmux server and socket per project**, so one project's runtime cannot take another's down | |
 | Raw byte-accurate input, real PTY resize, sequenced output | |
@@ -26,28 +29,31 @@ workspace all exist and work.
 | **A live terminal in the browser — xterm.js over `GET /api/ws`, real Claude Code TUI, raw ANSI and Unicode** | |
 | **Raw keyboard input, including Ctrl+C, and a Prompt Bar that shares the same input path** | |
 | **Reconnect and snapshot recovery: a fresh screen with the exact sequence where the stream resumes** | |
-| **Window resize, local scroll that is never yanked to the bottom, and touch keys on a tablet** | |
 | **A workspace of up to five projects at once, one WebSocket, the Project Manager in the last cell** | |
-| **Pages, slots that do not move on their own, Focus, full screen** | |
-| **A project removed from the grid keeps running, and comes back to the session it had** | |
+| **Controller and viewer roles: typing is a lease, and input from a viewer is refused** | |
+| **A systemd service with `Restart=always`, so a server that died comes back by itself** | |
+| **Runtimes that survive a service restart, and reconciliation that reports what it found** | |
+| **`GET /health` for a supervisor, and `GET /api/server` with version, backend and uptime** | |
+| **An installer, a configuration file, and YAML as well as JSON — with one decoder, so they cannot drift** | |
+| **Logs with a component on every record, and nothing a terminal printed ever written to one** | |
 
 The product is not described here as if it were finished. A project's runtime hosts the real Claude
-Code CLI, and its terminal is now in the browser: the bytes are the terminal's own, the keystrokes are
-the keyboard's own, and closing the tab leaves Claude running. What is missing is around the edge of
-that — no controller or viewer roles, so every browser that can reach the server can type; and no
-authentication.
+Code CLI, and its terminal is in the browser: the bytes are the terminal's own, the keystrokes are the
+keyboard's own, and closing the tab leaves Claude running. Phase 6.5 did not add product capability —
+it made what exists deployable, upgradeable, recoverable, monitorable and able to run for a long time.
+What is still missing is around that edge: **no authentication**, so every browser that can reach the
+port can type, and no hooks or task state, so the workspace cannot yet tell you that an agent is
+waiting for you.
 
-One thing about the development host rather than this build: the WSL Claude Code is installed but
-**not signed in**, so a terminal opened on it shows Claude Code's own sign-in screen rather than a
-conversation. That is Phase 3's outstanding item, and neither Phase 4 nor Phase 5 was allowed to touch
-it — nothing was copied, faked, or worked around to hide it. Everything the terminal does is verified
-with real shells in real tmux sessions, and the Claude TUI is verified as far as the screens Claude
-itself draws on this host: its sign-in flow and its first-run theme picker, both real full-screen TUIs
-drawn through the same path.
+Phase 6.5 was validated on a real Linux server — systemd 255, tmux 3.4, Ubuntu 24.04 under WSL2 —
+where the installer, the service, all three recovery cases, the upgrade path and the health endpoint
+were exercised rather than argued. What could not be validated there is stated where it belongs rather
+than glossed: see `docs/DEPLOYMENT.md` §Platforms and §Troubleshooting.
 
 `provider.integrated` is false and the provider switch is a disabled control that says "Coming later".
-See `docs/ROADMAP.md` for the phase table, `docs/WORKSPACE.md` for the grid, `docs/TERMINAL.md` for the
-transport, and `docs/RUNTIME.md` for how the runtime works and what it does not do.
+See `docs/ROADMAP.md` for the phase table, `docs/DEPLOYMENT.md` for putting it on a server,
+`docs/WORKSPACE.md` for the grid, `docs/TERMINAL.md` for the transport, and `docs/RUNTIME.md` for how
+the runtime works and what it does not do.
 
 ## Requirements
 
@@ -143,10 +149,53 @@ The Projects Root is spelled for the side the server runs on. A WSL server wants
 `/mnt/d/AI/Projects`; a Windows server wants `D:\AI\Projects`. AgentMux maps between them for
 display, so a project registered from either side shows the same directory.
 
+## Deploying it on a server
+
+For anything you intend to keep running, install it as a service rather than starting it by hand:
+
+```sh
+sudo ./deploy/linux/install.sh --root /srv/projects
+```
+
+That builds the server and the frontend, creates an unprivileged `agentmux` service account, installs
+everything under `/opt/agentmux`, writes a configuration file, installs and enables a systemd unit,
+starts it and checks `/health`.
+
+There is no Docker image and this phase does not add one — the runtime is tmux driving real ptys in a
+real filesystem, and a container between the two would add a layer whose failure modes are
+indistinguishable from tmux's own.
+
+On a Windows host the server belongs **inside** the WSL distribution, with systemd enabled. There is
+no Windows-native tmux and there will be no Windows-native service.
+
+| Document | What it covers |
+| --- | --- |
+| [`deploy/linux/README.md`](deploy/linux/README.md) | The operational guide: install, the unit, recovery, upgrade, WSL2, uninstall, troubleshooting |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | The reference behind it: every setting, the log rules, the health contract, the performance baseline |
+| [`docs/BACKUP.md`](docs/BACKUP.md) | Backing up and restoring the database, and what a restore does not get you |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | What the absent authentication means, and the checklist before exposing the port |
+
+`deploy/linux/recovery-test.sh` runs the three recovery cases against a real installation, and
+`deploy/linux/loadtest.py` takes the performance baseline.
+
 ## Configuration
 
-Flags override the configuration file, which overrides the platform defaults. The flags worth
-knowing:
+Precedence, and it is worth internalising before editing anything:
+
+```
+CLI arguments  >  AGENTMUX_* environment  >  the configuration file  >  built-in defaults
+```
+
+A flag is what a person types when they want this run to differ; an environment variable is what a
+service manager sets for every run; the file persists and is edited rarely. The more specific
+statement wins.
+
+The file may be **YAML or JSON**. `.yaml` and `.yml` are read as YAML and everything else as JSON, and
+there is exactly one decoder behind both: a YAML document is converted to JSON and handed to the same
+unmarshaler, so the two formats cannot drift apart in key names, types or error behaviour.
+`config/agentmux.example.yaml` documents every key with its default.
+
+The flags worth knowing:
 
 | Flag | Meaning |
 | --- | --- |
@@ -159,12 +208,17 @@ knowing:
 | `-tmux-binary <path>` | The tmux executable every project's runtime runs. Default: `tmux` on `PATH`. Set it to `/usr/bin/tmux` or a user-local path to pin the exact binary. |
 | `-tmux-socket-dir <dir>` | Directory holding one tmux socket per project. Default `<data-dir>/tmux`. |
 | `-tmux-socket <name>` | **Deprecated, no effect.** Accepted and warned about, never silently reinterpreted. See below. |
-| `-config <file>` | Use a specific JSON configuration file. |
+| `-config <file>` | Use a specific configuration file. YAML or JSON, chosen by extension. |
 | `-web-dir <dir>` | Serve the built frontend from this directory. |
+| `-debug` | Include this machine's filesystem layout in `GET /api/server`. Off by default; see `docs/SECURITY.md` §7. |
 | `-log-level`, `-log-format` | `debug`/`info`/`warn`/`error`, and `text`/`json`. |
+| `-version` | Print the version, the git commit it was built from and the phase, then exit. |
 
 In the configuration file these are `terminal.tmuxBinary` and `terminal.tmuxSocketDir`; the
-environment overrides are `AGENTMUX_TMUX_BINARY` and `AGENTMUX_TMUX_SOCKET_DIR`.
+environment overrides are `AGENTMUX_TMUX_BINARY` and `AGENTMUX_TMUX_SOCKET_DIR`. The data directory is
+deliberately **not** settable from the file: the default configuration file lives inside the data
+directory, so a file that could move it would be deciding where it itself is. Set it with `-data-dir`
+or `AGENTMUX_DATA_DIR`.
 
 **One project, one tmux server, one socket.** Since Phase 2.5 each project's runtime gets its own
 tmux server, addressed as `tmux -S <data-dir>/tmux/<projectId>.sock`. tmux identifies a server by its
@@ -187,16 +241,46 @@ outside the configured roots. The default on Windows is `D:\AI\Projects`. On Lin
 A request naming a path outside every configured root is refused with `path_outside_projects_root`
 rather than quietly accepted.
 
-Logs never contain API keys, tokens, secrets, or credentials.
+Logs carry a timestamp, a level, a component and an event, and never contain terminal output, anything
+a user typed, a prompt, an API key, a token, a secret or a credential. `docs/DEPLOYMENT.md` §Logs has
+the rule and the rotation, which under systemd is the journal's job and not AgentMux's.
+
+## Health and server information
+
+Two endpoints answer "is it up", and they answer different questions.
+
+`GET /health` is the one a supervisor, a load balancer or a person with `curl` asks. It always returns
+200, because a monitor should not have to parse a body to learn the process is alive:
+
+```json
+{"status":"ok","version":"0.6.5","commit":"31e0f208a3aa","runtime":"available"}
+```
+
+`status` is liveness; `runtime` is readiness, and reads `unavailable` on a host with no tmux — which
+is a working server that cannot host a terminal. It carries no credential, no filesystem detail and
+no secret, and it sits deliberately outside `/api`, so a monitor need not track the protocol version.
+
+`GET /api/server` is the richer one: version, operating system, runtime backend, whether tmux is
+available, and uptime, alongside the projects roots and the dependency probes. It reports the machine's
+*platform* rather than its identity — the server never asks the operating system for a hostname or a
+username, so there is none to withhold — and four of its own paths (the data directory, the database,
+the config file and the frontend directory) are absent unless debug mode is on. The tmux socket
+directory is the one path published in every mode, because it is what an orphaned session is explained
+from. Turning on debug is a separate decision from turning up log verbosity, and `docs/SECURITY.md` §7
+says exactly what appears and why.
+
+Requests that change something are checked against their `Origin`: a page from another site cannot
+create a project, start a runtime or open a terminal, and a request from a program — `curl`, a script —
+is unaffected because it sends no `Origin` at all. `docs/SECURITY.md` §4 is the rule and the reasoning.
 
 ## Where the data lives
 
 | What | Where |
 | --- | --- |
 | SQLite database | `<data-dir>/agentmux.db` |
-| Configuration file | `<data-dir>/config.json` |
+| Configuration file | `<data-dir>/config.json`, or `/etc/agentmux/agentmux.yaml` under `deploy/linux` |
 | tmux sockets, one per project | `<data-dir>/tmux/<projectId>.sock` |
-| Logs | stderr |
+| Logs | stderr, which is the journal under systemd |
 
 The default data directory is `%AppData%\AgentMux` on Windows and `$XDG_CONFIG_HOME/AgentMux` (or
 `~/.config/AgentMux`) on Linux, both taken from the platform's own configuration directory. Nothing
@@ -354,6 +438,14 @@ It needs a WSL distribution with tmux and the Claude Code CLI, Go on the machine
 and Chrome (which Playwright drives as a channel rather than downloading). `docs/ROADMAP.md` Phase 5
 lists what the five suites cover and `docs/WORKSPACE.md` §6 is where the measured geometry is.
 
+The deployment in `deploy/linux/` is tested the same way — against a real installation rather than in
+a unit test:
+
+```bash
+sudo ./deploy/linux/recovery-test.sh   # the three recovery cases, against the running service
+python3 deploy/linux/loadtest.py       # the performance baseline
+```
+
 ## Documentation reading order
 
 1. `docs/PRODUCT_REQUIREMENTS.md`
@@ -367,8 +459,13 @@ lists what the five suites cover and `docs/WORKSPACE.md` §6 is where the measur
 9. `docs/CLAUDE_RUNTIME.md` — how the real Claude Code CLI is resolved, launched, observed and stopped
 10. `docs/TERMINAL.md` — the terminal protocol, the snapshot boundary, and its fidelity limits
 11. `docs/WORKSPACE.md` — the grid, its slots, its pages, and its multi-device limit
-12. `CLAUDE.md`
-13. `.claude/rules/`
+12. `docs/MULTI_DEVICE.md` — control, the lease, and its transfer handshake
+13. `docs/DEPLOYMENT.md` — putting it on a server, and what a restart does and does not bring back
+14. `docs/BACKUP.md` — what to back up, what not to, and how to restore
+15. `docs/SECURITY.md` — start here before the port is reachable from anywhere but this machine
+16. `deploy/linux/README.md` — the operator's guide to the two above
+17. `CLAUDE.md`
+18. `.claude/rules/`
 
 ## Development principle
 
@@ -406,5 +503,15 @@ working in one of them. Two defects came out of the browser suites rather than t
 is the argument for having them.
 
 Phase 6 adds explicit controller and viewer ownership, so the same project can be open on a PC, a
-tablet and a phone at once while exactly one client controls input and resize. Claude Hooks, state
-detection, notifications, provider switching, and additional AI tools are later milestones.
+tablet and a phone at once while exactly one client controls input and resize.
+
+Phase 6.5 added no product capability at all, deliberately. It made what was already there
+deployable, upgradeable, recoverable, monitorable and able to run for a long time: a systemd unit, an
+installer, a YAML-or-JSON configuration file behind one decoder, a health endpoint for a supervisor,
+a component on every log record, a version and a git commit in the binary, a documented recovery model
+with a script that exercises it, and a measured performance baseline. Its two honest limits are stated
+in the documents rather than glossed: the in-script build path was not exercised inside the test
+distribution, which has no Go or Node toolchain, and the final `claude` link in the deployment chain
+was not exercised end to end on that host because the CLI belongs to a human's account and the service
+account cannot reach it. Claude Hooks, state detection, notifications, provider switching, additional
+AI tools, accounts and billing are later milestones.

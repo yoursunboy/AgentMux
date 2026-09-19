@@ -1,0 +1,253 @@
+# AgentMux configuration — an example, with every setting and its default.
+#
+# This file is a reference, not a file the server reads. Nothing points at it:
+# it is checked in so that an operator has one place to look up a key name,
+# instead of reading the source or the flag list. Copy it to somewhere the
+# service can read it and delete what you do not need:
+#
+#     sudo mkdir -p /etc/agentmux
+#     sudo cp config/agentmux.example.yaml /etc/agentmux/agentmux.yaml
+#     sudo chmod 640 /etc/agentmux/agentmux.yaml
+#
+# deploy/linux/install.sh does exactly that, and deploy/linux/README.md is the
+# deployment guide. docs/DEPLOYMENT.md §Configuration has the precedence rules.
+#
+# ---------------------------------------------------------------------------
+# Precedence, and why it is this order
+# ---------------------------------------------------------------------------
+#
+#     CLI arguments  >  AGENTMUX_* environment  >  this file  >  built-in defaults
+#
+# A flag is what a person types when they want this run to differ; an
+# environment variable is what a service manager sets for every run; this file
+# persists and is edited rarely. The more specific statement wins.
+#
+# The practical consequence: anything set in the systemd unit's Environment=
+# lines cannot be changed by editing this file. deploy/linux/agentmux.service
+# sets only the two values this file is not allowed to carry — see the note on
+# dataDir below.
+#
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+#
+# There are none, and there is nowhere here to put one. AgentMux holds no
+# credentials of its own: the Claude Code CLI keeps its own, in its own files,
+# outside AgentMux's reach. Do not add an apiKey or a token key to this file —
+# nothing reads them, and a file that looks like it holds a credential is a file
+# somebody will put one in. docs/SECURITY.md §5 is the full statement.
+
+# ---------------------------------------------------------------------------
+# server — the HTTP listener
+# ---------------------------------------------------------------------------
+server:
+  # The address to bind. 127.0.0.1 is reachable only from this machine, which is
+  # the right default for a terminal server: it has no authentication, so who
+  # can reach the port is the whole of its access control.
+  #
+  # Change it to 0.0.0.0 only on a trusted network, and read docs/SECURITY.md §3
+  # first. A bind on 0.0.0.0 is a bind on every interface, including any that
+  # face a network you did not mean to expose a shell to.
+  host: 127.0.0.1
+
+  port: 8787
+
+  # How long a client has to send its request headers.
+  readHeaderTimeoutSeconds: 10
+
+  # readTimeoutSeconds and writeTimeoutSeconds are 0 (disabled) and must stay
+  # that way. A write deadline applies to hijacked connections, and the terminal
+  # WebSocket is one, so a non-zero value here would close every terminal on a
+  # timer. Per-request limits are enforced in the handlers instead.
+  readTimeoutSeconds: 0
+  writeTimeoutSeconds: 0
+
+  # How long an idle keep-alive connection is held open.
+  idleTimeoutSeconds: 120
+
+  # How long a shutdown waits for in-flight requests before the process exits.
+  shutdownGraceSeconds: 10
+
+  # How long a browser that holds a project's terminal keeps it after its
+  # connection drops.
+  #
+  # This is a grace period, not a timeout: the usual reason a controller's
+  # socket closes is a network that will come back — a tablet that slept, a
+  # laptop that changed networks, a page being reloaded. Releasing on the
+  # disconnect would hand the terminal to whoever asks first during a two-second
+  # gap. Thirty seconds is the product default; raise it for a link that drops
+  # often, lower it on a machine where the lease should turn over quickly.
+  controlGraceSeconds: 30
+
+  # Extra browser origins permitted by CORS and by the WebSocket upgrade's
+  # Origin check, on top of the loopback origins that are always allowed.
+  #
+  # Needed only when the UI is served from somewhere other than this server —
+  # a development Vite server, say. A page on the public internet cannot reach a
+  # loopback AgentMux through a browser, and adding an origin here is how you
+  # would let one try, so add nothing you do not recognise.
+  allowedOrigins: []
+
+  # Widen what GET /api/server reports about this machine: with debug on, the
+  # response includes the data directory, the database file, the config file and
+  # the built frontend's directory.
+  #
+  # Off by default, and deliberately separate from logging.level — an operator
+  # who turns up log verbosity to chase a problem has not thereby decided to
+  # publish a map of the disk from an endpoint that has no authentication.
+  # docs/SECURITY.md §7.
+  debug: false
+
+# ---------------------------------------------------------------------------
+# storage — the metadata database
+# ---------------------------------------------------------------------------
+storage:
+  # The SQLite file. A relative path is resolved against the data directory, so
+  # the default puts it at /var/lib/agentmux/agentmux.db.
+  #
+  # This database holds projects, their workspace slots, and one row per runtime.
+  # It does not hold terminal output, prompts or conversation content. Back it
+  # up with docs/BACKUP.md, and never while the service is writing to it without
+  # the procedure described there.
+  sqlitePath: agentmux.db
+
+# ---------------------------------------------------------------------------
+# projects — where projects are found
+# ---------------------------------------------------------------------------
+projects:
+  # The directories AgentMux scans for projects, in order. The first is the
+  # default target for a new project.
+  #
+  # Absolute paths only. A root that does not exist yet is a warning rather than
+  # a failure: the drive may not be mounted, and refusing to start would mean
+  # the whole server is down because one volume is not there.
+  roots:
+    - /srv/projects
+
+  # How deep below a root discovery walks. Depth 2 reaches Root/Collection/
+  # Project; 3 leaves a level of margin.
+  discoveryDepth: 3
+
+  # Bounds on a single scan, so that a root that turns out to be a home
+  # directory with a million files in it ends the scan rather than the server.
+  maxCandidates: 500
+  maxScanDirectories: 20000
+  scanTimeoutSeconds: 20
+
+# ---------------------------------------------------------------------------
+# runtime — the execution environment for terminal sessions
+# ---------------------------------------------------------------------------
+runtime:
+  # auto   — decide from the host platform
+  # native — run tmux directly (this is what a Linux server uses)
+  # wsl    — run tmux inside a WSL distribution (this is what a Windows host uses)
+  #
+  # On a Linux server this is effectively native whatever it says, and leaving
+  # it as auto is correct. It becomes worth setting when a Windows host has more
+  # than one distribution installed and the automatic choice is not the one the
+  # projects live in — see distro below.
+  mode: auto
+
+  # The WSL distribution to run in. Empty means auto-detect. Ignored off Windows.
+  distro: ""
+
+  # The mount point under which WSL exposes Windows drives.
+  wslMountRoot: /mnt
+
+# ---------------------------------------------------------------------------
+# terminal — the terminal runtime itself
+# ---------------------------------------------------------------------------
+terminal:
+  # Which tmux every project's runtime runs. A bare name is resolved on PATH; an
+  # absolute path is used as given.
+  #
+  # Worth setting when a machine has more than one tmux: a runtime that measured
+  # one binary and drove another would report a version for a program that never
+  # ran. Empty means "tmux" on PATH.
+  tmuxBinary: ""
+
+  # Where the per-project sockets live. Empty means a directory under the data
+  # directory, which is /var/lib/agentmux/tmux.
+  #
+  # One project, one tmux server, one socket — that is the whole of the fault
+  # isolation. A tmux server is identified by its socket, so two socket paths
+  # are two servers, and two servers cannot take each other down.
+  tmuxSocketDir: ""
+
+  # The shell a session runs when no command is given. Empty means the account's
+  # own shell, from /etc/passwd.
+  shell: ""
+
+  # The Claude Code CLI a project's runtime starts. Empty means "claude" on
+  # PATH, resolved in the account's environment.
+  #
+  # It is configurable for the same reason tmuxBinary is: a machine can have
+  # more than one Claude Code — a native install, a package manager's, a Node
+  # install — and a runtime that reported one version while launching another
+  # would be describing a program that never ran.
+  claudeBinary: ""
+
+  # The canonical terminal geometry, for a session that has no client yet.
+  # Zero means the runtime's own default.
+  #
+  # A session needs a size before anyone attaches. Letting the first client to
+  # connect decide would make the terminal's size a side effect of who clicked
+  # first, and would resize a program that had already drawn itself.
+  canonicalCols: 0
+  canonicalRows: 0
+
+  # How much recent output is kept in memory per runtime, so that a reconnecting
+  # client can be given what it missed. Zero means the runtime's default.
+  #
+  # This is not the session's scrollback — that lives in tmux and is bounded by
+  # tmux's own history limit. This is the buffer a browser catches up from.
+  historyChunks: 0
+  historyBytes: 0
+
+  # socket is removed. It named one shared tmux socket, which stopped
+  # describing anything in Phase 2.5 when every project got its own server. A
+  # file that still sets it starts, warns, and ignores it.
+
+# ---------------------------------------------------------------------------
+# logging
+# ---------------------------------------------------------------------------
+logging:
+  # debug, info, warn, error.
+  level: info
+
+  # text is for a person reading journalctl; json is for a log pipeline.
+  #
+  # Either way the records carry a timestamp, a level, a component and an event,
+  # and neither way does terminal output, anything a user typed, or a credential
+  # reach a log. internal/logging has the rule; docs/DEPLOYMENT.md §Logs has the
+  # rotation, which under systemd is the journal and is not AgentMux's business.
+  format: text
+
+# ---------------------------------------------------------------------------
+# web — the built frontend
+# ---------------------------------------------------------------------------
+web:
+  # The directory holding the built UI. A relative path is resolved against the
+  # process's working directory, and the systemd unit sets that to /opt/agentmux,
+  # so this default lands on /opt/agentmux/web/dist — which is where install.sh
+  # puts the bundle.
+  #
+  # When the directory is missing the server still runs; it just serves the API
+  # and no UI, and says so in its log.
+  dir: web/dist
+
+# ---------------------------------------------------------------------------
+# dataDir — where AgentMux keeps its own state
+# ---------------------------------------------------------------------------
+#
+# Deliberately absent. The data directory holds the database, the config file
+# and the per-project tmux sockets, and it is set from -data-dir or
+# AGENTMUX_DATA_DIR rather than from this file.
+#
+# The reason is circularity: the default config file lives *inside* the data
+# directory, so a file that could move the data directory would be deciding
+# where it itself is. A dataDir key in this file is ignored and reported as a
+# warning rather than silently accepted.
+#
+# deploy/linux/agentmux.service sets AGENTMUX_DATA_DIR=/var/lib/agentmux, which
+# is why that line cannot be moved into this file.

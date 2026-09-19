@@ -59,6 +59,24 @@ type serverInfoResponse struct {
 	// Windows is not where the runtime runs.
 	Environment string `json:"environment"`
 
+	// RuntimeBackend and TmuxAvailable are the two halves of "what would run a
+	// terminal here, and is it installed".
+	//
+	// RuntimeBackend comes from the runtime itself rather than from a constant
+	// in this package, because it is the runtime's own name for itself: the
+	// value recorded with every runtime row in the database is the same string,
+	// so a report that disagreed with the database would be a report about a
+	// backend that never ran. It is "tmux" today, and it is empty when the
+	// manager has no backend to name.
+	//
+	// TmuxAvailable is the dependency probe's verdict, promoted from the
+	// Dependencies list to a field a client can read without searching that
+	// list for the right entry. It answers "is the program on the PATH"; it is
+	// not the same question as RuntimeAvailable, which asks whether this process
+	// could execute a terminal at all.
+	RuntimeBackend string `json:"runtimeBackend,omitempty"`
+	TmuxAvailable  bool   `json:"tmuxAvailable"`
+
 	// RuntimeAvailable reports whether a persistent terminal runtime can
 	// execute here at all, and RuntimeUnavailableReason says what to do about
 	// it when it cannot. A client must not render a terminal, or offer to start
@@ -72,8 +90,19 @@ type serverInfoResponse struct {
 	ProjectsRoots  []string `json:"projectsRoots"`
 	DiscoveryDepth int      `json:"discoveryDepth"`
 
-	DataDirectory string `json:"dataDirectory"`
-	DatabasePath  string `json:"databasePath"`
+	// The four fields below describe where this server keeps its own files.
+	// They are empty unless debug mode is on, and empty is the only other thing
+	// they can be - each is resolved during configuration and cannot legitimately
+	// be blank - so a client can read their absence as "withheld" rather than
+	// "misconfigured".
+	//
+	// Why they are withheld: see ServerConfig.Debug, and docs/SECURITY.md §7.
+	// The short version is that this endpoint has no authentication, and a list
+	// of directories on the host is a map of the disk which is useful to
+	// somebody who has not been given one. Nothing about them is a credential;
+	// they are simply not needed to use the API and are needed to probe it.
+	DataDirectory string `json:"dataDirectory,omitempty"`
+	DatabasePath  string `json:"databasePath,omitempty"`
 	ConfigFile    string `json:"configFile,omitempty"`
 	WebDirectory  string `json:"webDirectory,omitempty"`
 
@@ -140,7 +169,7 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	if dep, ok := findDependency(dependencies, "tmux"); ok {
 		tmuxAvailable = dep.Available
 	}
-	terminalReady := info.RuntimeAvailable && tmuxAvailable && version.TerminalRuntimeImplemented
+	terminalReady := s.terminalCanRun(info, dependencies)
 
 	// The agent is resolved here rather than reported from a cached capability,
 	// because the answer is a property of the machine and not of the build: the
@@ -175,14 +204,12 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		RuntimeAvailable:         info.RuntimeAvailable,
 		RuntimeUnavailableReason: info.RuntimeUnavailableReason,
 
+		RuntimeBackend: s.runtime.BackendName(),
+		TmuxAvailable:  tmuxAvailable,
+
 		ProjectsRoot:   firstRoot,
 		ProjectsRoots:  roots,
 		DiscoveryDepth: s.discoverer.MaxDepth(),
-
-		DataDirectory: s.cfg.DataDir,
-		DatabasePath:  s.cfg.SQLitePath(),
-		ConfigFile:    s.cfg.SourceFile,
-		WebDirectory:  s.webDir,
 
 		TerminalRuntimeImplemented: version.TerminalRuntimeImplemented,
 		Dependencies:               dependencies,
@@ -216,6 +243,15 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		Warnings: append([]string(nil), s.cfg.Warnings...),
 	}
 
+	// Where this server keeps its files. Off by default, and on only when an
+	// operator has asked for it with -debug, AGENTMUX_DEBUG or server.debug.
+	if s.cfg.Server.Debug {
+		response.DataDirectory = s.cfg.DataDir
+		response.DatabasePath = s.cfg.SQLitePath()
+		response.ConfigFile = s.cfg.SourceFile
+		response.WebDirectory = s.webDir
+	}
+
 	// A runtime that cannot execute is worth saying in the warnings list,
 	// because that is what the UI already renders as a banner. The reason is
 	// the one a user can act on: which side of the boundary to start the server
@@ -242,6 +278,89 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 		response.Warnings = []string{}
 	}
 	writeJSON(w, s.log, http.StatusOK, response)
+}
+
+// healthResponse is the body of GET /health.
+//
+// It is three fields, and the shortness is the design. A health check is asked
+// by a supervisor every few seconds, and its answer is read by a program that
+// has to decide one thing: is this process working. Everything else - which
+// paths it uses, what it has configured, who it is - is either useless to that
+// decision or reconnaissance. docs/SECURITY.md §7 has the full list of what
+// this endpoint deliberately does not say.
+//
+// There is no field here that could carry a credential, and no field that
+// describes the filesystem. The three that remain are the process's liveness,
+// its identity, and the one machine capability a person checking by hand
+// actually wants.
+type healthResponse struct {
+	Status string `json:"status"`
+
+	// Version is the release, and Commit the git revision it was built from.
+	// The pair is what makes "did the upgrade take effect" a question curl can
+	// answer: a service that restarted into the old binary looks identical to
+	// one that restarted into the new one until you compare this. Commit is
+	// absent for a binary built without the linker flag rather than reported as
+	// an empty string, so that its presence means something.
+	Version string `json:"version"`
+	Commit  string `json:"commit,omitempty"`
+
+	// Runtime is "available" or "unavailable": whether a persistent terminal
+	// session can execute on this machine at all.
+	//
+	// It is not "healthy" or "unhealthy", because the two are different
+	// questions and the difference matters to whoever reads this. A server on a
+	// host with no tmux is working perfectly - it manages projects, serves the
+	// UI and answers every endpoint - it simply cannot host a terminal. Calling
+	// that unhealthy would have a supervisor restart a process that is doing
+	// nothing wrong, in a loop, and the restart would not install tmux.
+	Runtime string `json:"runtime"`
+}
+
+// handleHealth implements GET /health.
+//
+// It answers 200 whenever the process can serve a request at all. There is no
+// unhealthy status, and that is deliberate: the only failures this handler
+// could report are failures of the machine it runs on, and a health endpoint
+// that returned 503 for a missing tmux would be asking a supervisor to restart
+// AgentMux until tmux appeared.
+//
+// Readiness, as opposed to liveness, is the `runtime` field, and it is also
+// reported by GET /api/server with its inputs and an explanation. This is the
+// one-line version for a script.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+
+	response := healthResponse{
+		Status:  "ok",
+		Version: version.Version,
+		Commit:  version.ShortCommit(),
+		Runtime: "unavailable",
+	}
+	if s.terminalCanRun(s.host.Info(ctx), s.host.CheckDependencies(ctx)) {
+		response.Runtime = "available"
+	}
+	writeJSON(w, s.log, http.StatusOK, response)
+}
+
+// terminalCanRun reports whether a persistent terminal session can run on this
+// machine.
+//
+// It is the one place the rule is written down, and it is written down once
+// because two endpoints report it: GET /api/server publishes the verdict beside
+// the probe results it was derived from, and GET /health publishes the verdict
+// alone. A second copy of the expression is how the two would come to disagree
+// about the same machine - and the disagreement would be invisible, because
+// each answer is internally consistent.
+//
+// All three conditions are required, and they are three different kinds of
+// fact. TerminalRuntimeImplemented is about this build; RuntimeAvailable is
+// about which side of the WSL boundary the process is on; the tmux probe is
+// about what is installed in the environment the runtime will actually use.
+func (s *Server) terminalCanRun(info host.SystemInfo, dependencies []host.Dependency) bool {
+	dep, ok := findDependency(dependencies, "tmux")
+	return info.RuntimeAvailable && ok && dep.Available && version.TerminalRuntimeImplemented
 }
 
 // runtimeBlocker explains why the terminal runtime is not ready, or "" when it

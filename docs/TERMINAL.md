@@ -92,6 +92,12 @@ exists to stop requires a browser. Refusing it would break every non-browser cli
 project's own tests — without protecting anything. The default is *not* "accept everything": a page
 served from a hostname that is neither this server nor on the list is refused.
 
+The same policy guards the rest of the API, from the same function: since Phase 6.5 a request that
+would change something — anything that is not a `GET`, `HEAD` or `OPTIONS` — is refused with the same
+`403 forbidden` when it comes from an origin this table refuses. It has to be, because CORS protects
+only the reply: a page on another site can send a request this server will act on and simply not be
+able to read the answer. `docs/SECURITY.md` §4 is the full statement.
+
 **The server never opens the connection on a browser's behalf.** A client cannot name a host, a port,
 a socket path, or a directory. It names a `projectId`, and the server resolves that through the
 project repository to a runtime it is already running. A project the server does not know is

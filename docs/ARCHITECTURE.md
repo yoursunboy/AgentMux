@@ -535,10 +535,25 @@ go to whatever is already running in the pane, exactly as typing would. Nothing 
 path from a client either — a subscribe names a `projectId`, which the server resolves against the
 projects it already knows.
 
-**A page from another origin cannot open a terminal.** The WebSocket handshake is checked against the
-request's own host and against `server.allowedOrigins`; a missing `Origin` is allowed because browsers
-always send one, so a request without one is a program rather than a page. This is the check that stops
-a site the user is visiting from connecting to a local AgentMux server.
+**A page from another origin cannot open a terminal, and cannot change anything.** One policy,
+`browserOriginAllowed`, is asked at both places a browser can reach this server: the WebSocket
+handshake, and every HTTP request that is not a plain read. It allows a missing `Origin` (browsers
+always send one, so a request without one is a program rather than a page), the host the request was
+sent to, and anything in `server.allowedOrigins`; everything else gets `403 forbidden`.
+
+The HTTP half was added in Phase 6.5, and the reason is the shape of the mistake it corrects. CORS
+alone protects the reply and not the effect: a `POST` with a simple content type needs no preflight,
+so a browser delivers it whatever the server does with the response headers. Measured against the
+installed service, a page on another origin registered a project and was answered `201 Created`.
+The policy is kept in one function so that the two entry points cannot drift; the detail, and what
+each case is for, is `docs/SECURITY.md` §4.
+
+**The HTTP surface publishes nothing that maps the disk, and one path that does.** `GET /api/server`
+withholds the data directory, the database path, the configuration file and the frontend directory
+unless debug mode is on, because an endpoint with no authentication is the wrong place to publish a
+filesystem layout and nothing in the API needs them. `tmux.socketDir` is the exception and stays,
+because it is the directory an orphaned session is explained from. `GET /health` carries no path and
+no credential at all, and a test asserts its exact key set rather than a list of forbidden names.
 
 **Nothing sensitive is logged.** Terminal output, raw input, and the contents of a Prompt Bar prompt are
 never written to the log at any level, in either direction. The permitted fields are listed in
@@ -570,3 +585,39 @@ Tailscale/private network
 The terminal endpoint has no authentication of its own — it is as reachable as the server is — so the
 network boundary above is what keeps it private, and that is a deployment decision rather than
 something this layer decides.
+
+## 15. Deployment
+
+The architecture above describes a server process and a set of tmux servers. Phase 6.5 added the thing
+that keeps both of them alive across a restart, and it is worth stating as a structure rather than as
+an installer, because one line of it decides the whole recovery story.
+
+```text
+systemd
+  └── AgentMux Server            User=agentmux, Restart=always, KillMode=process
+        └── tmux server          one per project, started on request
+              └── Claude Code    started in a pane, when a person asks
+```
+
+Every layer outlives the ones above it in a different way. A project's tmux server is **not** a child
+of the AgentMux server in any sense the kernel enforces — tmux detaches by forking, which changes its
+controlling terminal but not its cgroup — so it survives the server exiting, and the server re-adopts
+it on the way back up by finding the socket. That is why a restart preserves running sessions, and it
+is a property of how tmux starts rather than of anything AgentMux does at shutdown.
+
+It is also why `KillMode=process` in the unit is load-bearing rather than tidy. The default,
+`control-group`, signals every process in the unit's cgroup when the service stops — and the tmux
+server is in that cgroup, because detaching changed its terminal and not its cgroup membership. Under
+the default, `systemctl restart` would kill every session and the server would come back, reconcile,
+and correctly report every runtime as stopped, having destroyed them itself. The unit ships the
+setting; `deploy/linux/README.md` §Recovery has the three cases and the test that runs them.
+
+What no setting can do is survive a reboot, because a reboot ends every process including the tmux
+servers. Runtimes come back **stopped** after one, and resuming one is a person's decision rather than
+the server's: it never starts a runtime on its own initiative, and it never kills a session it did not
+have a record of. A socket it cannot account for is reported and left alone.
+
+The server itself is one binary and one SQLite file, both under a directory that belongs to an
+unprivileged service account. There is no container, no cluster and no separate database process:
+`docs/DEPLOYMENT.md` is the operator's view, and the decision not to ship Docker in this phase is
+recorded there and in the root `README.md`.

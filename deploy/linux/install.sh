@@ -338,29 +338,48 @@ install_agentmux() {
 
   # --- an upgrade is a stop, a backup, a replace, a start -----------------
 
+  # Whether this is an upgrade is a question about the machine, not about
+  # whether the service happens to be up. This asked `systemctl is-active`,
+  # which reads a server that is down - crashed, stopped by hand, or not yet
+  # started since a reboot - as a fresh install: the copy below was skipped
+  # without a word and the binary was replaced underneath a database written to
+  # since the last upgrade. The case where a copy matters most was the one case
+  # that did not take one.
   local upgrading=0
-  if systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+  if [ -f "$PREFIX/agentmux-server" ] || [ -f "/etc/systemd/system/${UNIT_NAME}.service" ]; then
     upgrading=1
   fi
 
   if [ "$upgrading" -eq 1 ]; then
-    step "Stopping the running service"
-    systemctl stop "$UNIT_NAME"
+    step "Stopping the service"
+    systemctl stop "$UNIT_NAME" 2>/dev/null || true
     info "stopped"
 
     # A cold copy, which is what makes it a valid one: the service is down, so
-    # nothing is writing. A copy taken while the server runs can miss the write
-    # in flight and produce a database that opens and is quietly missing its
-    # last transaction. docs/BACKUP.md §3 has the hot-copy procedure for a
-    # backup you want to take without stopping anything.
+    # nothing is writing. What makes it a *complete* one is that the three
+    # files are copied as a set. In WAL mode a commit appends to the `-wal` and
+    # the database file is only brought up to date at a checkpoint, so a `.db`
+    # copied without the `-wal` beside it is consistent as of the last
+    # checkpoint and quietly missing every transaction after it - the failure
+    # docs/BACKUP.md §3.3 exists to describe. A clean stop checkpoints and
+    # removes the `-wal`, so in the ordinary case the last two do not exist and
+    # this is a one-file copy; they are copied when they are there, which is
+    # the crash and the hard stop, and that is exactly when they hold something.
+    # docs/BACKUP.md §3 has the hot-copy procedure for a backup taken without
+    # stopping anything.
     local db="$DATA_DIR/agentmux.db"
     if [ -f "$db" ]; then
-      local stamp backup
+      local stamp backup suffix copied=0
       stamp=$(date -u +%Y%m%dT%H%M%SZ)
       backup="${db}.pre-upgrade-${stamp}"
-      cp -a "$db" "$backup"
-      info "database copied to $(basename "$backup")"
+      for suffix in "" "-wal" "-shm"; do
+        [ -f "${db}${suffix}" ] || continue
+        cp -a "${db}${suffix}" "${backup}${suffix}"
+        copied=$((copied + 1))
+      done
+      info "database copied to $(basename "$backup")  ${DIM}(${copied} file(s))${RESET}"
       note "$backup"
+      [ "$copied" -gt 1 ] && note "the -wal is part of the copy: without it the database is short its last commits"
     else
       info "no database yet; nothing to copy"
     fi
@@ -527,10 +546,17 @@ verify_health() {
 # curl and wget are both common and neither is guaranteed on a minimal server,
 # so the fallback is bash's own /dev/tcp rather than a dependency.
 fetch_health() {
+  # stderr is discarded rather than passed through. This is called in a retry
+  # loop while the service is binding its port, so the first few attempts
+  # failing is the normal case - and curl's own `-S` prints "Failed to connect"
+  # for each one, which reads as an install that went wrong directly above the
+  # line saying it went right. Nothing is lost by dropping it: the caller treats
+  # an empty answer as "not up yet", and if it never comes up the failure path
+  # prints the unit status and the journal, which say more than curl does.
   if have curl; then
-    curl -fsS --max-time 5 "$HEALTH_URL"
+    curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null
   elif have wget; then
-    wget -qO- --timeout=5 "$HEALTH_URL"
+    wget -qO- --timeout=5 "$HEALTH_URL" 2>/dev/null
   else
     exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
     printf 'GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3

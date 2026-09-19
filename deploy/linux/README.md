@@ -198,6 +198,11 @@ database aside, replaces the binary and the bundle, starts the service and
 checks `/health` — the sequence in `docs/DEPLOYMENT.md` §Upgrade, performed
 rather than described.
 
+It decides it is an upgrade from the machine — a binary under the prefix, or
+the unit file — and not from whether the service happens to be running, so
+re-running it on a server that is down still takes the copy. It copies
+`agentmux.db` and, when they exist, the `-wal` and `-shm` with it, as one set.
+
 ```sh
 git pull
 sudo ./deploy/linux/install.sh
@@ -207,16 +212,23 @@ By hand, if you would rather:
 
 ```sh
 sudo systemctl stop agentmux
-sudo cp -a /var/lib/agentmux/agentmux.db /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/agentmux/agentmux.db      /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/agentmux/agentmux.db-wal  /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)-wal 2>/dev/null || true
 sudo install -m 0755 ./agentmux-server /opt/agentmux/agentmux-server
 sudo systemctl start agentmux
 curl -s http://127.0.0.1:8787/health
 ```
 
 `cp` is a valid backup **here and only here**, because the service is stopped
-and nothing is writing. For a copy taken while the server runs, use the
-procedure in `docs/BACKUP.md` §3; a plain `cp` of a live SQLite database can
-produce a file that opens cleanly and is quietly missing its last transaction.
+and nothing is writing. Copying the `-wal` alongside is what keeps it complete:
+in WAL mode a commit lands in `agentmux.db-wal` and only reaches the database
+file at a checkpoint, so a `.db` copied without it is short everything since
+the last one. A clean stop checkpoints and removes the `-wal`, which is why
+that line is conditional and why a one-file copy is usually right — but not
+when the service was killed or the machine lost power. For a copy taken while
+the server runs, use the procedure in `docs/BACKUP.md` §3; a plain `cp` of a
+live SQLite database can produce a file that opens cleanly and is quietly
+missing its last transaction.
 
 Verify the upgrade took effect by comparing the version, not by trusting that
 the service restarted:

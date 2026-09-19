@@ -565,7 +565,7 @@ that reaches the history buffer, so a runtime that survived but stopped being wa
 
 The same ground once more, and this time under the thing that is supposed to keep it alive. Installed
 as a real systemd service by `deploy/linux/install.sh` on Ubuntu 24.04 under WSL2, with systemd 255 and
-tmux 3.4, and driven through `deploy/linux/recovery-test.sh` — eleven checks, all passing, against the
+tmux 3.4, and driven through `deploy/linux/recovery-test.sh` — twelve checks, all passing, against the
 installed service rather than a server someone started by hand.
 
 The load-bearing measurement is that **the tmux server survives the service restart**, and it is
@@ -591,6 +591,27 @@ it recognisable as AgentMux's rather than as somebody else's; the server logged
 earlier attempts at that case failed for instructive reasons: a socket owned by root is a *different*
 case with a different correct answer (`could not be classified; it is left untouched`), and an orphan
 is not exposed over the HTTP API at all — the journal is the only place it is observable.
+
+Two of the twelve checks failed the first time the script ran against a rebuilt binary, and neither
+was the server's fault — both were defects in the test, which is the more useful kind of failure to
+record because it is the kind that makes a suite lie:
+
+- **The journal check could not see a warning that was there.** It read
+  `journalctl … | grep -q "belongs to no registered project"`. `grep -q` exits at the first match,
+  journalctl is still writing, takes SIGPIPE and dies 141, and the script runs under
+  `set -o pipefail` — so the pipeline's status is 141 and the `if` takes the failure branch. The
+  measurement that settled it was `PIPESTATUS = 141 0`: journalctl killed, grep matched. The check now
+  reads the journal once into a variable and matches it with `case`, which cannot send a signal to
+  anything. The phrase was in the journal all along; the test had been reporting its absence.
+- **The second assertion could never pass.** It read back `wellFormed=true` from the log line, on the
+  reasoning that the server records its classification of the socket name. It does — but on the
+  *sibling* branch, a live tmux server holding no sessions. This case constructs an orphan *with* a
+  session, which is logged by a different call site (`cmd/server/main.go`, in `reconcileRuntimes`)
+  carrying `session`, `projectId` and `dir` and no classification field at all. An assertion that
+  cannot pass is worse than no assertion: it reports a defect on every run and trains whoever reads
+  the output to ignore it. It now asserts what the branch actually emits — that the warning names this
+  socket's project id, which is what makes it a test of having identified *this* orphan — and the
+  comment says plainly which branch was left untested.
 
 The measured baseline at three loads is in `docs/DEPLOYMENT.md` §14: 0.3 % of one core and 18 MB at one
 project and one viewer, 1.0 % and 23 MB at five projects and ten viewers, with WebSocket subscribe p95

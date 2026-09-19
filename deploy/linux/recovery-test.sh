@@ -134,11 +134,9 @@ step "Case C — a tmux socket that belongs to no project"
 #
 # The name: the id is a well-formed project id - `p_` and twenty hex characters,
 # which is what `project.ValidID` accepts - because that is the case being
-# tested. The server reports every unclaimed socket it finds, whatever its
-# filename looks like: `wellFormed` is carried into the log line and decides
-# nothing. An earlier version of this test used a UUID and passed, which is how
-# that was found out; the assertion below now reads the flag back rather than
-# assuming which branch was taken.
+# tested. An earlier version of this test used a UUID and passed, which is how
+# it was found out that the server's classification is not what decides this:
+# it reports the socket either way.
 #
 # The owner: the socket is created as the service account, because that is who
 # owns every socket in this directory in a real installation. A socket made by
@@ -154,22 +152,43 @@ ok "started an unregistered session $ORPHAN_SESSION, owned by agentmux"
 systemctl restart "$UNIT"
 sleep 2
 
-if journalctl -u "$UNIT" --since "-3min" --no-pager | grep -q "belongs to no registered project"; then
-  ok "the orphan was reported in the journal"
-  journalctl -u "$UNIT" --since "-3min" --no-pager | grep "belongs to no registered project" | tail -1 | sed 's/^/      /'
-else
-  bad "no orphan warning in the journal"
-fi
+# The journal is read once into a variable and matched with `case`, not piped
+# into `grep -q`. The pipe is the obvious way to write it and it is wrong here:
+# `grep -q` exits at the first match, journalctl is still writing, takes SIGPIPE
+# and dies 141, and under the `set -o pipefail` at the top of this script that
+# becomes the pipeline's status. The check then reports "no orphan warning in
+# the journal" about a journal that has the warning in it. Measured before the
+# change: PIPESTATUS is "141 0" - journalctl killed, grep matched.
+JOURNAL=$(journalctl -u "$UNIT" --since "-3min" --no-pager 2>/dev/null || true)
 
-# The line carries the server's own classification of the filename, and reading
-# it back is what makes this case a test of the classification rather than of
-# the warning. `wellFormed=true` says the server agreed the socket looked like
-# one of its own and reported it anyway, which is the whole point of case C.
-if journalctl -u "$UNIT" --since "-3min" --no-pager | grep -q "wellFormed=true"; then
-  ok "the server classified the socket as well-formed and still left it alone"
-else
-  bad "the journal does not show a well-formed classification for $ORPHAN_ID"
-fi
+case "$JOURNAL" in
+  *"belongs to no registered project"*)
+    ok "the orphan was reported in the journal"
+    printf '%s\n' "$JOURNAL" | grep "belongs to no registered project" | tail -1 | sed 's/^/      /'
+    ;;
+  *)
+    bad "no orphan warning in the journal"
+    ;;
+esac
+
+# The line names the socket's project id, which is what makes this a test of the
+# server having identified *this* socket rather than of it having warned in
+# general.
+#
+# Note what is deliberately not asserted. The `wellFormed` classification is
+# logged on the sibling branch - a live tmux server holding no sessions - which
+# is a different situation from the one constructed here, where the orphan has a
+# session. Asserting `wellFormed=true` against this case can never pass, and an
+# assertion that cannot pass is worse than none: it reports a defect every run
+# and teaches whoever reads it to ignore the result.
+case "$JOURNAL" in
+  *"projectId=${ORPHAN_ID}"*)
+    ok "the warning names ${ORPHAN_ID} as the socket with no project behind it"
+    ;;
+  *)
+    bad "the journal does not name ${ORPHAN_ID} among the orphans"
+    ;;
+esac
 
 if tmux -S "$ORPHAN_SOCKET" has-session -t "$ORPHAN_SESSION" 2>/dev/null; then
   ok "the orphan session was left running"

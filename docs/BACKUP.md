@@ -229,13 +229,35 @@ sudo systemctl start agentmux
 ```sh
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 backup="${db}.pre-upgrade-${stamp}"
-cp -a "$db" "$backup"
+for suffix in "" "-wal" "-shm"; do
+  [ -f "${db}${suffix}" ] || continue
+  cp -a "${db}${suffix}" "${backup}${suffix}"
+done
 ```
 
 Those lines sit inside the upgrade's own branch, after `systemctl stop`, and are
 skipped with a message when there is no database yet. The script's comment on them
 says the copy is a cold one, which is what makes it valid, and points at the
 hot-copy procedure for a backup taken without stopping anything.
+
+The loop is §3.3 applied, and both halves of this were wrong in the first version
+of the script — worth recording here because this is the document that explains
+why they matter:
+
+- **It was a `.db`-only copy.** `cp -a "$db" "$backup"`, one file, which is the
+  copy this document calls out two sections up as the one that is silently short.
+  It was defensible in the narrow case the script then handled — the service had
+  just stopped cleanly, which checkpoints the WAL and removes it — but it was one
+  step away from the failure mode, and the step was taken by the next fix.
+- **The branch did not run when the service was down.** It was entered on
+  `systemctl is-active`, so a server that had crashed, been stopped by hand, or
+  not yet started since a reboot read as a fresh install: no stop, no copy, no
+  message, and the binary replaced underneath a database written to since the
+  last upgrade. That is the one case where the `-wal` is most likely to be
+  present and the copy most likely to matter. It is entered now on whether an
+  installation exists — a binary under the prefix, or the unit file — which is a
+  question about the machine rather than about the moment, and it reports the
+  number of files it copied.
 
 The cost of this procedure is a maintenance window, and the benefit is that it is
 the easiest correct backup there is: no tooling beyond `cp`, no snapshot

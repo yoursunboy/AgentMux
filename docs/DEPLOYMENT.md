@@ -775,21 +775,46 @@ git pull
 sudo ./deploy/linux/install.sh
 ```
 
-Concretely, the script checks whether the unit is active, and if it is, stops it;
-copies the database to `agentmux.db.pre-upgrade-<UTC timestamp>` when one exists
-and says so when there is nothing to copy; keeps the existing configuration file
-untouched; installs the new binary by rename and replaces `web/dist`; reloads
-systemd and re-enables the unit; restarts it; and verifies `/health`, failing the
-script if the check does not answer within thirty seconds. It closes by printing
-that runtimes were left as they were: a project whose tmux session survived the
-restart is running again, and one whose session did not is reported stopped, with
-starting it being yours to ask for.
+Concretely, the script checks whether there is an installation here — a binary
+under the prefix, or the unit file — and if there is, stops the service and
+copies the database aside before replacing anything. It copies
+`agentmux.db.pre-upgrade-<UTC timestamp>` and, when they are present, the `-wal`
+and `-shm` beside it, as one set; and it says so when there is nothing to copy.
+It keeps the existing configuration file untouched; installs the new binary by
+rename and replaces `web/dist`; reloads systemd and re-enables the unit;
+restarts it; and verifies `/health`, failing the script if the check does not
+answer within thirty seconds. It closes by printing that runtimes were left as
+they were: a project whose tmux session survived the restart is running again,
+and one whose session did not is reported stopped, with starting it being yours
+to ask for.
+
+Two details of that are worth stating rather than leaving in the source, because
+both were wrong in the first version of the script:
+
+- **The copy is taken whenever there is a database, not only when the service
+  was up.** The script used to decide it was an upgrade by asking
+  `systemctl is-active`. A server that is down — crashed, stopped by hand, or
+  not yet started since a reboot — therefore read as a fresh install: the copy
+  was skipped silently and the binary was replaced underneath a database that
+  had been written to since the last upgrade. The case where a backup matters
+  most was the one case that did not take one. It now asks whether an
+  installation exists, which is a question about the machine rather than about
+  the moment.
+- **The `-wal` is part of the copy.** SQLite runs here in WAL mode, so a commit
+  appends to `agentmux.db-wal` and the database file is only brought up to date
+  at a checkpoint. A copy of `agentmux.db` alone is consistent as of the last
+  checkpoint and quietly missing everything after it. A clean stop checkpoints
+  and removes the `-wal`, so in the ordinary case there is nothing to copy and
+  this is a one-file backup — but the script now also runs when the service did
+  *not* stop cleanly, which is exactly when a `-wal` is on disk holding
+  transactions. `docs/BACKUP.md` §3.3 is the same three files.
 
 By hand, if you would rather:
 
 ```sh
 sudo systemctl stop agentmux
-sudo cp -a /var/lib/agentmux/agentmux.db /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/agentmux/agentmux.db      /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)
+sudo cp -a /var/lib/agentmux/agentmux.db-wal  /var/lib/agentmux/agentmux.db.backup-$(date -u +%Y%m%dT%H%M%SZ)-wal 2>/dev/null || true
 sudo install -m 0755 ./agentmux-server /opt/agentmux/agentmux-server
 sudo systemctl start agentmux
 curl -s http://127.0.0.1:8787/health

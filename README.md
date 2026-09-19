@@ -474,9 +474,10 @@ python3 deploy/linux/loadtest.py       # the performance baseline
 13. `docs/DEPLOYMENT.md` — putting it on a server, and what a restart does and does not bring back
 14. `docs/BACKUP.md` — what to back up, what not to, and how to restore
 15. `docs/SECURITY.md` — start here before the port is reachable from anywhere but this machine
-16. `deploy/linux/README.md` — the operator's guide to the two above
-17. `CLAUDE.md`
-18. `.claude/rules/`
+16. `docs/AGENT_EVENTS.md` — what happened, as opposed to what is true now
+17. `deploy/linux/README.md` — the operator's guide to the two above
+18. `CLAUDE.md`
+19. `.claude/rules/`
 
 ## Development principle
 

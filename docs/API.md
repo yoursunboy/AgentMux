@@ -710,6 +710,83 @@ behaves the same way.
 only `running` sees the truth, a client that reads both sees the whole truth, and neither is told a
 stop succeeded when it did not.
 
+## Event timelines
+
+Two endpoints, and they are the only ones that answer "what happened" rather than "what is true now".
+Everything above this section describes state: the runtime resource says what a session is doing at
+this moment. These two describe the past, which does not change.
+
+| Call | Effect |
+| --- | --- |
+| `GET /api/projects/{id}/events` | One project's timeline, across every runtime it has had. |
+| `GET /api/runtime/{id}/events` | One runtime's timeline. |
+
+There is **no write endpoint**, and no method other than `GET` is routed on either path. Events are
+produced by the layers that know what happened — the runtime, today — and an endpoint that accepted
+one from a client would let anything that can reach this server put a row into a history that nothing
+can correct afterwards.
+
+Both take the same two query parameters and return the same envelope:
+
+| Parameter | Meaning |
+| --- | --- |
+| `limit` | How many events to return. Default 50, maximum 200. |
+| `before` | An event id. Return the events older than that one. |
+
+```json
+{
+  "events": [
+    {
+      "id": "evt_1f0c4a2b9d8e7f60a1b2c3d4e5f60718",
+      "projectId": "p_9a3b1c2d3e4f5061728394a5",
+      "runtimeId": "amx-p_9a3b1c2d3e4f5061728394a5",
+      "type": "runtime.started",
+      "source": "runtime",
+      "payload": { "state": "running", "cols": 120, "rows": 30 },
+      "createdAt": "2026-09-20T11:04:07.318204Z"
+    }
+  ],
+  "nextBefore": "evt_1f0c4a2b9d8e7f60a1b2c3d4e5f60718"
+}
+```
+
+`runtimeId` and `payload` are absent rather than null when the event has none — a project-level event
+has no runtime, and not every event carries detail. `nextBefore` is present only when more events
+remain, and it is passed back as `before`.
+
+Events are returned newest first. The ordering key is the pair `(createdAt, id)` and **not** the
+timestamp alone: two events written in the same instant — which a runtime start does routinely — would
+otherwise have no defined order, and paging over them would skip one or repeat one.
+
+### Failures
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The project does not exist | 404 | `project_not_found` |
+| `before` is not an event id | 400 | `invalid_request` |
+| `before` is a well-formed id that no event carries | 404 | `event_not_found` |
+| `limit` is not a whole number, or is below 1 | 400 | `invalid_request` |
+| The runtime id is not one AgentMux names | 400 | `invalid_request` |
+
+`limit` above the maximum is clamped rather than refused, because a client asking for a thousand is
+asking for as much as it can have; `nextBefore` tells it whether more remains.
+
+The project endpoint resolves the project first, so an unknown id is a 404 about the project. The
+runtime endpoint does not: a runtime is not a stored resource, so there is nothing to look up, and a
+runtime id with no events is an empty timeline — which is the honest answer for a runtime that has
+never started. Runtime ids are the session names AgentMux gives them (`amx-<project id>`), and a value
+outside that namespace is a bad request rather than an empty list.
+
+### What a timeline does not return
+
+No internal path, no socket name, no host directory, no credential, and no terminal output. The six
+fields above are the whole envelope, and the payload is bounded to what `docs/AGENT_EVENTS.md` §7
+allows. The one failure a reader might expect to find here is not: a `runtime.error` event records
+*that* an operation failed and what state it left, and never the error string, because an error string
+copied into a row that can never be redacted is a string that can never be taken back.
+
+`docs/AGENT_EVENTS.md` is the long form of this layer, including what it deliberately does not do.
+
 ## GET /api/ws
 
 **The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per
@@ -814,6 +891,8 @@ Every failure has the same shape:
 | `agent_stop_failed` | 500 | The agent could not be interrupted. |
 | `agent_wrong_directory` | 422 | The agent is not where the project is, or started somewhere else. Refused, not warned about. |
 | `agent_terminal_busy` | 409 | The terminal's foreground process is not the shell, so a command typed at it would go to another program. |
+| `invalid_event` | 400 | An event the event model refuses: a malformed source, a type that is not a dotted name, or a payload that is over the bound or names a credential. Nothing writes an event from a request in this build, so it is reachable only through a query parameter. |
+| `event_not_found` | 404 | An event id that no stored event carries, which is what a pagination cursor naming nothing is. |
 | `storage_failure` | 500 | The metadata store could not complete the request. |
 
 `runtime_not_running` is a `409` and not a `404`: the runtime exists, and it is in a state that makes
@@ -831,8 +910,14 @@ them answers today. **In particular there is no lease on typing**: every client 
 server can send input to every terminal it is subscribed to, and two of them typing at once interleave
 their keystrokes. That is Phase 6.
 
-What this build serves, beyond the project model, is the runtime endpoints, the agent inside one, and
-the terminal: a project's runtime can host the real Claude Code CLI, started by the server, the server
-reports honestly whether it is running, and `GET /api/ws` shows it to you as the terminal it is.
+The event timelines record what happened and nothing reads them to decide anything. There is no
+endpoint that turns an event into a task, a notification, or a state, and no event type in this build
+that no code emits.
+
+What this build serves, beyond the project model, is the runtime endpoints, the agent inside one, the
+terminal, and the event timelines: a project's runtime can host the real Claude Code CLI, started by
+the server, the server reports honestly whether it is running, `GET /api/ws` shows it to you as the
+terminal it is, and `GET /api/projects/{id}/events` says what has happened to it over time.
 `docs/ROADMAP.md` is where the next phase is defined, `docs/CLAUDE_RUNTIME.md` describes how the agent
-is resolved, launched, and observed, and `docs/TERMINAL.md` is the terminal protocol.
+is resolved, launched, and observed, `docs/TERMINAL.md` is the terminal protocol, and
+`docs/AGENT_EVENTS.md` is the event layer.

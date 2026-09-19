@@ -16,6 +16,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -43,6 +44,11 @@ type harness struct {
 	// runtime is the same manager the server holds, kept here so a test can
 	// read the sequence numbers and states the handlers produced.
 	runtime *session.Manager
+
+	// events is the same event service the server holds, kept here so a test
+	// can write a timeline without going through the runtime - which is what
+	// makes an API test about the API rather than about tmux.
+	events *event.Service
 }
 
 // harnessOptions describes the environment a test wants its server to believe
@@ -193,6 +199,21 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		t.Fatalf("project.NewDiscoverer returned an error: %v", err)
 	}
 
+	// The real event service over the harness's real database. A fake would let
+	// a test pass while the SQL the endpoints depend on was wrong.
+	//
+	// It is built before the runtime manager because the manager records into it:
+	// a runtime that starts without writing a `runtime.started` row is exactly
+	// the bug the bridge tests exist to catch, and a harness that wired the two
+	// together wrongly would hide it from every test in this package.
+	events, err := event.NewService(event.Options{
+		Repository: store.Events(),
+		Logger:     discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("event.NewService returned an error: %v", err)
+	}
+
 	backend := newFakeBackend()
 	backend.pane = o.pane
 	plain := &fakeFactory{backend: backend}
@@ -205,6 +226,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Sockets:  newFakeSockets(backend),
 		Projects: service,
 		Store:    store.Runtimes(),
+		Events:   events,
 		Logger:   discardLogger(),
 		Agent:    o.agent,
 
@@ -247,12 +269,14 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if o.claude != nil {
 		resolver = pinnedClaude{*o.claude}
 	}
+
 	server, err := New(Options{
 		Config:     cfg,
 		Host:       adapter,
 		Projects:   service,
 		Discoverer: discoverer,
 		Runtime:    manager,
+		Events:     events,
 		Terminal:   hub,
 		Logger:     discardLogger(),
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
@@ -271,6 +295,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		store:   store,
 		backend: backend,
 		runtime: manager,
+		events:  events,
 	}
 }
 

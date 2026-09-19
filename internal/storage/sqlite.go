@@ -127,6 +127,9 @@ func (s *Store) Settings() *SettingStore { return &SettingStore{db: s.db} }
 // Runtimes returns the runtime metadata store.
 func (s *Store) Runtimes() *RuntimeStore { return &RuntimeStore{db: s.db} }
 
+// Events returns the event repository.
+func (s *Store) Events() *EventStore { return &EventStore{db: s.db} }
+
 // dataSourceName builds the driver connection string.
 //
 // Pragmas are passed as DSN parameters rather than executed after opening, so

@@ -15,6 +15,7 @@ As of version 0.6.5:
 | Phase 5 — Multi-project workspace | **Done** | The workspace grid, slots, the Project Manager as the last cell, pagination, Focus and full screen, and the browser suites moved into the repository. Verified against real Chrome at four viewports. See below. |
 | Phase 6 — Multi-device control | **Done** | One controller and many viewers per project, a lease with a grace period, a handshake for handing control over, and input and resize authority on the server. Verified in two real browser contexts at once — a desktop and an emulated tablet. See below. |
 | Phase 6.5 — Stabilization | **Done** | Not a capability phase. systemd unit, installer, configuration file, health endpoint, log components, version reporting, a documented recovery model with a script that exercises it, and a measured performance baseline. Validated on a real Linux server. See below. |
+| Phase 7.1 — Agent event foundation | **Done** | Not a capability phase, and deliberately invisible in the product. The event model, `agent_events`, one write path, the runtime bridge, and two read-only timeline endpoints. No Claude Hooks, no output parsing, no state inference, no UI. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -465,6 +466,45 @@ Through Claude Hooks:
 - ERROR.
 
 Terminal remains the real displayed interface.
+
+### Phase 7.1 — Agent event foundation
+
+Status: **done**. It is the layer the rest of Phase 7 stands on, and it is
+deliberately invisible: nothing a user does looks different after it, and that is
+what a foundation is for.
+
+Deliver:
+
+- an event model — an event records that something happened, and is not a status
+  (`internal/event`);
+- `agent_events`, with the indexes the timeline queries read
+  (`migrations/0003_agent_events.sql`);
+- one write path, `Service.CreateEvent`, so a later hook, a later user action and
+  the runtime today all pass the same validation;
+- the runtime bridge: `runtime.started`, `runtime.stopped`, `runtime.error`,
+  `runtime.destroyed`, emitted after the state has already changed and never
+  involved in it;
+- `GET /api/projects/{id}/events` and `GET /api/runtime/{id}/events`, read-only,
+  newest first, keyset-paginated;
+- `docs/AGENT_EVENTS.md`.
+
+**Not in this sub-phase, and not stubbed:** Claude Hooks, terminal output parsing,
+pattern matching against a pane, state inference, a task model, notifications,
+token or model accounting, automatic decisions, and any user interface. The only
+consumer is the API, which exists so the data model can be exercised before
+anything is built on it.
+
+The boundary this sub-phase exists to establish is the one between what is true
+now and what happened:
+
+```text
+RuntimeManager   owns  what is true now      Runtime.State, project_runtime
+Event Service    owns  what happened         agent_events, append-only
+```
+
+A later phase that reads events to decide whether a runtime is running has made
+the mistake the boundary prevents. `docs/AGENT_EVENTS.md` §1 and §5 are the long
+form, and §8 lists what is deliberately absent.
 
 ## Phase 8 — CC Switch integration
 

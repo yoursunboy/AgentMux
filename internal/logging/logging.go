@@ -60,6 +60,7 @@ const (
 	ComponentHost     = "host"
 	ComponentProject  = "project"
 	ComponentRuntime  = "session"
+	ComponentEvent    = "event"
 	ComponentAgent    = "claude"
 	ComponentTerminal = "terminal"
 	ComponentAPI      = "httpapi"

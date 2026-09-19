@@ -25,6 +25,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -53,6 +54,7 @@ type Server struct {
 	projects   *project.Service
 	discoverer *project.Discoverer
 	runtime    *session.Manager
+	events     *event.Service
 	agent      AgentResolver
 	terminal   *terminal.Hub
 	log        *slog.Logger
@@ -78,6 +80,15 @@ type Options struct {
 	// one cannot answer a single runtime request, and a nil field would turn
 	// that into a panic in a handler instead of an explanation.
 	Runtime *session.Manager
+
+	// Events is the event log, read by the two timeline endpoints. It is
+	// optional, like Terminal and for the same reason: a test of the REST
+	// surface that is not about events should not have to build one. A server
+	// without it explains itself on those two routes.
+	//
+	// It is a *Service and not a Repository, because the HTTP layer talks to
+	// services and never to storage.
+	Events *event.Service
 
 	// Agent resolves the coding agent this server would launch, for the
 	// capability report. It is optional: a server with no agent configured
@@ -125,6 +136,7 @@ func New(o Options) (*Server, error) {
 		projects:   o.Projects,
 		discoverer: o.Discoverer,
 		runtime:    o.Runtime,
+		events:     o.Events,
 		agent:      o.Agent,
 		terminal:   o.Terminal,
 		log:        o.Logger,
@@ -187,6 +199,16 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/projects/{id}/runtime/agent", s.handleGetAgent)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/start", s.handleStartAgent)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/stop", s.handleStopAgent)
+
+	// What happened, as opposed to what is true now. The runtime resource above
+	// answers the second question; these two answer the first, and the two are
+	// deliberately separate resources because they are separate kinds of fact -
+	// see docs/AGENT_EVENTS.md §1.
+	//
+	// There is no POST here, and no events route on a runtime's sub-resources: a
+	// client reads a history, and never writes one.
+	mux.HandleFunc("GET /api/projects/{id}/events", s.handleListProjectEvents)
+	mux.HandleFunc("GET /api/runtime/{id}/events", s.handleListRuntimeEvents)
 
 	// The one real-time endpoint. One socket per browser, carrying every
 	// project's terminal; see internal/terminal and docs/PROTOCOL.md.

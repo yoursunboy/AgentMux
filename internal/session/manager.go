@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 )
 
@@ -73,6 +74,15 @@ type ManagerOptions struct {
 	// Store persists runtime metadata. Required.
 	Store RuntimeStore
 
+	// Events records what a runtime does - started, stopped, failed,
+	// destroyed - for the event log. It is optional: a manager built without
+	// one manages runtimes exactly as well and records nothing, which is what
+	// this package's own tests do.
+	//
+	// See events.go for why recording a fact can never fail the operation that
+	// produced it.
+	Events EventRecorder
+
 	// Shell is the shell a session runs when no command is given.
 	Shell string
 
@@ -128,6 +138,7 @@ type Manager struct {
 	sockets     SocketLayout
 	projects    ProjectLookup
 	store       RuntimeStore
+	events      EventRecorder
 	shell       string
 	cols        int
 	rows        int
@@ -185,6 +196,7 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 		sockets:           o.Sockets,
 		projects:          o.Projects,
 		store:             o.Store,
+		events:            o.Events,
 		shell:             o.Shell,
 		cols:              o.Cols,
 		rows:              o.Rows,
@@ -851,7 +863,7 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 
 	runtimePath, err := m.runtimePath(p)
 	if err != nil {
-		rt.setState(StateError, err.Error(), m.now())
+		m.failRuntime(ctx, rt, operationStart, err.Error())
 		return nil, err
 	}
 
@@ -861,7 +873,7 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 		cols, rows = record.Cols, record.Rows
 		recordedSize = true
 	} else if recordErr != nil && !errors.Is(recordErr, ErrRecordNotFound) {
-		rt.setState(StateError, "runtime metadata could not be read", m.now())
+		m.failRuntime(ctx, rt, operationStart, "runtime metadata could not be read")
 		return nil, wrapError(recordErr, CodeStorageFailure, "could not read the runtime record for %s", projectID)
 	}
 
@@ -870,7 +882,7 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	// user cares about.
 	session, created, err := m.ensureSession(ctx, backend, rt, runtimePath, cols, rows)
 	if err != nil {
-		rt.setState(StateError, err.Error(), m.now())
+		m.failRuntime(ctx, rt, operationStart, err.Error())
 		m.recordFailure(ctx, projectID, rt.session)
 		return nil, err
 	}
@@ -887,12 +899,12 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	// The size is asserted on every start, not only at creation: the canonical
 	// geometry is a decision, and re-asserting it is how it stays one.
 	if err := backend.Resize(ctx, rt.session, cols, rows); err != nil {
-		rt.setState(StateError, err.Error(), m.now())
+		m.failRuntime(ctx, rt, operationStart, err.Error())
 		return nil, err
 	}
 
 	if err := m.attach(rt); err != nil {
-		rt.setState(StateError, err.Error(), m.now())
+		m.failRuntime(ctx, rt, operationStart, err.Error())
 		return nil, err
 	}
 
@@ -903,6 +915,12 @@ func (m *Manager) Start(ctx context.Context, projectID string) (*Runtime, error)
 	rt.started = session.Created
 	rt.updated = now
 	rt.mu.Unlock()
+
+	// The runtime is running. This is the moment the fact became true, so it is
+	// where the fact is recorded - before the record below, because a record
+	// that could not be written does not un-run the terminal.
+	m.noteRuntimeEvent(ctx, projectID, rt.session, event.TypeRuntimeStarted,
+		map[string]any{"state": string(StateRunning), "cols": cols, "rows": rows})
 
 	if err := m.store.Save(ctx, Record{
 		ProjectID: projectID,
@@ -1221,13 +1239,15 @@ func (m *Manager) Stop(ctx context.Context, projectID string) (*Runtime, error) 
 	// agent's exit be reported as a stop rather than as a crash.
 	rt.noteAgentStopRequested(m.now())
 	if err := backend.Stop(ctx, rt.session); err != nil && !errors.Is(err, ErrNoSuchSession) {
-		rt.setState(StateError, err.Error(), m.now())
+		m.failRuntime(ctx, rt, operationStop, err.Error())
 		return nil, err
 	}
 
 	now := m.now()
 	rt.setState(StateStopped, "", now)
 	m.persistState(ctx, projectID, rt, StateStopped)
+	m.noteRuntimeEvent(ctx, projectID, rt.session, event.TypeRuntimeStopped,
+		map[string]any{"state": string(StateStopped)})
 	m.log.Info("runtime stopped", "projectId", projectID, "session", rt.session)
 	return m.describe(ctx, rt), nil
 }
@@ -1287,9 +1307,36 @@ func (m *Manager) Destroy(ctx context.Context, projectID string) error {
 		rt.setState(StateStopped, "", m.now())
 	}
 
+	// Whether there was a runtime to destroy, which decides whether any of this
+	// is an event.
+	//
+	// Destroy is idempotent: a call for a project that has no runtime succeeds,
+	// because "gone" is the end state it was asked for. Nothing happened, so
+	// nothing is recorded - the same rule a Start and a Stop that changed
+	// nothing follow. A `runtime.destroyed` for a runtime that was never started
+	// would be a row with no beginning, and every reader of that timeline would
+	// have to work out for themselves that it meant nothing.
+	hadRuntime := ok
+
 	session := p.SessionName()
 	if err := backend.Destroy(ctx, session); err != nil {
+		// No state is written and none is claimed: a destroy that failed leaves
+		// the runtime exactly as it was. The event records which operation
+		// failed and nothing more, because there is nothing more that is true.
+		if hadRuntime {
+			m.noteRuntimeEvent(ctx, projectID, session, event.TypeRuntimeError,
+				map[string]any{"operation": operationDestroy})
+		}
 		return err
+	}
+
+	// The session is gone, so the fact is recorded here rather than at the end
+	// of the function. What follows is cleanup - stopping the project's tmux
+	// server, releasing the backend, removing the record - and any of it can
+	// fail and be reported to the caller without making the destroy untrue.
+	if hadRuntime {
+		m.noteRuntimeEvent(ctx, projectID, session, event.TypeRuntimeDestroyed,
+			map[string]any{"state": string(StateStopped)})
 	}
 
 	// The project's tmux server is the project's own resource, so it goes too -

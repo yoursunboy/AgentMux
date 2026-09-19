@@ -17,6 +17,7 @@ iPad / Phone / PC
 │ Workspace                   │   web/src/workspace       — built in Phase 5
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
+│ Event Log                   │   internal/event          — built in Phase 7.1
 │ Controller Manager          │   Phase 6, not stubbed
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
@@ -208,6 +209,37 @@ Responsibilities:
 ### Provider Adapter
 
 Future CC Switch integration.
+
+### Event Log
+
+Owns:
+
+- what happened, and when;
+- the vocabulary of an event type and a source;
+- the payload bound and the credential check on a payload;
+- one page of a timeline at a time.
+
+Does **not** own anything about current state. That split is the whole of this boundary and it is
+worth stating as a table, because the two are easy to confuse and one of them is wrong to use for the
+other's questions:
+
+```text
+RuntimeManager   owns  what is true now      Runtime.State, project_runtime
+Event Service    owns  what happened         agent_events, append-only
+```
+
+`internal/event` holds the model, the rules and the only write path
+(`Service.CreateEvent`). Every statement is in `internal/storage`; the HTTP layer never sees a
+`*sql.DB`, exactly as it does not for projects and runtimes. The runtime imports this package for the
+vocabulary of what a runtime can report and for nothing else — the recorder is an interface
+`internal/session` declares and `*event.Service` satisfies, so there is no adapter and therefore no
+second place where the two vocabularies could drift.
+
+The table is append-only. Nothing updates or deletes a row, and no API could: a history that can be
+edited is not a history. That is also why the payload is bounded and why no error string is ever
+copied into one — a row that can never be changed can never be redacted either.
+
+`docs/AGENT_EVENTS.md` is the long form.
 
 ## 4. Project identity
 
@@ -507,8 +539,9 @@ collections (optional)
 A separate `collections` table is optional; collection path may initially be stored on Project records.
 
 Created so far: `projects`, `settings`, `schema_migrations` (the migration bookkeeping table), and —
-from Phase 2 — `project_runtime`. Collection membership is a column on `projects`, which is why
-registering an existing project is a single insert and finding a project's collection needs no join.
+from Phase 2 — `project_runtime`, and — from Phase 7.1 — `agent_events`. Collection membership is a
+column on `projects`, which is why registering an existing project is a single insert and finding a
+project's collection needs no join.
 
 `project_runtime` stores only what cannot be answered after a restart: the owning backend, the session
 name, the user's intent, the canonical size, and the timestamps. It stores **no terminal output at any
@@ -521,6 +554,16 @@ Phase 4 added a live terminal and did not add a table. A snapshot is taken from 
 for and is not written down; the browser keeps the screen in memory and nothing else, so nothing about
 a terminal reaches `localStorage` or the database. That is the same rule as before, applied to a
 feature that would have made it easy to break.
+
+Phase 7.1 added `agent_events` — the first table in AgentMux that is a **log** rather than a record of
+what is. It stores the event's identity, its project and (optionally) its runtime, its type and
+source, a small JSON payload, and when it happened; indexes on `project_id`, `runtime_id` and
+`created_at` are what the timeline queries read. The runtime id is the runtime's session name and is
+**not** a foreign key to `project_runtime`: a destroy empties the runtime record, and "this runtime
+was destroyed" is not a fact that stops being true when the record goes. The one foreign key is to
+`projects`, with `ON DELETE CASCADE`, because an event about a project that no longer exists is
+unreachable through every endpoint this API has. Nothing in the table is ever updated or deleted, and
+`docs/AGENT_EVENTS.md` §7 lists what a payload may not contain.
 
 Migrations are embedded SQL files applied in order and recorded by name, so a future schema change is
 a new numbered file rather than an edit to an applied one.

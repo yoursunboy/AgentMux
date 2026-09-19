@@ -139,7 +139,7 @@ func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 
 	tables := tableNames(t, store)
 
-	want := []string{"project_runtime", "projects", "schema_migrations", "settings"}
+	want := []string{"agent_events", "project_runtime", "projects", "schema_migrations", "settings"}
 	if strings.Join(tables, ",") != strings.Join(want, ",") {
 		t.Errorf("tables = %v, want %v", tables, want)
 	}

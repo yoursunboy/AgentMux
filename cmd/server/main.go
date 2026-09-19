@@ -30,6 +30,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/httpapi"
 	"github.com/kutonlagos/agentmux/internal/logging"
@@ -205,11 +206,28 @@ func run(args []string) error {
 			"agent", installation.Type, "reason", installation.Message)
 	}
 
+	// The event log. One service, handed to both the runtime manager that writes
+	// it and the API that reads it, so that there is exactly one entry point
+	// into the table and no path from an HTTP handler to a database.
+	//
+	// It is built before the runtime manager because the manager takes it as a
+	// collaborator, and it is built after the store because that is what it
+	// writes to. Nothing reads an event to decide anything: see
+	// docs/AGENT_EVENTS.md §5.
+	eventLog, err := event.NewService(event.Options{
+		Repository: store.Events(),
+		Logger:     logging.Component(logger, logging.ComponentEvent),
+	})
+	if err != nil {
+		return err
+	}
+
 	runtimes, err := session.NewManager(session.ManagerOptions{
 		Backends:      backends,
 		Sockets:       backends.Sockets(),
 		Projects:      projectService,
 		Store:         store.Runtimes(),
+		Events:        eventLog,
 		Shell:         cfg.Terminal.Shell,
 		Cols:          cfg.Terminal.Cols,
 		Rows:          cfg.Terminal.Rows,
@@ -275,6 +293,7 @@ func run(args []string) error {
 		Projects:   projectService,
 		Discoverer: discoverer,
 		Runtime:    runtimes,
+		Events:     eventLog,
 		Agent:      agents,
 		Terminal:   terminalHub,
 		Logger:     logging.Component(logger, logging.ComponentAPI),

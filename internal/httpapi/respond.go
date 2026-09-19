@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 )
@@ -102,15 +103,18 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Two packages define codes - the project model and the runtime - and both are
-// passed through to the client unchanged, so a client switches on one
-// vocabulary across the whole API. The HTTP layer adds only the codes for
-// failures it produces itself.
+// Three packages define codes - the project model, the runtime, and the event
+// log - and all are passed through to the client unchanged, so a client
+// switches on one vocabulary across the whole API. The HTTP layer adds only the
+// codes for failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
 	}
-	return session.CodeOf(err)
+	if code := session.CodeOf(err); code != "" {
+		return code
+	}
+	return event.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -122,6 +126,10 @@ func detailsOf(err error) map[string]any {
 	var sessionErr *session.Error
 	if errors.As(err, &sessionErr) {
 		return sessionErr.Details
+	}
+	var eventErr *event.Error
+	if errors.As(err, &eventErr) {
+		return eventErr.Details
 	}
 	return nil
 }
@@ -136,7 +144,14 @@ func messageFor(err error, code string) string {
 	if errors.As(err, &sessionErr) && sessionErr.Message != "" {
 		return sessionErr.Message
 	}
+	var eventErr *event.Error
+	if errors.As(err, &eventErr) && eventErr.Message != "" {
+		return eventErr.Message
+	}
 	switch code {
+	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure
+	// and event.CodeStorageFailure are the same string: the shared vocabulary
+	// means a caller cannot tell which store failed, and does not need to.
 	case project.CodeStorageFailure:
 		return "the metadata store could not complete the request"
 	default:
@@ -149,24 +164,33 @@ func messageFor(err error, code string) string {
 // The mapping is explicit rather than derived from a prefix, so that adding a
 // code forces a decision about what it means to a client.
 //
-// Some codes are deliberately shared between the two layers and appear here
-// once: project.CodeInvalidInput and session.CodeInvalidInput are both
-// "invalid_input", project.CodeStorageFailure and session.CodeStorageFailure
-// are both "storage_failure", and project.CodeNotFound and
-// session.CodeProjectNotFound are both "project_not_found". That is the point
-// of the shared vocabulary - a client that switches on "project_not_found" does
-// not need to know which layer produced it.
+// Some codes are deliberately shared between the layers and appear here
+// once: project.CodeStorageFailure, session.CodeStorageFailure and
+// event.CodeStorageFailure are all "storage_failure", and project.CodeNotFound
+// and session.CodeProjectNotFound are both "project_not_found". That is the
+// point of the shared vocabulary - a client that switches on "storage_failure"
+// does not need to know which layer produced it.
 func statusForCode(code string) int {
 	switch code {
 	case project.CodeInvalidInput,
 		project.CodeInvalidName,
 		project.CodeNotADirectory,
 		project.CodePathIsProjectsRoot,
+		// An event that the event model refuses: a malformed source, a type that
+		// is not a dotted name, or a payload that is too large or that names a
+		// credential. Nothing in this phase writes an event from a request, so
+		// this is reachable only through a cursor or a query parameter - but the
+		// mapping belongs here rather than being implied by a 500.
+		event.CodeInvalidEvent,
 		session.CodeInvalidSize:
 		return http.StatusBadRequest
 
 	case project.CodePathNotFound,
 		project.CodeNotFound,
+		// An event id that no stored event carries, which is what a pagination
+		// cursor is: asking to page from a row that does not exist is a request
+		// about a resource that is not there.
+		event.CodeNotFound,
 		session.CodeNotFound:
 		return http.StatusNotFound
 
@@ -214,6 +238,11 @@ func statusForCode(code string) int {
 		return http.StatusServiceUnavailable
 
 	case project.CodeGitInitFailed,
+		// One clause for three layers: an event log that cannot be read is the
+		// same failure as a metadata store that cannot be read, and the three
+		// CodeStorageFailure constants are one string. A timeline that cannot be
+		// read is the server failing to do something it said it would do, and
+		// there is nothing the caller could send differently.
 		project.CodeStorageFailure,
 		session.CodeStartFailed,
 		session.CodeStopFailed,

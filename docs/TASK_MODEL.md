@@ -229,7 +229,7 @@ idle, and idle is not a lifecycle state - it is what `RUNNING` looks like
 between two things happening.
 
 The task has a `WAITING` because a task can be blocked on something outside
-itself, which is a real and long-lived condition. If Phase 7.3 finds that a
+itself, which is a real and long-lived condition. If Phase 7.3B finds that a
 session can be blocked in a way that matters, adding a status is a migration
 and a row in this table, and that is the right time to make it.
 
@@ -408,7 +408,7 @@ between the column write and the event write, an event pruned by a retention
 policy that does not exist yet but will - a derived state would silently be
 wrong, while an explicit column is simply stale in a way a reader can see.
 
-Phase 7.3 may revisit this, when there is an agent deciding things and a reason
+Phase 7.3B may revisit this, when there is an agent deciding things and a reason
 to reconcile. Until then the rule is: events record, the service decides.
 
 ## 8. What this phase does not do

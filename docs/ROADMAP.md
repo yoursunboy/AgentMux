@@ -17,6 +17,8 @@ As of version 0.6.5:
 | Phase 6.5 — Stabilization | **Done** | Not a capability phase. systemd unit, installer, configuration file, health endpoint, log components, version reporting, a documented recovery model with a script that exercises it, and a measured performance baseline. Validated on a real Linux server. See below. |
 | Phase 7.1 — Agent event foundation | **Done** | Not a capability phase, and deliberately invisible in the product. The event model, `agent_events`, one write path, the runtime bridge, and two read-only timeline endpoints. No Claude Hooks, no output parsing, no state inference, no UI. See below. |
 | Phase 7.2 — Task and agent session model | **Done** | Not a capability phase either, and the last piece of Phase 7 that is not about Claude. `tasks` and `agent_sessions`, their lifecycles, the service that owns both, the eight endpoints that read and move them, and no UI. Nothing here starts a process. See below. |
+| Phase 7.3A — Claude integration discovery | **Done** | Not an implementation phase. What the installed Claude Code can actually report, measured rather than assumed, and the design that follows from it. No production code, database, API, or frontend was changed. See `docs/CLAUDE_INTEGRATION.md`. |
+| Phase 7.3B — Claude event adapter | **Next** | Not started, not stubbed. A `ClaudeAdapter` that turns Claude's own hook and stream events into AgentMux session events, through the existing event service, with the Runtime Layer unchanged. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -579,18 +581,48 @@ a task list is capped and not paginated (§12 of the same document), and nothing
 joins a task to a running Claude — a task exists, and a session names the runtime
 it ran in, and no code yet connects the two.
 
-### Phase 7.3 — not started
+### Phase 7.3A — Claude integration discovery
 
-**The next phase.** Phase 7.1 built the record of what happened and 7.2 built the
-record of what is wanted. What remains is the part Phase 7 was named for: the
-agent reporting its own state, so that a session's status stops being something a
-caller sets by hand and becomes something Claude Hooks say. That is where the
-five statuses at the top of this section — READY, RUNNING, WAITING, COMPLETED,
-ERROR — are meant to come from, and it is where a task and a runtime are finally
-joined.
+Status: **done**. Not an implementation phase, and the last phase of Phase 7
+that produces no running code. Its question was whether AgentMux can learn what
+Claude is doing from Claude rather than from what Claude's terminal looks like,
+and its answer is yes — through Claude Code hooks, which turn out to be a control
+mechanism as well as a notification one, and through the machine-readable JSON
+stream the CLI already writes to the stdout the Runtime Layer already owns.
 
-Nothing about it is designed here, no part of it is stubbed, and no code in this
-build anticipates it. It is listed so that a reader can see what 7.2 was for.
+The findings are long enough to have their own document rather than a section
+here: `docs/CLAUDE_INTEGRATION.md`. What belongs in the roadmap is what the
+discovery changed. It ruled out the Agent SDK, not on effort but on shape — the
+SDK spawns and supervises its own subprocess over stdio and cannot attach to the
+tmux pane AgentMux owns, so adopting it would mean replacing the Runtime Layer
+rather than integrating with it, and it would require AgentMux to hold its own
+API credentials. It established that terminal parsing is not a fallback for any
+of the five states but a different and worse instrument. It found that hook
+configuration is a trust boundary, since a hook can grant a permission that would
+otherwise be refused. And it found that "waiting for user input" is observable,
+but only in interactive sessions — which is the case AgentMux runs and would
+not be the case for a `-p`-driven design.
+
+Nothing in this phase is implemented, and nothing in the build anticipates it.
+
+### Phase 7.3B — Claude event adapter
+
+**The next phase, and not started.** Phase 7.1 built the record of what happened
+and 7.2 built the record of what is wanted. What remains is the part Phase 7 was
+named for: the agent reporting its own state, so that a session's status stops
+being something a caller sets by hand and becomes something Claude says. That is
+where the five statuses at the top of this section — READY, RUNNING, WAITING,
+COMPLETED, ERROR — are meant to come from, and it is where a task and a runtime
+are finally joined.
+
+The shape is decided and recorded in `docs/CLAUDE_INTEGRATION.md` §10: a
+`ClaudeAdapter` that receives Claude's hook events and the CLI's machine-readable
+stream, writes AgentMux events through the existing `event.Service`, and leaves
+the Runtime Layer's process, pane, input, and output handling exactly as it is.
+§12 of that document is the ordered plan.
+
+Nothing about it is stubbed, and no code in this build anticipates it. It is
+listed so that a reader can see what 7.3A was for.
 
 ## Phase 8 — CC Switch integration
 

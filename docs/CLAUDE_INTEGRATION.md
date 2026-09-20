@@ -178,10 +178,21 @@ Not an integration. See §11 for the explicit statement.
 
 ## 3. Event Capabilities
 
-The interactive Claude Code session offers 33 hook events. Listing them is less
-useful than grouping them by whether they bear on AgentMux's five states —
-READY, RUNNING, WAITING, COMPLETED, ERROR — so that is how they are presented.
-The names are the schema's names.
+Taken against the six things AgentMux needs to know, the coverage is:
+
+| Needed | Claude signal | Reliability |
+|---|---|---|
+| **Start** | `SessionStart` | Verified |
+| **Input** | `UserPromptSubmit` (carries the prompt and a `prompt_id`) | Verified |
+| **Permission** | `PermissionRequest`, plus `Notification` / `permission_prompt` | Verified |
+| **Completion** | `Stop`, plus the `result` message on the machine-readable stream | Verified |
+| **Failure** | `StopFailure`, `PostToolUseFailure`, `PermissionDenied` | `StopFailure` **not observed** |
+| **Exit** | `SessionEnd` (carries `reason`) | Verified |
+
+The interactive Claude Code session offers 33 hook events in total. Listing them
+all is less useful than grouping them by whether they bear on AgentMux's five
+states — READY, RUNNING, WAITING, COMPLETED, ERROR — so that is how they are
+presented. The names are the schema's names.
 
 **Session and turn boundaries.** `SessionStart`, `SessionEnd`, `UserPromptSubmit`,
 `UserPromptExpansion`, `Stop`, `StopFailure`, `MessageDisplay`.

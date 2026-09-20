@@ -16,6 +16,7 @@ As of version 0.6.5:
 | Phase 6 — Multi-device control | **Done** | One controller and many viewers per project, a lease with a grace period, a handshake for handing control over, and input and resize authority on the server. Verified in two real browser contexts at once — a desktop and an emulated tablet. See below. |
 | Phase 6.5 — Stabilization | **Done** | Not a capability phase. systemd unit, installer, configuration file, health endpoint, log components, version reporting, a documented recovery model with a script that exercises it, and a measured performance baseline. Validated on a real Linux server. See below. |
 | Phase 7.1 — Agent event foundation | **Done** | Not a capability phase, and deliberately invisible in the product. The event model, `agent_events`, one write path, the runtime bridge, and two read-only timeline endpoints. No Claude Hooks, no output parsing, no state inference, no UI. See below. |
+| Phase 7.2 — Task and agent session model | **Done** | Not a capability phase either, and the last piece of Phase 7 that is not about Claude. `tasks` and `agent_sessions`, their lifecycles, the service that owns both, the eight endpoints that read and move them, and no UI. Nothing here starts a process. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -505,6 +506,91 @@ Event Service    owns  what happened         agent_events, append-only
 A later phase that reads events to decide whether a runtime is running has made
 the mistake the boundary prevents. `docs/AGENT_EVENTS.md` §1 and §5 are the long
 form, and §8 lists what is deliberately absent.
+
+### Phase 7.2 — Task and agent session model
+
+Status: **done**. It is the second half of the foundation Phase 7 stands on, and it
+is as invisible as the first: no screen in the product changed, and nothing a
+person can do in the interface is different.
+
+Deliver:
+
+- the task model — what somebody wants an agent to do, and its status
+  (`internal/task`);
+- the agent session model — one attempt at a task, and its status
+  (`internal/task/session.go`);
+- `tasks` and `agent_sessions`, with their indexes
+  (`migrations/0004_tasks.sql`, `migrations/0005_agent_sessions.sql`);
+- one service that owns both lifecycles, so a status changes in one place and
+  cannot be moved anywhere the graph does not allow;
+- eight endpoints under `/api` for reading and moving them;
+- `docs/TASK_MODEL.md`.
+
+The relationship, which is the whole of the phase:
+
+```text
+Project → Task → AgentSession → Runtime → AgentEvent
+```
+
+**A task is not a runtime.** "Is the terminal up?" is a runtime question with a
+present-tense answer that changes while you look at it; "was this work finished?"
+is a task question whose answer stays true after every process involved has
+exited. The session is the level that makes the two compatible rather than merely
+different, and it is what allows a task to have been attempted twice, in two
+different runtimes, one of which no longer exists. That is why
+`agent_sessions.runtime_id` is a column and **not** a foreign key.
+
+**Nothing in this sub-phase starts a process.** Creating a task starts no runtime,
+launches no agent and writes no prompt; a session is created with no runtime and
+one is attached afterwards by a request. The two halves of AgentMux meet at the
+runtime API, which already existed, and joining them is 7.3 rather than a missing
+line of this one.
+
+**A status changes because a request changed it, and for no other reason.** The
+service never reads the event log to work out where a task stands. Deriving a
+status from events would make the log authoritative and the task a cache of it,
+and the first time the two disagreed there would be no way to say which was right.
+
+What was built: four packages' worth of model and none of it a UI. The task and
+session lifecycles as a table of allowed edges rather than forbidden ones, so a
+transition nobody thought about is refused; `COMPLETED` final, so a task reported
+as done and then reported as running again cannot make the first report false;
+`WAITING` on the task and deliberately **not** on the session; a conditional
+`UPDATE … WHERE id = ? AND status = ?` instead of a lock, so two racing requests
+apply exactly once and the loser is told it lost; identifiers from
+`internal/idgen`, which this phase factored out of the two packages that had
+already written it twice; and four event types rather than one per status,
+written through Phase 7.1's existing `event.Service`.
+
+Verified by `go test ./...` across the model, the service, the storage layer and
+the HTTP surface; a new browser suite, `web/e2e/suites/tasks.mjs`, driving the API
+from a real page against a real server; and the migration path from a Phase 7.1
+database asserted to upgrade without disturbing `projects`, `project_runtime` or
+`agent_events`.
+
+**Not in this sub-phase, and not stubbed:** Claude Hooks, the Claude Agent SDK,
+terminal output parsing, prompt parsing, AI state inference, notifications,
+token or model statistics, automatic retry, AI summarization, multi-agent
+orchestration, user accounts, billing, and any Task UI. The frontend gained types
+and API functions and no screens. `docs/TASK_MODEL.md` §8 is the long form.
+
+The two things this phase is **not** yet able to do, stated rather than implied:
+a task list is capped and not paginated (§12 of the same document), and nothing
+joins a task to a running Claude — a task exists, and a session names the runtime
+it ran in, and no code yet connects the two.
+
+### Phase 7.3 — not started
+
+**The next phase.** Phase 7.1 built the record of what happened and 7.2 built the
+record of what is wanted. What remains is the part Phase 7 was named for: the
+agent reporting its own state, so that a session's status stops being something a
+caller sets by hand and becomes something Claude Hooks say. That is where the
+five statuses at the top of this section — READY, RUNNING, WAITING, COMPLETED,
+ERROR — are meant to come from, and it is where a task and a runtime are finally
+joined.
+
+Nothing about it is designed here, no part of it is stubbed, and no code in this
+build anticipates it. It is listed so that a reader can see what 7.2 was for.
 
 ## Phase 8 — CC Switch integration
 

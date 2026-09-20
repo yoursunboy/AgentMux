@@ -18,8 +18,8 @@ func TestNewIDShape(t *testing.T) {
 		if !strings.HasPrefix(id, IDPrefix) {
 			t.Fatalf("NewID produced %q, want the %q prefix", id, IDPrefix)
 		}
-		if len(id) != len(IDPrefix)+idBodyLen {
-			t.Fatalf("NewID produced %q, want %d characters", id, len(IDPrefix)+idBodyLen)
+		if len(id) != len(IDPrefix)+eventID.BodyLen() {
+			t.Fatalf("NewID produced %q, want %d characters", id, len(IDPrefix)+eventID.BodyLen())
 		}
 		// Uniqueness before storage is the property the identifier exists for:
 		// it is what lets an event be logged or handed to a client before the

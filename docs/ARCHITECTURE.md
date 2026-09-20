@@ -11,6 +11,7 @@ iPad / Phone / PC
 │       AgentMux Server       │   runs inside WSL on Windows (see §7)
 │                             │
 │ Project Manager             │   internal/project        — built
+│ Task Model                  │   internal/task           — built in Phase 7.2
 │ Session Manager             │   internal/session        — built in Phase 2
 │ Terminal Manager            │   part of session.Manager — sequence, history
 │ Terminal Transport          │   internal/terminal       — built in Phase 4
@@ -18,7 +19,7 @@ iPad / Phone / PC
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Event Log                   │   internal/event          — built in Phase 7.1
-│ Controller Manager          │   Phase 6, not stubbed
+│ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
 │ Storage                     │   internal/storage        — built
@@ -35,6 +36,11 @@ iPad / Phone / PC
     (shell)   (shell)   (shell)
       └─ claude   └─ claude   └─ claude    one agent per runtime, since Phase 3
 ```
+
+The Task Model is in that table and **not** in that diagram, and the omission is the design rather
+than an oversight. Everything else in the box is a thing that owns a process, a socket, or a byte
+stream. A task owns none of them: it is a row, and a later phase is what will connect it to the
+machinery below. The Task Model boundary in §3 is the whole of that distinction.
 
 The server's own process is the one that owns tmux, which is why the box above is inside the runtime
 environment rather than beside it. Everything above `SessionBackend` is transport-agnostic; everything
@@ -240,6 +246,79 @@ edited is not a history. That is also why the payload is bounded and why no erro
 copied into one — a row that can never be changed can never be redacted either.
 
 `docs/AGENT_EVENTS.md` is the long form.
+
+### Task Model
+
+Owns:
+
+- what somebody wants an agent to do — a task, and its status;
+- the attempts made at it — an agent session, and its status;
+- the relation between an attempt and the runtime it ran in;
+- the lifecycle: which status changes are allowed, and which are refused.
+
+Does **not** own anything about runtime state, terminal output, or the event log. Phase 7.1 drew a line
+between what is true now and what happened; this adds a third thing that is neither, and the three are
+worth stating together because each answers a question the other two get wrong:
+
+```text
+RuntimeManager   owns  what is true now      Runtime.State, project_runtime
+Task Service     owns  what is wanted        tasks, agent_sessions
+Event Service    owns  what happened         agent_events, append-only
+```
+
+Five levels, and each one is a different kind of statement:
+
+```text
+Project        where the work lives           1 project      → many tasks
+Task           what is wanted                 1 task         → many attempts
+AgentSession   one attempt at it              0 or 1 attempts → one runtime
+Runtime        the process an attempt ran in  one runtime    → many events
+AgentEvent     what happened                  forever
+```
+
+Read that downward and it is a decomposition. Read it upward and it is a history: the event is the
+smallest fact, and each level above it is a way of grouping the facts below. `docs/TASK_MODEL.md` §1
+is the same table with the questions and the lifetimes alongside it.
+
+**A task is not a runtime, and this is the distinction the level exists to keep.** "Is the terminal
+up?" is a runtime question with a present-tense answer that changes while you look at it. "Was this
+work finished?" is a task question whose answer stays true after every process involved has exited. A
+task that required a process in order to exist would make the second question unanswerable — and it
+would make "we decided not to do this" and "we did this last month" into records that vanish when a
+tmux server is killed.
+
+The agent session is the level that makes the two compatible rather than merely different. It is what
+allows a task to have been attempted twice, in two different runtimes, one of which no longer exists —
+which is why `agent_sessions.runtime_id` is **not** a foreign key and why the record of an attempt
+outlives the runtime it names. §13 and `docs/TASK_MODEL.md` §3 have the reasoning.
+
+Three consequences of the boundary, each of which a future phase could be tempted to break:
+
+- **A task's status changes because a request changed it, and for no other reason.** The service never
+  reads the event log to work out where a task stands. Deriving a status from events would make the
+  log authoritative and the task a cache of it, and the first time the two disagreed there would be no
+  way to say which was right.
+- **Nothing in the task model starts a process.** Creating a task starts no runtime, launches no agent
+  and writes no prompt. The two halves of AgentMux meet at the runtime API, which already exists, and
+  joining them is a later phase rather than a missing line of this one.
+- **A task and an attempt are two rows and not one transaction.** An attempt begins with no runtime and
+  gets one afterwards, because creating a record and starting a process are two acts that fail
+  differently. Holding a write lock across a process launch would let a tmux that refused to start undo
+  the record that somebody wanted the work done at all.
+
+The four packages, and which way each one is allowed to look:
+
+```text
+internal/task      the model, the service, the lifecycle   →  knows project, event
+internal/project   the project and its identifiers         →  knows nothing above it
+internal/storage   every statement, and the repositories  →  knows all of them
+internal/httpapi   the routes                              →  knows services, never *sql.DB
+```
+
+`internal/task` imports `internal/project` because a runtime id *is* a project id with a prefix, and
+the package that spells that namespace should be the one that checks it. It imports `internal/event`
+for the vocabulary of what it may report. Neither imports `internal/task`, which is what makes the
+dependency a line rather than a tangle.
 
 ## 4. Project identity
 
@@ -539,9 +618,9 @@ collections (optional)
 A separate `collections` table is optional; collection path may initially be stored on Project records.
 
 Created so far: `projects`, `settings`, `schema_migrations` (the migration bookkeeping table), and —
-from Phase 2 — `project_runtime`, and — from Phase 7.1 — `agent_events`. Collection membership is a
-column on `projects`, which is why registering an existing project is a single insert and finding a
-project's collection needs no join.
+from Phase 2 — `project_runtime`, and — from Phase 7.1 — `agent_events`, and — from Phase 7.2 —
+`tasks` and `agent_sessions`. Collection membership is a column on `projects`, which is why registering
+an existing project is a single insert and finding a project's collection needs no join.
 
 `project_runtime` stores only what cannot be answered after a restart: the owning backend, the session
 name, the user's intent, the canonical size, and the timestamps. It stores **no terminal output at any
@@ -567,6 +646,30 @@ unreachable through every endpoint this API has. Nothing in the table is ever up
 
 Migrations are embedded SQL files applied in order and recorded by name, so a future schema change is
 a new numbered file rather than an edit to an applied one.
+
+Phase 7.2 added `tasks` and `agent_sessions` (`0004`, `0005`), and the two foreign keys in them are
+the interesting part because they are deliberately not the same shape.
+
+```text
+tasks.project_id            →  projects(id)     ON DELETE CASCADE
+agent_sessions.task_id      →  tasks(id)        ON DELETE CASCADE
+agent_sessions.runtime_id   →  (no foreign key)
+```
+
+`agent_events` is left exactly as 0003 declared it, cascade on `projects` and all — see
+`docs/TASK_MODEL.md` §5 for why neither new cascade reaches it.
+
+The first two keys above are the hierarchy: work that belongs to a project that no longer exists is
+unreachable through every endpoint this API has. The third is the boundary §3's Task Model section
+describes, and it has no constraint because a runtime is destroyed while the attempt that used it is
+not: a foreign key here would either delete the history of the attempt along with the runtime, or
+refuse the destroy because something still pointed at it, and both of those are worse than a column
+that is not checked. An attempt's `runtime_id` therefore names a runtime that may be gone, and that is
+the point of it.
+
+Nothing in either table is deleted by this build — there is no DELETE on a task or an attempt — so
+those cascades describe what would happen the day something does delete, rather than a path this phase
+opens.
 
 ## 14. Security
 

@@ -29,6 +29,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/internal/terminal"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
@@ -55,6 +56,7 @@ type Server struct {
 	discoverer *project.Discoverer
 	runtime    *session.Manager
 	events     *event.Service
+	tasks      *task.Service
 	agent      AgentResolver
 	terminal   *terminal.Hub
 	log        *slog.Logger
@@ -89,6 +91,15 @@ type Options struct {
 	// It is a *Service and not a Repository, because the HTTP layer talks to
 	// services and never to storage.
 	Events *event.Service
+
+	// Tasks is the task and agent session model. It is optional, like Events
+	// and Terminal and for the same reason: a test of the REST surface that is
+	// not about tasks should not have to build one. A server without it
+	// explains itself on those seven routes.
+	//
+	// It is a *Service and not a Repository for the same reason Events is: no
+	// handler in this package sees a database handle.
+	Tasks *task.Service
 
 	// Agent resolves the coding agent this server would launch, for the
 	// capability report. It is optional: a server with no agent configured
@@ -137,6 +148,7 @@ func New(o Options) (*Server, error) {
 		discoverer: o.Discoverer,
 		runtime:    o.Runtime,
 		events:     o.Events,
+		tasks:      o.Tasks,
 		agent:      o.Agent,
 		terminal:   o.Terminal,
 		log:        o.Logger,
@@ -209,6 +221,35 @@ func (s *Server) routes() http.Handler {
 	// client reads a history, and never writes one.
 	mux.HandleFunc("GET /api/projects/{id}/events", s.handleListProjectEvents)
 	mux.HandleFunc("GET /api/runtime/{id}/events", s.handleListRuntimeEvents)
+
+	// The work somebody wants done, and the attempts made at it.
+	//
+	// A task is created under its project and is then addressed by its own id,
+	// because the id is what outlives the relationship: a task belongs to one
+	// project for its whole life, while the things a caller does with it - move
+	// its status, record an attempt - are about the task.
+	//
+	// An attempt is nested under its task, and is then also addressed by its own
+	// id. Nothing here deletes either one: there is no DELETE, and its absence
+	// is the design rather than a gap. See internal/httpapi/tasks.go.
+	//
+	// The status is changed with a PATCH rather than a POST to a /status
+	// sub-resource, because a status is a property of a task and not a resource
+	// of its own.
+	mux.HandleFunc("POST /api/projects/{id}/tasks", s.handleCreateTask)
+	mux.HandleFunc("GET /api/projects/{id}/tasks", s.handleListTasks)
+	mux.HandleFunc("GET /api/tasks/{id}", s.handleGetTask)
+	mux.HandleFunc("PATCH /api/tasks/{id}", s.handleUpdateTask)
+	mux.HandleFunc("POST /api/tasks/{id}/sessions", s.handleCreateSession)
+	mux.HandleFunc("GET /api/tasks/{id}/sessions", s.handleListSessions)
+	mux.HandleFunc("GET /api/sessions/{id}", s.handleGetSession)
+
+	// One endpoint, two things it can change: the attempt's status, and the
+	// runtime it ran in. They share a request because they are the two facts
+	// that are known at the moment an attempt is under way, and a client that
+	// has just started a runtime for a session would otherwise make two calls
+	// and have to decide their order itself.
+	mux.HandleFunc("PATCH /api/sessions/{id}", s.handleUpdateSession)
 
 	// The one real-time endpoint. One socket per browser, carrying every
 	// project's terminal; see internal/terminal and docs/PROTOCOL.md.
@@ -505,6 +546,16 @@ func hasHiddenSegment(cleaned string) bool {
 	return false
 }
 
+// errEmptyBody is what decodeJSON returns for a request with no body.
+//
+// It is a named error rather than a message so that a handler can decide
+// whether an empty body is a mistake or an ordinary request. For most endpoints
+// it is a mistake - a POST that creates something out of fields needs the
+// fields - and for a few it is not: creating an attempt at a task names
+// everything it needs in the path, and demanding a body would be demanding
+// punctuation.
+var errEmptyBody = errors.New("request body is empty")
+
 // decodeJSON reads a JSON body into dst.
 //
 // Unknown fields are rejected: AgentMux has exactly one client, and a typo
@@ -527,7 +578,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		case errors.As(err, &typeErr):
 			return fmt.Errorf("field %q has the wrong type", typeErr.Field)
 		case errors.Is(err, io.EOF):
-			return errors.New("request body is empty")
+			return errEmptyBody
 		default:
 			return errors.New(strings.TrimPrefix(err.Error(), "json: "))
 		}

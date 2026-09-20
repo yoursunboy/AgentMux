@@ -21,6 +21,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
+	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/internal/terminal"
 )
 
@@ -49,6 +50,11 @@ type harness struct {
 	// can write a timeline without going through the runtime - which is what
 	// makes an API test about the API rather than about tmux.
 	events *event.Service
+
+	// tasks is the same task service the server holds, kept here so a test can
+	// record a task or an attempt directly when what it is asserting about is
+	// not the call that would have created it.
+	tasks *task.Service
 }
 
 // harnessOptions describes the environment a test wants its server to believe
@@ -85,7 +91,6 @@ type harnessOptions struct {
 	// tmuxMissing is the third case on its own: an environment that could host
 	// a runtime with a tmux that is not installed in it.
 	tmuxMissing bool
-
 	// tmuxStatus, when set, makes this server's backend factory able to
 	// describe the tmux installation its runtimes will use. Left nil the
 	// factory cannot, which is the case the server has to survive: an absent
@@ -117,11 +122,27 @@ type harnessOptions struct {
 	// the pane's foreground process against it before typing a command, so a
 	// test about a busy terminal has to say which program it is busy with.
 	shell string
+
+	// withoutTasks builds the server with no task service, which is how a
+	// caller that does not use the task model runs it. The task routes must
+	// then explain themselves rather than panic or answer with an empty list.
+	withoutTasks bool
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	return newHarnessOpts(t, harnessOptions{})
+}
+
+// newHarnessWithoutTasks builds a server that was started with no task model.
+//
+// The service is optional in Options the same way the event log and the
+// terminal hub are, and this is the harness that exercises the other branch: a
+// request to a task route has to be told the model is missing rather than
+// being answered with an empty list or a panic.
+func newHarnessWithoutTasks(t *testing.T) *harness {
+	t.Helper()
+	return newHarnessOpts(t, harnessOptions{withoutTasks: true})
 }
 
 // newHarnessWith builds a harness whose Projects Root is pre-populated by
@@ -214,6 +235,27 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		t.Fatalf("event.NewService returned an error: %v", err)
 	}
 
+	// The real task service over the harness's real database, and recording
+	// into the same event log the runtime manager writes to. A fake repository
+	// would let every test in this file pass while the SQL the endpoints depend
+	// on was wrong - the conditional status update in particular, which is the
+	// one statement in this phase that is not a plain INSERT or SELECT.
+	tasks, err := task.NewService(task.Options{
+		Repository: store.Tasks(),
+		Projects:   service,
+		Events:     events,
+		Logger:     discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("task.NewService returned an error: %v", err)
+	}
+	// A harness built without the task model hands the server a nil service and
+	// keeps the real one, so a test can still record rows directly.
+	var servedTasks *task.Service = tasks
+	if o.withoutTasks {
+		servedTasks = nil
+	}
+
 	backend := newFakeBackend()
 	backend.pane = o.pane
 	plain := &fakeFactory{backend: backend}
@@ -277,6 +319,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Discoverer: discoverer,
 		Runtime:    manager,
 		Events:     events,
+		Tasks:      servedTasks,
 		Terminal:   hub,
 		Logger:     discardLogger(),
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
@@ -296,6 +339,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		backend: backend,
 		runtime: manager,
 		events:  events,
+		tasks:   tasks,
 	}
 }
 

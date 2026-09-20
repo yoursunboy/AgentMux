@@ -37,6 +37,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/storage"
+	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/internal/terminal"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
@@ -222,6 +223,26 @@ func run(args []string) error {
 		return err
 	}
 
+	// The task model. It reads the project store to check that the project a
+	// task names exists, and it writes to the event log the same way the runtime
+	// manager does - through the service, never through the table.
+	//
+	// It is built after the event log because it records into it, and before the
+	// API server because the API is handed the service rather than a repository.
+	// Nothing here starts anything: creating a task records that somebody wants
+	// work done, and the runtime API is still the only thing that launches a
+	// process.
+	taskLog := logging.Component(logger, logging.ComponentTask)
+	taskService, err := task.NewService(task.Options{
+		Repository: store.Tasks(),
+		Projects:   projectService,
+		Events:     eventLog,
+		Logger:     taskLog,
+	})
+	if err != nil {
+		return err
+	}
+
 	runtimes, err := session.NewManager(session.ManagerOptions{
 		Backends:      backends,
 		Sockets:       backends.Sockets(),
@@ -294,6 +315,7 @@ func run(args []string) error {
 		Discoverer: discoverer,
 		Runtime:    runtimes,
 		Events:     eventLog,
+		Tasks:      taskService,
 		Agent:      agents,
 		Terminal:   terminalHub,
 		Logger:     logging.Component(logger, logging.ComponentAPI),

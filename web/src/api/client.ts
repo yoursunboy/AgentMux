@@ -7,13 +7,18 @@
  * number or a message string.
  */
 import type {
-  Candidate,
+  AgentSession,
   CreateProjectInput,
+  CreateTaskInput,
   DiscoveryResult,
   Project,
   RegisterProjectInput,
   Runtime,
   ServerInfo,
+  Task,
+  TaskStatus,
+  UpdateSessionInput,
+  UpdateTaskInput,
 } from './types'
 
 /** The API is served from the same origin as this bundle. */
@@ -303,4 +308,167 @@ export async function startAgent(projectId: string, signal?: AbortSignal): Promi
 }
 
 /** Re-exported so callers do not import from two modules for one concept. */
-export type { Candidate, DiscoveryResult, Project, Runtime, ServerInfo }
+export type {
+  AgentSession,
+  AgentSessionStatus,
+  Candidate,
+  DiscoveryResult,
+  Project,
+  Runtime,
+  ServerInfo,
+  Task,
+  TaskStatus,
+} from './types'
+
+// ---------------------------------------------------------------------------
+// Tasks and agent sessions
+// ---------------------------------------------------------------------------
+
+/**
+ * Record a piece of work somebody wants an agent to do.
+ *
+ * It starts nothing. Creating a task does not start a runtime, launch an agent
+ * or send a prompt: it records that the work is wanted, and that fact does not
+ * depend on any process being alive. The two halves of AgentMux are joined by a
+ * later phase.
+ *
+ * The project is in the path and deliberately not in the body - a body that also
+ * names one is refused rather than resolved by a rule nobody wrote down.
+ */
+export async function createTask(
+  projectId: string,
+  input: CreateTaskInput,
+  signal?: AbortSignal,
+): Promise<Task> {
+  const body = await request<{ task: Task }>(
+    `/projects/${encodeURIComponent(projectId)}/tasks`,
+    { method: 'POST', body: JSON.stringify(input), signal: signal ?? null },
+  )
+  return body.task
+}
+
+/**
+ * List a project's tasks, newest first.
+ *
+ * An unknown project is a 404 rather than an empty list, because "this project
+ * does not exist" and "this project has no tasks" are different answers and an
+ * empty list cannot tell them apart.
+ */
+export async function fetchTasks(
+  projectId: string,
+  options: { status?: TaskStatus; limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<Task[]> {
+  const query = new URLSearchParams()
+  if (options.status) query.set('status', options.status)
+  if (options.limit !== undefined) query.set('limit', String(options.limit))
+  const suffix = query.toString() === '' ? '' : `?${query}`
+
+  const body = await request<{ tasks: Task[]; count: number }>(
+    `/projects/${encodeURIComponent(projectId)}/tasks${suffix}`,
+    { signal: signal ?? null },
+  )
+  return body.tasks
+}
+
+/** One task by its own id. */
+export async function fetchTask(id: string, signal?: AbortSignal): Promise<Task> {
+  const body = await request<{ task: Task }>(`/tasks/${encodeURIComponent(id)}`, {
+    signal: signal ?? null,
+  })
+  return body.task
+}
+
+/**
+ * Change a task's title, its status, or both.
+ *
+ * This is the only call that moves a task, and it cannot bypass the lifecycle:
+ * the server validates the transition against the status it reads, so a
+ * `COMPLETED` task cannot be moved back to `RUNNING` by any request it accepts.
+ * A refused transition arrives as an `ApiError` with code
+ * `invalid_status_transition` and the statuses that were available.
+ *
+ * There is no delete. A cancelled task is a record of work somebody decided not
+ * to do, which is worth keeping.
+ */
+export async function updateTask(
+  id: string,
+  input: UpdateTaskInput,
+  signal?: AbortSignal,
+): Promise<Task> {
+  const body = await request<{ task: Task }>(`/tasks/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+    signal: signal ?? null,
+  })
+  return body.task
+}
+
+/**
+ * Start a new attempt at a task.
+ *
+ * The attempt begins with no runtime, and `runtimeId` is deliberately not
+ * accepted here: creating an attempt and starting a process are two acts, and
+ * the window between them is a real state. Attach one afterwards with
+ * `updateSession`.
+ *
+ * A second attempt is a second session. Neither replaces the other - that is
+ * what this level is for.
+ */
+export async function createSession(taskId: string, signal?: AbortSignal): Promise<AgentSession> {
+  const body = await request<{ session: AgentSession }>(
+    `/tasks/${encodeURIComponent(taskId)}/sessions`,
+    { method: 'POST', signal: signal ?? null },
+  )
+  return body.session
+}
+
+/** List one task's attempts, newest first. */
+export async function fetchSessions(
+  taskId: string,
+  options: { limit?: number } = {},
+  signal?: AbortSignal,
+): Promise<AgentSession[]> {
+  const query = new URLSearchParams()
+  if (options.limit !== undefined) query.set('limit', String(options.limit))
+  const suffix = query.toString() === '' ? '' : `?${query}`
+
+  const body = await request<{ sessions: AgentSession[]; count: number }>(
+    `/tasks/${encodeURIComponent(taskId)}/sessions${suffix}`,
+    { signal: signal ?? null },
+  )
+  return body.sessions
+}
+
+/** One attempt by its own id. */
+export async function fetchSession(id: string, signal?: AbortSignal): Promise<AgentSession> {
+  const body = await request<{ session: AgentSession }>(`/sessions/${encodeURIComponent(id)}`, {
+    signal: signal ?? null,
+  })
+  return body.session
+}
+
+/**
+ * Change an attempt's status, bind it to a runtime, or both.
+ *
+ * The status is applied first, so a caller told it lost a race is told so
+ * before a runtime has been attached on its behalf - nothing about a refused
+ * request is left behind.
+ *
+ * The runtime is bound once. A session that already has one is refused with
+ * `status_conflict` rather than rebound, because the field answers "which
+ * runtime did this attempt run in" and a field that can be rewritten stops
+ * answering it.
+ */
+export async function updateSession(
+  id: string,
+  input: UpdateSessionInput,
+  signal?: AbortSignal,
+): Promise<AgentSession> {
+  const body = await request<{ session: AgentSession }>(`/sessions/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(input),
+    signal: signal ?? null,
+  })
+  return body.session
+}

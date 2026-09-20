@@ -18,63 +18,40 @@
 package event
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/kutonlagos/agentmux/internal/idgen"
 )
 
 // IDPrefix marks an event identifier in a log line or a URL.
 const IDPrefix = "evt_"
 
-// idRandomBytes is the entropy per identifier: 16 bytes, 128 bits, the same
+// eventID is the shape of an event identifier: 16 bytes, 128 bits, the same
 // entropy a version-4 UUID carries.
 //
 // It is not a UUID. Every other identifier in AgentMux is "prefix_hex" - "p_"
-// for a project, "inst_" for an installation - and a second identifier format
-// in the same product is a second thing for a reader to recognise. The entropy
-// is what makes the identifier unique before it is stored, which is what lets
-// an event be logged or handed to a client before it is written; the spelling
-// is not.
-const idRandomBytes = 16
-
-// idBodyLen is the number of hex characters in the random part of an ID.
-const idBodyLen = idRandomBytes * 2
+// for a project, "task_" for a task - and a second identifier format in the
+// same product is a second thing for a reader to recognise. The entropy is what
+// makes the identifier unique before it is stored, which is what lets an event
+// be logged or handed to a client before it is written; the spelling is not.
+//
+// It is the largest of the resource identifiers because an event id is a
+// pagination cursor and appears in a URL, where it may be handed to something
+// outside this installation.
+var eventID = idgen.Spec{Prefix: IDPrefix, Bytes: 16}
 
 // NewID returns a fresh event identifier.
 //
 // It is generated rather than assigned by the database, because identity the
 // storage engine hands out is identity only the storage engine knows: two
 // installations writing to two databases cannot agree on an integer.
-func NewID() (string, error) {
-	buf := make([]byte, idRandomBytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("event: generate id: %w", err)
-	}
-	return IDPrefix + hex.EncodeToString(buf), nil
-}
+func NewID() (string, error) { return eventID.New() }
 
 // ValidID reports whether id has the shape NewID produces.
-func ValidID(id string) bool {
-	if !strings.HasPrefix(id, IDPrefix) {
-		return false
-	}
-	body := id[len(IDPrefix):]
-	if len(body) != idBodyLen {
-		return false
-	}
-	for i := 0; i < len(body); i++ {
-		c := body[i]
-		switch {
-		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
-		default:
-			return false
-		}
-	}
-	return true
-}
+func ValidID(id string) bool { return eventID.Valid(id) }
 
 // Event types this build emits.
 //

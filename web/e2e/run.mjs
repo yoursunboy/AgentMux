@@ -196,11 +196,18 @@ async function waitForClaude(entry, timeoutMs) {
 /**
  * The order suites run in: cheapest and most fundamental first.
  *
+ * `tasks` sits second because it is the cheapest of them and the least
+ * entangled: it drives the task API and reads one runtime's state without ever
+ * starting, stopping or typing into one, so nothing it does can depend on what
+ * ran before it. It does leave rows behind, which is why it goes before the
+ * suites that restart the server - a restart is worth surviving with real data
+ * in the database.
+ *
  * `controller` is last because it is the most expensive of them: it drives two
  * browser contexts at once, waits out a control grace and restarts the server
  * underneath its own fixture. Nothing after it would benefit from that.
  */
-const ALL_SUITES = ['transport', 'terminal', 'recovery', 'tablet', 'workspace', 'controller']
+const ALL_SUITES = ['transport', 'tasks', 'terminal', 'recovery', 'tablet', 'workspace', 'controller']
 
 /**
  * The fixtures, and the role each one plays.

@@ -787,6 +787,227 @@ copied into a row that can never be redacted is a string that can never be taken
 
 `docs/AGENT_EVENTS.md` is the long form of this layer, including what it deliberately does not do.
 
+## Tasks and agent sessions
+
+Two resources, and the third thing this API knows about that is neither present state nor the past. A
+task is **what somebody wants done**; an agent session is **one attempt at it**. Neither is a terminal,
+a runtime, a WebSocket or a Claude process, and the distinction is the entire reason the level exists —
+`docs/TASK_MODEL.md` §1–§3 is the long form, and §1 is the part worth reading before this section.
+
+| Call | Effect |
+| --- | --- |
+| `POST /api/projects/{id}/tasks` | Record a piece of work somebody wants an agent to do. |
+| `GET /api/projects/{id}/tasks` | One project's tasks, newest first. |
+| `GET /api/tasks/{id}` | One task. |
+| `PATCH /api/tasks/{id}` | Change a task's title, its status, or both. |
+| `POST /api/tasks/{id}/sessions` | Start a new attempt at a task. |
+| `GET /api/tasks/{id}/sessions` | One task's attempts, newest first. |
+| `GET /api/sessions/{id}` | One attempt. |
+| `PATCH /api/sessions/{id}` | Change an attempt's status, bind it to a runtime, or both. |
+
+**There is no `DELETE` on either resource**, and no method other than those above is routed on any of
+those paths. Nothing in this build removes a task or an attempt; a cancelled task is the record of
+work somebody decided not to do, which is worth keeping, and the same argument covers an attempt that
+failed. What the database would do if something ever did delete is decided by the foreign keys in
+`0004` and `0005` — see `docs/TASK_MODEL.md` §5 — and this phase does not open that door.
+
+**No endpoint here starts anything.** Creating a task starts no runtime, launches no agent and writes
+no prompt. The two halves of AgentMux meet at the runtime API above, and joining them is a later
+phase rather than a missing line of this one.
+
+### A task
+
+```json
+{
+  "id": "task_44e0a1b2c3d4e5f60718293a",
+  "projectId": "p_9a3b1c2d3e4f5061728394a5",
+  "title": "Implement Controller Viewer",
+  "status": "CREATED",
+  "createdAt": "2026-09-20T11:04:07.318204Z",
+  "updatedAt": "2026-09-20T11:04:07.318204Z",
+  "completedAt": null
+}
+```
+
+Every time in the model is produced by the server, in UTC, and a client's clock is never read. A
+`completedAt` of `null` is present rather than absent: the field answers "when was this completed",
+and *never* is an answer that has to be sayable.
+
+`title` is free text and is treated as such — never executed, never interpolated into a shell, never
+interpreted as a path or as HTML. It is bounded at 200 characters, counted in **runes** rather than
+bytes, because the bound exists to bound what a person sees and 200 bytes is a different amount of
+text in every script. An empty title, one with leading or trailing whitespace, one that is not valid
+UTF-8 and one carrying control characters are refused rather than quietly rewritten.
+
+The six statuses, and the edges between them, are the whole lifecycle:
+
+```text
+from        may become
+CREATED     RUNNING, CANCELLED
+RUNNING     WAITING, COMPLETED, FAILED, CANCELLED
+WAITING     RUNNING, COMPLETED, FAILED, CANCELLED
+COMPLETED   — terminal
+FAILED      — terminal
+CANCELLED   — terminal
+```
+
+`AllowedTaskTransitions` in `internal/task` is the same list, and a refusal carries it in
+`details.allowed` so a client renders the control the server actually enforces rather than a second
+copy of the rule.
+
+Written as a table of allowed edges rather than forbidden ones, so that a transition nobody thought
+about is refused. Three consequences are worth stating because they are decisions rather than
+arithmetic: `COMPLETED` is final, so a task reported as done and then reported as running again cannot
+make the first report false; `CREATED` does not lead directly to `COMPLETED`, because "completed" is a
+claim about work that was done and work that never started was not done; and `WAITING` exists on the
+task and **not** on the session, because being blocked on a review or a decision is a long-lived
+condition of a *goal*, while a runtime that is up and idle is idle, and idle is not a lifecycle state.
+
+#### `POST /api/projects/{id}/tasks`
+
+The project is in the path and deliberately **not** in the body. A body that also names one is an
+unknown field and is refused rather than resolved by a rule nobody wrote down: two places to say which
+project a task belongs to is one place too many.
+
+```json
+{ "title": "Implement Controller Viewer" }
+```
+
+Answers `201` with `{ "task": { … } }`. The task begins in `CREATED` with no attempt, and the project
+is resolved before anything is written, so a task cannot be created under a project that does not
+exist.
+
+#### `GET /api/projects/{id}/tasks`
+
+| Parameter | Meaning |
+| --- | --- |
+| `status` | Return only tasks in this status. One of the six, exactly. |
+| `limit` | How many to return. Default 100, maximum 500. |
+
+```json
+{ "tasks": [ … ], "count": 1 }
+```
+
+Newest first, ordered by `(createdAt, id)` and **not** by the timestamp alone: two tasks created in
+the same instant would otherwise have no defined order, and the tie-break is what makes the order
+stable across two calls that read the same rows. The list is **capped and not paginated** — there is no
+cursor, and `count` is the number of rows in this page rather than the number that exist. That is a
+deliberate limit of this phase rather than an oversight; `docs/TASK_MODEL.md` §12 records it.
+
+The project is resolved first, so an unknown id is a 404 about the project rather than a project that
+exists and has nothing in it. An unknown `status` is refused with the six that exist rather than
+answered with an empty list, for the same reason.
+
+#### `GET /api/tasks/{id}`
+
+`200` with `{ "task": { … } }`, or `404 task_not_found`.
+
+#### `PATCH /api/tasks/{id}`
+
+Both fields are optional and at least one must be present.
+
+```json
+{ "title": "Implement Controller Viewer", "status": "RUNNING" }
+```
+
+A field sent as `null` is refused rather than treated as "leave it alone": a request to clear a task's
+title is a mistake, and reporting it as an absent field would silently accept it. A status equal to
+the one already stored is a no-op that returns the task unchanged, so a client that re-sends what it
+already knows is not told it lost a race.
+
+This is the only route that moves a task, and it cannot bypass the lifecycle: the service checks the
+transition against the status it reads and writes **conditionally** on that status still holding. Two
+requests that race therefore apply exactly once — the loser is told `409 status_conflict` and is not
+handed a state it did not ask for. `docs/TASK_MODEL.md` §10 has the mechanism.
+
+### An agent session
+
+```json
+{
+  "id": "sess_9a27f1e0d3c4b5a69788796a",
+  "taskId": "task_44e0a1b2c3d4e5f60718293a",
+  "status": "CREATED",
+  "startedAt": null,
+  "endedAt": null,
+  "createdAt": "2026-09-20T11:05:12.884301Z"
+}
+```
+
+`runtimeId` is **absent rather than null** when the attempt has no runtime yet, which is how every
+attempt begins. Empty is a first-class value here, not a placeholder: a session is created before its
+runtime is, and the window between the two calls is a real state this model names rather than hides.
+
+An attempt has five statuses — `CREATED`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED` — and the same
+shape of lifecycle as a task, minus `WAITING`. `startedAt` is set on entering `RUNNING` and `endedAt`
+on entering a terminal status, so a session that failed before it ever ran has an end and no start:
+that is the honest description of a runtime that never came up.
+
+#### `POST /api/tasks/{id}/sessions`
+
+A complete request with nothing in it, and the body is optional. `201` with `{ "session": { … } }`.
+
+`runtimeId` is deliberately **not** accepted here. Creating an attempt and starting a process are two
+acts that fail differently, and a single transaction across both would hold a write lock for the
+length of a process launch and let a tmux that refused to start undo the record that somebody wanted
+this work done at all. A caller that wants both makes two requests, and the first one is true on its
+own.
+
+A second attempt is a second session. Neither replaces the other — that is what this level is for.
+
+#### `GET /api/tasks/{id}/sessions`
+
+Takes `limit` (default 100, maximum 500), returns `{ "sessions": [ … ], "count": 1 }`, newest first
+with the same `(createdAt, id)` ordering. The task is resolved first, so an unknown id is a 404 about
+the task.
+
+#### `GET /api/sessions/{id}`
+
+`200` with `{ "session": { … } }`, or `404 session_not_found`.
+
+#### `PATCH /api/sessions/{id}`
+
+```json
+{ "status": "RUNNING", "runtimeId": "amx-p_9a3b1c2d3e4f5061728394a5" }
+```
+
+**The status is applied first**, and the order is a decision rather than an accident. The status write
+is the one that can lose a race; applying it first means a caller told it lost is told so *before* a
+runtime has been attached on its behalf, so nothing about a refused request is left behind.
+
+`runtimeId` binds the attempt to the runtime it ran in. It may be set **once**: a session that already
+has one is refused with `409 status_conflict` rather than rebound, because the field answers "which
+runtime did this attempt run in" and a field that can be rewritten stops answering it. It is not
+checked for existence — a runtime can be destroyed while the attempt that used it remains, which is
+the whole reason it is not a foreign key. Its shape is checked, and an id outside the `amx-` namespace
+is a `400 invalid_request`.
+
+### Failures
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| A title that is empty, too long, not UTF-8, or carries control characters | 400 | `invalid_task_title` |
+| An unknown status value, an unknown query parameter value, or a malformed runtime id | 400 | `invalid_input` |
+| A body with no `title` and no `status`, or a blank body | 400 | `invalid_request` |
+| The project does not exist | 404 | `project_not_found` |
+| The task does not exist | 404 | `task_not_found` |
+| The session does not exist | 404 | `session_not_found` |
+| A status change the lifecycle does not allow | 409 | `invalid_status_transition` |
+| Somebody else changed the same row first, or a runtime is already bound | 409 | `status_conflict` |
+| The server was built without the task model | 503 | `internal_error` |
+
+An unknown status and an unavailable transition are **different answers** on purpose. The first is
+`invalid_input` with the field named and the vocabulary in the message, because the caller can fix it.
+The second is `invalid_status_transition` with `details.from`, `details.to` and `details.allowed`,
+because the request was well-formed and the task exists — the two are simply incompatible right now,
+and `400` would misreport a perfectly valid request against a task that is still running.
+
+`runtimeId` sent as an empty string is refused rather than treated as a no-op, which is worth stating
+because the mistake is an easy one to make and the failure would otherwise be silent: a session that
+has no runtime would be told it now has the one it asked for, and nothing would have been recorded.
+
+`docs/TASK_MODEL.md` is the long form of this layer: what a task is, why it is not a runtime, what the
+lifecycle refuses and why, and what this phase deliberately does not do.
+
 ## GET /api/ws
 
 **The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per
@@ -904,20 +1125,25 @@ client that saw `500` there would report a bug where the honest answer is "not o
 
 ## Not implemented
 
-There is no provider switching, no controller or viewer role, no Claude Hooks and no Waiting/Completed
-state detection. `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for them, and none of
-them answers today. **In particular there is no lease on typing**: every client that can reach this
-server can send input to every terminal it is subscribed to, and two of them typing at once interleave
-their keystrokes. That is Phase 6.
+There is no provider switching, no Claude Hooks and no Waiting/Completed state detection. There is no
+Task UI: the task and session endpoints above exist and the frontend has types and functions for them,
+and no screen shows either. `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for the
+rest, and none of them answers today.
 
-The event timelines record what happened and nothing reads them to decide anything. There is no
-endpoint that turns an event into a task, a notification, or a state, and no event type in this build
-that no code emits.
+The event timelines record what happened and nothing reads them to decide anything — in particular the
+task service does not, and a task's status is never derived from its events. There is no endpoint that
+turns an event into a task, a notification, or a state.
 
-What this build serves, beyond the project model, is the runtime endpoints, the agent inside one, the
-terminal, and the event timelines: a project's runtime can host the real Claude Code CLI, started by
-the server, the server reports honestly whether it is running, `GET /api/ws` shows it to you as the
-terminal it is, and `GET /api/projects/{id}/events` says what has happened to it over time.
+Nothing joins a task to a running Claude. A task can be created, moved through its lifecycle and
+attempted; the runtime can be started, typed at and watched; and no request in this build connects the
+two acts. That connection is the next phase, and `docs/ROADMAP.md` is where it is defined.
+
+What this build serves is the project model, the runtime endpoints, the agent inside one, the terminal,
+the event timelines, and — since Phase 7.2 — the tasks and agent sessions those will eventually be
+about. A project's runtime can host the real Claude Code CLI, started by the server, the server reports
+honestly whether it is running, `GET /api/ws` shows it to you as the terminal it is,
+`GET /api/projects/{id}/events` says what has happened to it over time, and `POST
+/api/projects/{id}/tasks` records that somebody wants something done and starts nothing at all.
 `docs/ROADMAP.md` is where the next phase is defined, `docs/CLAUDE_RUNTIME.md` describes how the agent
-is resolved, launched, and observed, `docs/TERMINAL.md` is the terminal protocol, and
-`docs/AGENT_EVENTS.md` is the event layer.
+is resolved, launched, and observed, `docs/TERMINAL.md` is the terminal protocol,
+`docs/AGENT_EVENTS.md` is the event layer, and `docs/TASK_MODEL.md` is the task layer.

@@ -15,6 +15,7 @@ package project
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -107,6 +108,24 @@ func SessionNameFor(projectID string) string {
 // that renaming a project cannot orphan a running session.
 func (p *Project) SessionName() string {
 	return SessionNameFor(p.ID)
+}
+
+// ValidRuntimeID reports whether id is a runtime identifier this server could
+// have produced.
+//
+// A runtime id is a session name, and a session name is the prefix followed by
+// a project id - so the body is checked against ValidID rather than the whole
+// string being checked for the prefix. The difference matters to a caller
+// storing the value: "amx-" is not a runtime, and neither is "amx-1", and a
+// check that only asked about the prefix would accept both.
+//
+// It answers a question about the name and not about the world. Nothing here
+// says a runtime with this id is running, or ever ran: a runtime is destroyed
+// and forgotten while the record of what used it remains, and this is the
+// shape that record has to have.
+func ValidRuntimeID(id string) bool {
+	body, ok := strings.CutPrefix(id, SessionPrefix)
+	return ok && ValidID(body)
 }
 
 // String renders a project for logs without exposing anything sensitive.

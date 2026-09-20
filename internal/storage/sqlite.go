@@ -130,6 +130,9 @@ func (s *Store) Runtimes() *RuntimeStore { return &RuntimeStore{db: s.db} }
 // Events returns the event repository.
 func (s *Store) Events() *EventStore { return &EventStore{db: s.db} }
 
+// Tasks returns the task and agent session repository.
+func (s *Store) Tasks() *TaskStore { return &TaskStore{db: s.db} }
+
 // dataSourceName builds the driver connection string.
 //
 // Pragmas are passed as DSN parameters rather than executed after opening, so

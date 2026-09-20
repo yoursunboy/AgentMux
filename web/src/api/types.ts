@@ -206,3 +206,108 @@ export interface RegisterProjectInput {
   /** Overrides the display name. Empty means the directory's own name. */
   name?: string
 }
+
+/**
+ * What somebody wants an agent to do, from POST /api/projects/{id}/tasks.
+ *
+ * A task is not a terminal, not a runtime and not a process. It is the thing
+ * those exist to serve, and it outlives every one of them: "is the terminal up"
+ * stops meaning anything when the process exits, while "was this finished" stays
+ * true afterwards. See docs/TASK_MODEL.md.
+ *
+ * There is no `description`, `priority` or `tags`. A field belongs here when
+ * something reads it, and nothing does.
+ */
+export interface Task {
+  /** "task_" followed by 96 random bits in hex. */
+  id: string
+  projectId: string
+  /** What the person wrote. Free text, never markup, never a command. */
+  title: string
+  status: TaskStatus
+  /** Server-produced, UTC. */
+  createdAt: string
+  updatedAt: string
+  /**
+   * When the task entered `COMPLETED`, or null.
+   *
+   * It is present and null rather than omitted, so a client rendering
+   * "completed at" can tell "not completed" from "this server does not say".
+   */
+  completedAt: string | null
+}
+
+/**
+ * A task's lifecycle.
+ *
+ * `WAITING` is the state a task has and a session deliberately does not: being
+ * blocked on something outside the work is a real condition for a piece of
+ * work, and it is not clear what an attempt would be waiting for.
+ *
+ * The three terminal statuses are final. `COMPLETED` cannot return to
+ * `RUNNING` - a fact that was reported as finished and then reported as running
+ * again would make the first report false.
+ */
+export type TaskStatus = 'CREATED' | 'RUNNING' | 'WAITING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+
+/**
+ * One attempt at a task, from POST /api/tasks/{id}/sessions.
+ *
+ * A task and a process have different lifetimes, and this is the level where
+ * that difference is recorded: restarting the terminal is a second session
+ * rather than an overwrite of the first, and the task is what says both were
+ * attempts at the same goal.
+ */
+export interface AgentSession {
+  /** "sess_" followed by 96 random bits in hex. */
+  id: string
+  taskId: string
+  /**
+   * The runtime this attempt ran in, or absent.
+   *
+   * It is omitted rather than null when there is none, because the window
+   * between creating an attempt and attaching a runtime is a real state: a
+   * client that sees no `runtimeId` knows the attempt has not been given one
+   * yet. It is set once and never rewritten.
+   */
+  runtimeId?: string
+  status: AgentSessionStatus
+  /** Set when the attempt entered `RUNNING`, null before that. */
+  startedAt: string | null
+  /** Set when the attempt stopped running, null while it runs. */
+  endedAt: string | null
+  createdAt: string
+}
+
+/** An attempt's lifecycle. There is no `WAITING`; see TaskStatus. */
+export type AgentSessionStatus = 'CREATED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED'
+
+/** The body of POST /api/projects/{id}/tasks. The project is in the path. */
+export interface CreateTaskInput {
+  title: string
+}
+
+/**
+ * The body of PATCH /api/tasks/{id}.
+ *
+ * Both fields are optional and at least one is required. A field that is absent
+ * is left alone; sending a field as null is refused, because there is no such
+ * thing as a task with no title or an attempt with no status, and accepting the
+ * request would silently mean something other than what it says.
+ */
+export interface UpdateTaskInput {
+  title?: string
+  status?: TaskStatus
+}
+
+/** The body of PATCH /api/sessions/{id}. */
+export interface UpdateSessionInput {
+  status?: AgentSessionStatus
+  /**
+   * The runtime to bind this attempt to. It is set at most once - a session
+   * that already has one is refused rather than rebound - and the runtime need
+   * not exist: a runtime can be destroyed while the attempt that used it
+   * remains.
+   */
+  runtimeId?: string
+}

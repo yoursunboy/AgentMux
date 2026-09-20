@@ -13,8 +13,8 @@ func TestNewIDShape(t *testing.T) {
 	if !strings.HasPrefix(id, IDPrefix) {
 		t.Errorf("NewID() = %q, want the %q prefix", id, IDPrefix)
 	}
-	if len(id) != len(IDPrefix)+idBodyLen {
-		t.Errorf("NewID() = %q, want %d characters", id, len(IDPrefix)+idBodyLen)
+	if len(id) != len(IDPrefix)+projectID.BodyLen() {
+		t.Errorf("NewID() = %q, want %d characters", id, len(IDPrefix)+projectID.BodyLen())
 	}
 	if !ValidID(id) {
 		t.Errorf("ValidID(%q) = false for an identifier NewID produced", id)
@@ -63,7 +63,7 @@ func TestValidID(t *testing.T) {
 		{"too short", IDPrefix + "abc", false},
 		{"too long", valid + "a", false},
 		{"upper-case hex", IDPrefix + strings.ToUpper(strings.TrimPrefix(valid, IDPrefix)), false},
-		{"a non-hex character", IDPrefix + strings.Repeat("z", idBodyLen), false},
+		{"a non-hex character", IDPrefix + strings.Repeat("z", projectID.BodyLen()), false},
 		{"a path traversal attempt", "../../etc/passwd", false},
 		{"a name rather than an identifier", "AgentMux", false},
 	}

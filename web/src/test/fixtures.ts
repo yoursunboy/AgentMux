@@ -1,4 +1,4 @@
-import type { Candidate, DiscoveryResult, Project, ServerInfo } from '../api/types'
+import type { AgentSession, Candidate, DiscoveryResult, Project, ServerInfo, Task } from '../api/types'
 
 /**
  * Builders for the API shapes, so a test states only what it is about.
@@ -20,6 +20,42 @@ export function makeProject(overrides: Partial<Project> = {}): Project {
     createdAt: '2026-09-17T12:00:00Z',
     updatedAt: '2026-09-17T12:00:00Z',
     lastOpenedAt: null,
+    ...overrides,
+  }
+}
+
+/**
+ * A task nobody has started. The default is the state POST returns, so a test
+ * that cares about one field does not have to spell out the rest.
+ */
+export function makeTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'task_0123456789abcdef01234567',
+    projectId: 'p_0123456789abcdef0123',
+    title: 'Implement Controller Viewer',
+    status: 'CREATED',
+    createdAt: '2026-09-20T09:00:00Z',
+    updatedAt: '2026-09-20T09:00:00Z',
+    completedAt: null,
+    ...overrides,
+  }
+}
+
+/**
+ * An attempt that has not been given a runtime, which is what POST returns.
+ *
+ * `runtimeId` is omitted rather than null because the server omits it, and the
+ * difference is the point: a client can tell "no runtime yet" from "this server
+ * does not report one".
+ */
+export function makeSession(overrides: Partial<AgentSession> = {}): AgentSession {
+  return {
+    id: 'sess_0123456789abcdef01234567',
+    taskId: 'task_0123456789abcdef01234567',
+    status: 'CREATED',
+    startedAt: null,
+    endedAt: null,
+    createdAt: '2026-09-20T09:05:00Z',
     ...overrides,
   }
 }

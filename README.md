@@ -6,11 +6,13 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.6.5, end of Phase 6.5**. The project model, the server foundation,
+This repository is at **version 0.6.5, end of Phase 7.2**. The project model, the server foundation,
 the persistent session runtime, the real Claude Code runtime, the web terminal, and the multi-project
 workspace all exist and work — and Phase 6.5 added what a deployment needs: a systemd unit, an
 installer, a configuration file, a health endpoint, and a documented answer to what happens when the
-server restarts.
+server restarts. Phase 7 added the records the product will eventually be about: an append-only event
+log (7.1), and the tasks somebody wants done together with the attempts made at them (7.2). Neither
+is visible in the interface, and that is what a foundation is for.
 
 | Works today | Does not exist yet |
 | --- | --- |
@@ -36,14 +38,17 @@ server restarts.
 | **`GET /health` for a supervisor, and `GET /api/server` with version, backend and uptime** | |
 | **An installer, a configuration file, and YAML as well as JSON — with one decoder, so they cannot drift** | |
 | **Logs with a component on every record, and nothing a terminal printed ever written to one** | |
+| **A task model and an agent session model: what somebody wants done, and each attempt at it — API only, no screen** | |
+| **An append-only event log, written by one path, with two read-only timeline endpoints — API only, no screen** | |
 
 The product is not described here as if it were finished. A project's runtime hosts the real Claude
 Code CLI, and its terminal is in the browser: the bytes are the terminal's own, the keystrokes are the
 keyboard's own, and closing the tab leaves Claude running. Phase 6.5 did not add product capability —
 it made what exists deployable, upgradeable, recoverable, monitorable and able to run for a long time.
 What is still missing is around that edge: **no authentication**, so every browser that can reach the
-port can type, and no hooks or task state, so the workspace cannot yet tell you that an agent is
-waiting for you.
+port can type, and no hooks, so nothing reports that an agent is waiting for you. A task and an attempt
+at it can be recorded, and nothing yet joins them to a running Claude — creating a task starts no
+process, and no request in this build connects the two acts.
 
 Phase 6.5 was validated on a real Linux server — systemd 255, tmux 3.4, Ubuntu 24.04 under WSL2 —
 where the installer, the service, all three recovery cases, the upgrade path and the health endpoint
@@ -436,7 +441,9 @@ cd web && npm run test:e2e
 
 It needs a WSL distribution with tmux and the Claude Code CLI, Go on the machine running it, Node 22+,
 and Chrome (which Playwright drives as a channel rather than downloading). `docs/ROADMAP.md` Phase 5
-lists what the five suites cover and `docs/WORKSPACE.md` §6 is where the measured geometry is.
+lists what the original five suites cover, Phase 6 what the controller suite adds, and Phase 7.2 what
+`suites/tasks.mjs` checks — the task and session API driven from a real page, which is the one suite
+here that never touches a terminal. `docs/WORKSPACE.md` §6 is where the measured geometry is.
 
 **An interrupted run cleans up after itself.** Ctrl-C, a `SIGTERM`, or a suite killed by hand arrives
 while seven tmux servers and a server process exist, and stopping where it stands is what leaves them
@@ -475,9 +482,10 @@ python3 deploy/linux/loadtest.py       # the performance baseline
 14. `docs/BACKUP.md` — what to back up, what not to, and how to restore
 15. `docs/SECURITY.md` — start here before the port is reachable from anywhere but this machine
 16. `docs/AGENT_EVENTS.md` — what happened, as opposed to what is true now
-17. `deploy/linux/README.md` — the operator's guide to the two above
-18. `CLAUDE.md`
-19. `.claude/rules/`
+17. `docs/TASK_MODEL.md` — what is wanted, why a task is not a runtime, and what this layer does not do
+18. `deploy/linux/README.md` — the operator's guide to the two above
+19. `CLAUDE.md`
+20. `.claude/rules/`
 
 ## Development principle
 
@@ -527,3 +535,16 @@ distribution, which has no Go or Node toolchain, and the final `claude` link in 
 was not exercised end to end on that host because the CLI belongs to a human's account and the service
 account cannot reach it. Claude Hooks, state detection, notifications, provider switching, additional
 AI tools, accounts and billing are later milestones.
+
+Phase 7 is the phase that is about the agent rather than about its terminal, and its first two
+sub-phases deliberately add nothing a person can see. Phase 7.1 built the record of **what happened**:
+one append-only table, one write path, and a runtime bridge that reports state changes after the fact
+and is never involved in them. Phase 7.2 built the record of **what is wanted**: a task, and each
+attempt made at it, with a lifecycle the service owns and a conditional update instead of a lock.
+
+The distinction both sub-phases exist to keep is worth stating plainly, because it is the mistake a
+task model is most likely to make: **a task is not a runtime.** "Is the terminal up?" has a
+present-tense answer that changes while you look at it. "Was this work finished?" stays true after
+every process involved has exited. Phase 7.2 therefore adds no endpoint that starts anything —
+creating a task records that somebody wants something done, and starts no runtime, launches no agent
+and writes no prompt. `docs/TASK_MODEL.md` is the whole of it.

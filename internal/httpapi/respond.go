@@ -9,6 +9,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/task"
 )
 
 // Error codes produced by the HTTP layer itself. Codes produced by the project
@@ -103,10 +104,10 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Three packages define codes - the project model, the runtime, and the event
-// log - and all are passed through to the client unchanged, so a client
-// switches on one vocabulary across the whole API. The HTTP layer adds only the
-// codes for failures it produces itself.
+// Four packages define codes - the project model, the runtime, the event log and
+// the task model - and all are passed through to the client unchanged, so a
+// client switches on one vocabulary across the whole API. The HTTP layer adds
+// only the codes for failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
@@ -114,7 +115,10 @@ func codeOf(err error) string {
 	if code := session.CodeOf(err); code != "" {
 		return code
 	}
-	return event.CodeOf(err)
+	if code := event.CodeOf(err); code != "" {
+		return code
+	}
+	return task.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -130,6 +134,10 @@ func detailsOf(err error) map[string]any {
 	var eventErr *event.Error
 	if errors.As(err, &eventErr) {
 		return eventErr.Details
+	}
+	var taskErr *task.Error
+	if errors.As(err, &taskErr) {
+		return taskErr.Details
 	}
 	return nil
 }
@@ -148,10 +156,15 @@ func messageFor(err error, code string) string {
 	if errors.As(err, &eventErr) && eventErr.Message != "" {
 		return eventErr.Message
 	}
+	var taskErr *task.Error
+	if errors.As(err, &taskErr) && taskErr.Message != "" {
+		return taskErr.Message
+	}
 	switch code {
-	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure
-	// and event.CodeStorageFailure are the same string: the shared vocabulary
-	// means a caller cannot tell which store failed, and does not need to.
+	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure,
+	// event.CodeStorageFailure and task.CodeStorageFailure are the same string:
+	// the shared vocabulary means a caller cannot tell which store failed, and
+	// does not need to.
 	case project.CodeStorageFailure:
 		return "the metadata store could not complete the request"
 	default:
@@ -164,12 +177,22 @@ func messageFor(err error, code string) string {
 // The mapping is explicit rather than derived from a prefix, so that adding a
 // code forces a decision about what it means to a client.
 //
-// Some codes are deliberately shared between the layers and appear here
-// once: project.CodeStorageFailure, session.CodeStorageFailure and
-// event.CodeStorageFailure are all "storage_failure", and project.CodeNotFound
-// and session.CodeProjectNotFound are both "project_not_found". That is the
-// point of the shared vocabulary - a client that switches on "storage_failure"
-// does not need to know which layer produced it.
+// Several codes are shared between the layers and appear here once, and the
+// omissions are as deliberate as the entries:
+//
+//   - project.CodeStorageFailure, session.CodeStorageFailure,
+//     event.CodeStorageFailure and task.CodeStorageFailure are all
+//     "storage_failure".
+//   - project.CodeNotFound, session.CodeProjectNotFound and
+//     task.CodeProjectNotFound are all "project_not_found".
+//   - project.CodeInvalidInput, session.CodeInvalidInput and
+//     task.CodeInvalidInput are all "invalid_input".
+//
+// That is the point of the shared vocabulary - a client that switches on
+// "storage_failure" does not need to know which layer produced it - and it is
+// also why each of them is listed once. A second case with the same value is
+// not a compile error when the two are in one clause list, and it is when they
+// are two clauses, which is Go's way of saying the duplication means nothing.
 func statusForCode(code string) int {
 	switch code {
 	case project.CodeInvalidInput,
@@ -182,6 +205,10 @@ func statusForCode(code string) int {
 		// this is reachable only through a cursor or a query parameter - but the
 		// mapping belongs here rather than being implied by a 500.
 		event.CodeInvalidEvent,
+		// A task title that cannot be stored. It is the caller's input and the
+		// caller can fix it, which is what separates it from a transition the
+		// lifecycle refuses.
+		task.CodeInvalidTitle,
 		session.CodeInvalidSize:
 		return http.StatusBadRequest
 
@@ -191,6 +218,11 @@ func statusForCode(code string) int {
 		// cursor is: asking to page from a row that does not exist is a request
 		// about a resource that is not there.
 		event.CodeNotFound,
+		// A task or a session that is not here. They are separate codes
+		// because they are separate resources, and a caller that confused the
+		// two should be told which one was missing.
+		task.CodeTaskNotFound,
+		task.CodeSessionNotFound,
 		session.CodeNotFound:
 		return http.StatusNotFound
 
@@ -209,7 +241,18 @@ func statusForCode(code string) int {
 		// An agent cannot be typed into a terminal whose foreground process is
 		// another program. The runtime is fine and the request is fine; the
 		// session is busy, which is a state, and states change.
-		session.CodeAgentTerminalBusy:
+		session.CodeAgentTerminalBusy,
+		// A status change the lifecycle does not allow. The request is
+		// well-formed and the task exists; the two are simply incompatible
+		// right now, which is what 409 means and what 400 would misreport -
+		// COMPLETED to RUNNING is a perfectly valid request against a task that
+		// is still running.
+		task.CodeInvalidTransition,
+		// Somebody else changed the same row first. The caller's transition was
+		// validated against a status the row no longer holds, so it was never
+		// applied. Nothing the caller could send differently would have helped,
+		// and the fix is to read the task again.
+		task.CodeConflict:
 		return http.StatusConflict
 
 	case project.CodeRuntimePathMappingFailed,

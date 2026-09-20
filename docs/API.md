@@ -585,6 +585,12 @@ The session is really gone, and the endpoint is idempotent: destroying a runtime
 succeeds. The response is the runtime as it now is, so a client has one shape to render after every
 one of the four calls rather than four.
 
+Since Phase 7.3B-2 it also ends observation of the agent that was in it: the hook receiver is detached
+and the settings document it generated is removed. An attempt that was running is closed as `FAILED` —
+the environment it ran in was removed, which is not the same as somebody stopping it. `POST
+…/runtime/stop` closes it as `CANCELLED` instead, because that one is a person asking.
+`docs/AGENT_RUNTIME_BINDING.md` §3 is the table.
+
 ## The agent inside a runtime
 
 A runtime can host one coding agent — today, the Claude Code CLI. It lives at
@@ -670,16 +676,67 @@ honestly.
 }
 ```
 
-Idempotent: if an agent is already in the pane it is adopted and returned, not started twice. That is
-also how a runtime inherited from a previous server process is picked up — the agent was never this
-process's child, so nothing has to be restored, only recognised.
+The request body is optional and has one field:
 
-The command line is the resolved Claude Code path and nothing else. AgentMux does not add
-`--dangerously-skip-permissions`, `--permission-mode`, `--allowedTools`, `--model`, or `-p`. Claude's
-interactive permission model is preserved exactly as it is, and answering Claude's prompts is the
-user's job on a terminal the user owns.
+```json
+{"taskId": "task_44e0c1b2…"}
+```
+
+Naming a task asks for the attempt to be recorded as well as the agent to be started, and the two are
+genuinely different requests — one is "run Claude here", the other is "and this is the work it is
+doing". Naming none is a complete request, and is what the workspace's Start button has always sent.
+
+Naming one also does more than record it. AgentMux chooses a session id, passes it to Claude Code as
+`--session-id`, writes a settings document naming an adapter this server is running, passes that as
+`--settings`, and binds the attempt to the session. Those are what make the agent *observed* rather
+than merely started:
+
+```json
+{
+  "agent": { "type": "claude", "state": "RUNNING", "running": true, "pid": 843814, "…": "…" },
+  "session": {
+    "id": "sess_9a27…",
+    "taskId": "task_44e0c1b2…",
+    "runtimeId": "amx-p_6f1a…",
+    "status": "RUNNING",
+    "startedAt": "2026-09-20T09:00:00Z",
+    "createdAt": "2026-09-20T09:00:00Z"
+  }
+}
+```
+
+`session` is present only when a task was named; the field is omitted otherwise.
+
+Idempotent, with one asymmetry. If an agent is already in the pane it is adopted and returned, not
+started twice — and **adopting with a `taskId` is refused** (409, `agent_already_running`). A Claude
+process AgentMux did not start has a session id AgentMux never chose and no hook configuration
+pointing at a receiver, so there is nothing to observe and an attempt recorded against it would be a
+row with no evidence behind it. Stop the agent and start it again to have the attempt recorded.
+
+The runtime is started if it is not already running, which is what makes one call enough to go from a
+stopped project to a running agent. The budget is wider than a runtime start's because it covers one
+too.
+
+The command line is the resolved Claude Code path, plus `--session-id` and `--settings` and nothing
+else. AgentMux still does not add `--dangerously-skip-permissions`, `--permission-mode`,
+`--allowedTools`, `--model`, or `-p`. Claude's interactive permission model is preserved exactly as it
+is, and answering Claude's prompts is the user's job on a terminal the user owns.
+
+A `taskId` belonging to another project is refused (400, `agent_task_mismatch`). The project path and
+the task's own project have to agree; a runtime id from one project under another project's history
+would be a row nobody could ever interpret, in a log that cannot be corrected.
 
 ### POST /api/projects/{id}/runtime/agent/stop
+
+Stopping an agent that AgentMux started also closes the attempt as `CANCELLED`, and the response
+carries it beside the agent:
+
+```json
+{
+  "agent": { "state": "STOPPED", "running": false, "…": "…" },
+  "session": { "id": "sess_9a27…", "status": "CANCELLED", "endedAt": "2026-09-20T09:14:02Z", "…": "…" }
+}
+```
 
 The agent declined the interrupt — a real, observed response, verbatim:
 
@@ -1131,31 +1188,44 @@ and functions for them, and no screen shows either. `docs/PROTOCOL.md` sections 
 to 13 describe the agreed design for the rest, and none of them answers today.
 
 Claude Hooks are read — Phase 7.3B-1 built an adapter that receives them and
-records `agent.*` events — and **no endpoint exposes that adapter.** Nothing in
-this build constructs one, nothing starts it, and no request can ask what a
-Claude session has done. The events it writes land in the same `agent_events`
-table as `runtime.*` and are returned by the two timeline endpoints below, which
-is the whole of how they are reachable: a client reading
-`GET /api/projects/{id}/events` will see `agent.started`, `agent.prompt_submitted`,
-`agent.completed_candidate`, `agent.completed`, `agent.failed` and
-`agent.session_ended` rows without any request having asked for them.
-`docs/CLAUDE_ADAPTER.md` describes the adapter and §10 of it says which component
-would own one.
+records `agent.*` events — and **since Phase 7.3B-2 the server runs one.**
+`POST /api/projects/{id}/runtime/agent/start` starts a runtime if it needs one,
+launches Claude under a session id AgentMux chose, attaches a receiver and binds
+the attempt. The adapter is no longer something a client has to imagine: starting
+an agent is what constructs one, and `docs/AGENT_RUNTIME_BINDING.md` is the whole
+of that chain.
+
+What is still not implemented, and is not stubbed:
+
+- **No permission control.** `agent.permission_requested` is recorded and read by
+  nobody. Every response the hook receiver sends has an empty body, so AgentMux
+  cannot influence a decision Claude makes.
+- **No task status change.** A task's status is only ever moved by `PATCH
+  /api/tasks/{id}`, by a person. An attempt ending is not the work ending, and
+  nothing derives either from an event.
+- **No `agent.completed` or `agent.failed` on the path a session actually runs
+  on.** They come from the CLI's `result` envelope, which the stream-json half of
+  the adapter reads — and the runtime hosts Claude as a TUI in a tmux pane, so
+  nothing feeds it. The five hook events are what a real session produces.
+  `docs/AGENT_RUNTIME_BINDING.md` §5.
+- **No binding that survives a server restart**, and no reconciliation of an
+  attempt a restart left `RUNNING`. §6 of the same document.
+- **No notification, no dashboard, no Task UI.** The task and session endpoints
+  exist and the frontend has types and functions for them; no screen shows either,
+  and nothing pushes anything anywhere.
 
 The event timelines record what happened and nothing reads them to decide anything — in particular the
 task service does not, and a task's status is never derived from its events. There is no endpoint that
 turns an event into a task, a notification, or a state.
 
-Nothing joins a task to a running Claude. A task can be created, moved through its lifecycle and
-attempted; the runtime can be started, typed at and watched; and no request in this build connects the
-two acts. That connection is the next phase, and `docs/ROADMAP.md` is where it is defined.
-
 What this build serves is the project model, the runtime endpoints, the agent inside one, the terminal,
-the event timelines, and — since Phase 7.2 — the tasks and agent sessions those will eventually be
-about. A project's runtime can host the real Claude Code CLI, started by the server, the server reports
-honestly whether it is running, `GET /api/ws` shows it to you as the terminal it is,
-`GET /api/projects/{id}/events` says what has happened to it over time, and `POST
-/api/projects/{id}/tasks` records that somebody wants something done and starts nothing at all.
-`docs/ROADMAP.md` is where the next phase is defined, `docs/CLAUDE_RUNTIME.md` describes how the agent
-is resolved, launched, and observed, `docs/TERMINAL.md` is the terminal protocol,
-`docs/AGENT_EVENTS.md` is the event layer, and `docs/TASK_MODEL.md` is the task layer.
+the event timelines, and — since Phase 7.2 — the tasks and agent sessions those are about. Since Phase
+7.3B-2 those two halves are joined: `POST /api/projects/{id}/runtime/agent/start` with a `taskId`
+records an attempt, and its events are in the timeline beside it. A project's runtime can host the real
+Claude Code CLI, started by the server, the server reports honestly whether it is running,
+`GET /api/ws` shows it to you as the terminal it is, `GET /api/projects/{id}/events` says what has
+happened to it over time, and `POST /api/projects/{id}/tasks` records that somebody wants something
+done. `docs/ROADMAP.md` is where the next phase is defined, `docs/CLAUDE_RUNTIME.md` describes how the
+agent is resolved, launched, and observed, `docs/TERMINAL.md` is the terminal protocol,
+`docs/AGENT_EVENTS.md` is the event layer, `docs/AGENT_RUNTIME_BINDING.md` is the join between the
+agent and the task, and `docs/TASK_MODEL.md` is the task layer.

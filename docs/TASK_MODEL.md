@@ -416,14 +416,23 @@ to reconcile. Until then the rule is: events record, the service decides.
 Every item here is deferred deliberately. None is stubbed, and none is
 half-present.
 
-- **No Claude Hooks, no Claude Agent SDK, no agent intelligence.** Nothing in
-  this layer knows what an agent is doing. A session has a status because
-  somebody set it, and for no other reason.
+- **No Claude Hooks inside this layer, no Claude Agent SDK, no agent
+  intelligence.** Nothing here knows what an agent is doing. A session's status
+  is set by a request, and this package never reads an event to decide one.
+  Since Phase 7.3B-2 something else does read Claude and does set the status —
+  `internal/agent`, which creates an attempt, binds it to a session and closes it
+  — and it is a separate package precisely so that this one stays passive.
+  `docs/AGENT_RUNTIME_BINDING.md` §3 is the mapping it applies.
 - **No terminal output parsing, prompt parsing, or AI state inference.** The
   runtime bridge from Phase 7.1 is untouched by this phase.
 - **No automatic anything.** Creating a task does not start a runtime. Starting
   a runtime does not attach it to a session. Completing a session does not
-  complete its task. Every one of those links is a request a caller makes.
+  complete its task. Every one of those links is a request a caller makes — and
+  since Phase 7.3B-2 one request can make three of them at once: `POST
+  /api/projects/{id}/runtime/agent/start` with a `taskId` ensures the runtime,
+  creates the attempt and runs the agent. What it still does not do is move the
+  **task**: an attempt that ends is not the work ending, and nothing in the build
+  is in a position to say the work succeeded.
 - **No retry.** `FAILED` is terminal on both aggregates. Retrying is a new
   session against the same task, which a caller can do by hand today.
 - **No notifications, no token or model statistics, no summarization, no

@@ -76,9 +76,9 @@ func TestTheResultEnvelopeDecidesTheOutcome(t *testing.T) {
 			want: TypeAgentCompleted,
 		},
 		{
-			name: "a turn that failed",
-			line: `{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"api_error"}`,
-			want: TypeAgentFailed,
+			name:    "a turn that failed",
+			line:    `{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"api_error"}`,
+			want:    TypeAgentFailed,
 			isError: true,
 		},
 		{

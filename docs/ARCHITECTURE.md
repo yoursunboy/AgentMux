@@ -19,6 +19,7 @@ iPad / Phone / PC
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1
+│ Agent Coordinator           │   internal/agent          — built in Phase 7.3B-2
 │ Event Log                   │   internal/event          — built in Phase 7.1
 │ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
@@ -53,12 +54,19 @@ process table and never by parsing the terminal. That is what lets it outlive a 
 why the arrow above runs `shell → claude` rather than `server → claude`. See
 `docs/CLAUDE_RUNTIME.md` §1 and §6.
 
-The Claude Adapter is the second half of `internal/claude`, added in Phase 7.3B-1, and it is the one
-component above that **nothing constructs yet**. It receives what Claude reports — a hook delivery or
-a line of stream-json — translates it into the AgentMux event vocabulary, and writes it through the
-Event Log. It sits above nothing: it does not own the Claude process, does not read the terminal, and
-does not answer the agent. Wiring it into a lifetime is a later phase, and `docs/CLAUDE_ADAPTER.md`
-§10 says which component that is and why.
+The Claude Adapter is the second half of `internal/claude`, added in Phase 7.3B-1. It receives what
+Claude reports — a hook delivery or a line of stream-json — translates it into the AgentMux event
+vocabulary, and writes it through the Event Log. It sits above nothing: it does not own the Claude
+process, does not read the terminal, and does not answer the agent.
+
+The Agent Coordinator, added in Phase 7.3B-2 as `internal/agent`, is what constructs one. It is the
+only component that knows the three vocabularies at once — a runtime, an adapter and an attempt — and
+it is the only place in the build that decides which Claude session is which attempt. One call starts
+the terminal if there is not one, launches Claude under a session id AgentMux chose, attaches a
+receiver to the hooks it will fire, and binds the attempt. It starts nothing itself: every process
+operation below it belongs to the runtime manager, which this phase did not change. It is also the
+only component that knows the three, which is a cost as well as a licence — `docs/AGENT_RUNTIME_BINDING.md`
+§11 is the boundary as drawn and §6 is what the binding's lifetime costs.
 
 ## 2. Project vs Collection
 

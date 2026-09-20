@@ -31,6 +31,16 @@
 // The terminal package's client identifiers are deliberately not built here.
 // They are not resource names: a client id is machine-local, never stored, and
 // bounded by a protocol constant rather than by a fixed length.
+//
+// # The one identifier that is not AgentMux's to shape
+//
+// UUIDv4 exists beside Spec rather than as a Spec because its format is not
+// this package's decision. Every other identifier here is AgentMux naming its
+// own resource, so AgentMux chooses the shape. A session id handed to an
+// external tool is the opposite: the tool states the format, and a value that
+// does not match is rejected by something outside this codebase. It is here
+// rather than at the call site so that the version and variant bits are written
+// once.
 package idgen
 
 import (
@@ -39,6 +49,39 @@ import (
 	"fmt"
 	"strings"
 )
+
+// uuidLen is the length of the canonical 8-4-4-4-12 form.
+const uuidLen = 36
+
+// UUIDv4 returns a random version-4 UUID in the canonical hyphenated form.
+//
+// The version and variant bits are set rather than left random: a value that
+// merely looks like a UUID is not one, and a consumer that validates the format
+// is entitled to reject it. Bytes 6 and 8 carry them, per RFC 4122 §4.4.
+//
+// It fails only if the platform's random source does, for the same reason Spec
+// .New does: a server that cannot name the thing it is about to start has a
+// broken host, and saying so is more useful than a stack trace.
+func UUIDv4() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("idgen: generate a uuid: %w", err)
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40 // version 4
+	buf[8] = (buf[8] & 0x3f) | 0x80 // variant 10
+
+	var b strings.Builder
+	b.Grow(uuidLen)
+	body := hex.EncodeToString(buf)
+	for i := 0; i < len(body); i++ {
+		switch i {
+		case 8, 12, 16, 20:
+			b.WriteByte('-')
+		}
+		b.WriteByte(body[i])
+	}
+	return b.String(), nil
+}
 
 // Spec describes one kind of identifier.
 //

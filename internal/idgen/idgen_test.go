@@ -131,3 +131,80 @@ func TestBodyLenAndString(t *testing.T) {
 		t.Errorf("String() = %q, want %q", got, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// UUIDv4
+// ---------------------------------------------------------------------------
+
+func TestUUIDv4HasTheCanonicalForm(t *testing.T) {
+	id, err := UUIDv4()
+	if err != nil {
+		t.Fatalf("UUIDv4 returned an error: %v", err)
+	}
+	if len(id) != uuidLen {
+		t.Fatalf("UUIDv4() = %q, which is %d characters, want %d", id, len(id), uuidLen)
+	}
+	for _, i := range []int{8, 13, 18, 23} {
+		if id[i] != '-' {
+			t.Errorf("UUIDv4() = %q, want a hyphen at index %d", id, i)
+		}
+	}
+	for i, c := range id {
+		switch {
+		case i == 8 || i == 13 || i == 18 || i == 23:
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			t.Fatalf("UUIDv4() = %q, want only lowercase hex outside the hyphens; %q is at index %d", id, c, i)
+		}
+	}
+}
+
+// TestUUIDv4CarriesItsVersionAndVariant is the property that separates a UUID
+// from a string that merely looks like one. A consumer is entitled to check it.
+func TestUUIDv4CarriesItsVersionAndVariant(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		id, err := UUIDv4()
+		if err != nil {
+			t.Fatalf("UUIDv4 returned an error: %v", err)
+		}
+		if id[14] != '4' {
+			t.Fatalf("UUIDv4() = %q, want version 4 at index 14", id)
+		}
+		switch id[19] {
+		case '8', '9', 'a', 'b':
+		default:
+			t.Fatalf("UUIDv4() = %q, want an RFC 4122 variant at index 19", id)
+		}
+	}
+}
+
+func TestUUIDv4IsUnique(t *testing.T) {
+	const n = 5000
+	seen := make(map[string]bool, n)
+	for i := 0; i < n; i++ {
+		id, err := UUIDv4()
+		if err != nil {
+			t.Fatalf("UUIDv4 returned an error: %v", err)
+		}
+		if seen[id] {
+			t.Fatalf("UUIDv4 returned %q twice in %d identifiers", id, n)
+		}
+		seen[id] = true
+	}
+}
+
+// TestUUIDv4DoesNotMatchAnySpec pins that the two generators are separate. A
+// prefixed identifier is not a UUID, and a UUID must not be accepted where this
+// package's own shape is required.
+func TestUUIDv4DoesNotMatchAnySpec(t *testing.T) {
+	id, err := UUIDv4()
+	if err != nil {
+		t.Fatalf("UUIDv4 returned an error: %v", err)
+	}
+	if testSpec.Valid(id) {
+		t.Errorf("Valid(%q) = true for a UUID, want false", id)
+	}
+	if strings.HasPrefix(id, "_") || strings.Contains(id, "_") {
+		t.Errorf("UUIDv4() = %q, want the hyphenated form", id)
+	}
+}

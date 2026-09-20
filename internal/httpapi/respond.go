@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -104,10 +105,10 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Four packages define codes - the project model, the runtime, the event log and
-// the task model - and all are passed through to the client unchanged, so a
-// client switches on one vocabulary across the whole API. The HTTP layer adds
-// only the codes for failures it produces itself.
+// Five packages define codes - the project model, the runtime, the event log,
+// the task model and the agent coordinator - and all are passed through to the
+// client unchanged, so a client switches on one vocabulary across the whole
+// API. The HTTP layer adds only the codes for failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
@@ -118,7 +119,10 @@ func codeOf(err error) string {
 	if code := event.CodeOf(err); code != "" {
 		return code
 	}
-	return task.CodeOf(err)
+	if code := task.CodeOf(err); code != "" {
+		return code
+	}
+	return agent.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -138,6 +142,10 @@ func detailsOf(err error) map[string]any {
 	var taskErr *task.Error
 	if errors.As(err, &taskErr) {
 		return taskErr.Details
+	}
+	var agentErr *agent.Error
+	if errors.As(err, &agentErr) {
+		return agentErr.Details
 	}
 	return nil
 }
@@ -159,6 +167,10 @@ func messageFor(err error, code string) string {
 	var taskErr *task.Error
 	if errors.As(err, &taskErr) && taskErr.Message != "" {
 		return taskErr.Message
+	}
+	var agentErr *agent.Error
+	if errors.As(err, &agentErr) && agentErr.Message != "" {
+		return agentErr.Message
 	}
 	switch code {
 	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure,
@@ -209,7 +221,13 @@ func statusForCode(code string) int {
 		// caller can fix it, which is what separates it from a transition the
 		// lifecycle refuses.
 		task.CodeInvalidTitle,
-		session.CodeInvalidSize:
+		session.CodeInvalidSize,
+		// A request to start an agent that cannot say where, and one that names
+		// two projects that do not agree - the project in the path and the one
+		// its task belongs to. Both are the caller's input and both are things
+		// the caller can send differently.
+		agent.CodeInvalidInput,
+		agent.CodeTaskMismatch:
 		return http.StatusBadRequest
 
 	case project.CodePathNotFound,
@@ -223,7 +241,11 @@ func statusForCode(code string) int {
 		// two should be told which one was missing.
 		task.CodeTaskNotFound,
 		task.CodeSessionNotFound,
-		session.CodeNotFound:
+		session.CodeNotFound,
+		// A task that does not exist. A task belonging to another project is
+		// deliberately *not* here - it exists, and telling the caller it does
+		// not would send them looking for something they already have.
+		agent.CodeTaskNotFound:
 		return http.StatusNotFound
 
 	case project.CodePathNotAccessible,
@@ -252,7 +274,15 @@ func statusForCode(code string) int {
 		// validated against a status the row no longer holds, so it was never
 		// applied. Nothing the caller could send differently would have helped,
 		// and the fix is to read the task again.
-		task.CodeConflict:
+		task.CodeConflict,
+		// No agent is being observed for this project, or one is already
+		// running that AgentMux did not start. Both are conflicts with a state
+		// rather than bad requests: the request is well formed and the project
+		// exists, and what makes it impossible is what is (or is not) running
+		// right now. A stopped agent and an adopted one are both states that
+		// change.
+		agent.CodeAgentRunning,
+		agent.CodeAgentNotFound:
 		return http.StatusConflict
 
 	case project.CodeRuntimePathMappingFailed,
@@ -298,7 +328,13 @@ func statusForCode(code string) int {
 		// something it said it would do, which is a 500 and not the caller's
 		// problem to solve.
 		session.CodeAgentLaunchFailed,
-		session.CodeAgentStopFailed:
+		session.CodeAgentStopFailed,
+		// The hook configuration could not be written, so the agent was not
+		// launched at all. It is the server failing to prepare something it
+		// said it would prepare, and there is nothing the caller could send
+		// differently - the alternative would be to launch a session that can
+		// never report anything, which is worse than saying so.
+		agent.CodeSettingsFailure:
 		return http.StatusInternalServerError
 
 	default:

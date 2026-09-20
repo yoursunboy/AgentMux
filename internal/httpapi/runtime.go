@@ -1,11 +1,15 @@
 package httpapi
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/task"
 )
 
 // This file is the runtime half of the API: the endpoints that start, stop and
@@ -37,10 +41,14 @@ const (
 	runtimeDestroyTimeout = 20 * time.Second
 	runtimeReadTimeout    = 10 * time.Second
 
-	// Starting an agent waits for its process to appear, and stopping one waits
-	// for it to go. Both waits are the runtime's, and both are bounded there;
-	// these only have to be wider than the bounds they wrap.
-	agentStartTimeout = 40 * time.Second
+	// Starting an agent covers starting a runtime as well, so this budget has to
+	// be wider than the two it wraps rather than wider than one: the runtime
+	// manager's own bound on bringing a terminal up is runtimeStartTimeout
+	// above, and its default bound on waiting for the agent process to appear is
+	// fifteen seconds. Both are spent inside this one request, so a budget the
+	// sum did not fit in would abandon a launch that was proceeding normally and
+	// report it as an agent that never appeared - the opposite of what happened.
+	agentStartTimeout = 60 * time.Second
 	agentStopTimeout  = 30 * time.Second
 )
 
@@ -110,6 +118,11 @@ func (s *Server) handleStopRuntime(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, s.log, err)
 		return
 	}
+	// Stopping the terminal stops whatever was running in it, the agent
+	// included. Observation of it ends here, and the attempt is closed as
+	// cancelled because a stop is something a person asked for - which is the
+	// same answer `agent/stop` gives.
+	s.releaseAgent(ctx, r.PathValue("id"), agent.OutcomeCancelled)
 	writeJSON(w, s.log, http.StatusOK, runtimeResponse{Runtime: rt})
 }
 
@@ -129,6 +142,14 @@ func (s *Server) handleDestroyRuntime(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, s.log, err)
 		return
 	}
+	// The terminal the agent was running in no longer exists. An adapter left
+	// listening for a runtime that is gone is a port held for the life of the
+	// process and a goroutine that will never see anything again, so it is
+	// detached rather than left for the next start to replace. The attempt is
+	// failed rather than cancelled: the environment it was running in was
+	// removed, which is not the same as somebody stopping it.
+	s.releaseAgent(ctx, r.PathValue("id"), agent.OutcomeFailed)
+
 	// The response describes what is left, which is a stopped runtime, so a
 	// client does not have to guess what to render next.
 	rt, err := s.runtime.Runtime(ctx, r.PathValue("id"))
@@ -139,11 +160,35 @@ func (s *Server) handleDestroyRuntime(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.log, http.StatusOK, runtimeResponse{Runtime: rt})
 }
 
+// releaseAgent ends observation of a project's agent after the runtime it was
+// in has been stopped or destroyed.
+//
+// It is a no-op on a server without a coordinator, and on a project whose agent
+// was never observed - which is most of them. Nothing here is allowed to fail
+// the request: the runtime operation the caller asked for has already
+// succeeded, and reporting a failure now would describe a request that did what
+// it was told as one that did not.
+func (s *Server) releaseAgent(ctx context.Context, projectID string, outcome agent.Outcome) {
+	if s.agents == nil {
+		return
+	}
+	if err := s.agents.Release(ctx, projectID, outcome); err != nil {
+		s.log.Warn("could not release the agent observing a runtime",
+			"projectId", projectID, "outcome", outcome, "error", err)
+	}
+}
+
 // agentResponse is the body of the endpoints that return an agent's state.
 //
-// It is wrapped like the runtime is, and for the same reason.
+// It is wrapped like the runtime is, and for the same reason: this phase added
+// the attempt beside the agent without changing the shape of what was already
+// here, which is what the wrapper was for.
 type agentResponse struct {
 	Agent session.AgentStatus `json:"agent"`
+
+	// Session is the attempt this start created, when the caller named a task.
+	// It is absent otherwise, and absent after a stop that closed nothing.
+	Session *task.AgentSession `json:"session,omitempty"`
 }
 
 // handleGetAgent implements GET /api/projects/{id}/runtime/agent.
@@ -167,26 +212,65 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
 }
 
+// startAgentRequest is the body of POST /api/projects/{id}/runtime/agent/start.
+//
+// It has one field and it is optional, so the body itself is optional: the call
+// that says "make sure Claude is running here" is complete with nothing in it,
+// which is what the workspace's Start button sends and has always sent.
+type startAgentRequest struct {
+	// TaskID is the task this is an attempt at.
+	//
+	// Naming one asks for the attempt to be recorded as well as the agent to be
+	// started, and the two are genuinely different requests - one is "run
+	// Claude here" and the other is "and this is the work it is doing". The
+	// field is optional because a caller may want either, and a requirement
+	// would make the second impossible to decline.
+	TaskID string `json:"taskId"`
+}
+
 // handleStartAgent implements POST /api/projects/{id}/runtime/agent/start.
 //
-// A project's runtime has to be running first. An agent with no terminal is a
-// process nobody can see, interrupt, or read, and this product's whole premise
-// is that a coding agent runs where its work can be watched.
+// # What it does now
+//
+// It starts a runtime when there is not one, launches Claude in it under a
+// session id AgentMux chooses and a hook configuration pointing at an adapter
+// this server is running, and - when a task is named - records the attempt and
+// binds it. The observer is what makes any of it visible: an agent started
+// without one runs exactly as it did before this phase and tells AgentMux
+// nothing.
+//
+// The budget is wider than a runtime start's because it covers one too. A
+// stopped project is a project whose runtime has never been up, and one call
+// goes from that to a running agent, so the two bounds have to fit inside this
+// one rather than each getting a request of its own.
 func (s *Server) handleStartAgent(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRuntime(w, r) {
+	if !s.requireAgentCoordinator(w, r) {
 		return
 	}
-	// The budget is wider than a runtime start's because it covers one too: an
-	// agent can be asked for on a project whose runtime has never been up.
 	ctx, cancel := s.contextWithTimeout(r, agentStartTimeout)
 	defer cancel()
 
-	agent, err := s.runtime.StartAgent(ctx, r.PathValue("id"))
+	// An empty body is the ordinary case, not a malformed one. decodeJSON
+	// reports it separately from a body that is not JSON so that a client which
+	// posts nothing is not told it posted something wrong.
+	var req startAgentRequest
+	if err := decodeJSON(w, r, &req); err != nil && !errors.Is(err, errEmptyBody) {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, err.Error(), nil)
+		return
+	}
+
+	result, err := s.agents.Start(ctx, agent.StartInput{
+		ProjectID: r.PathValue("id"),
+		TaskID:    req.TaskID,
+	})
 	if err != nil {
 		writeServiceError(w, s.log, err)
 		return
 	}
-	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
+	writeJSON(w, s.log, http.StatusOK, agentResponse{
+		Agent:   result.Agent,
+		Session: result.Session,
+	})
 }
 
 // handleStopAgent implements POST /api/projects/{id}/runtime/agent/stop.
@@ -195,18 +279,39 @@ func (s *Server) handleStartAgent(w http.ResponseWriter, r *http.Request) {
 // does at the terminal. Ending the runtime as well is the runtime's own stop,
 // and destroying the terminal is DELETE on the runtime.
 func (s *Server) handleStopAgent(w http.ResponseWriter, r *http.Request) {
-	if !s.requireRuntime(w, r) {
+	if !s.requireAgentCoordinator(w, r) {
 		return
 	}
 	ctx, cancel := s.contextWithTimeout(r, agentStopTimeout)
 	defer cancel()
 
-	agent, err := s.runtime.StopAgent(ctx, r.PathValue("id"))
+	result, err := s.agents.Stop(ctx, agent.StopInput{ProjectID: r.PathValue("id")})
 	if err != nil {
 		writeServiceError(w, s.log, err)
 		return
 	}
-	writeJSON(w, s.log, http.StatusOK, agentResponse{Agent: agent})
+	writeJSON(w, s.log, http.StatusOK, agentResponse{
+		Agent:   result.Agent,
+		Session: result.Session,
+	})
+}
+
+// requireAgentCoordinator checks the runtime environment and the coordinator.
+//
+// The order matters: a server on a host that cannot run a terminal is told so
+// first, because that is the answer the user can act on. "This server was
+// started without an agent coordinator" is a wiring fact about one process, and
+// it is only worth saying once the environment is not the problem.
+func (s *Server) requireAgentCoordinator(w http.ResponseWriter, r *http.Request) bool {
+	if !s.requireRuntime(w, r) {
+		return false
+	}
+	if s.agents == nil {
+		writeError(w, http.StatusServiceUnavailable, CodeInternal,
+			"this server was started without an agent coordinator", nil)
+		return false
+	}
+	return true
 }
 
 // requireRuntime refuses a runtime request on a host that cannot execute one.//

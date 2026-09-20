@@ -19,8 +19,9 @@ As of version 0.6.5:
 | Phase 7.2 — Task and agent session model | **Done** | Not a capability phase either, and the last piece of Phase 7 that is not about Claude. `tasks` and `agent_sessions`, their lifecycles, the service that owns both, the eight endpoints that read and move them, and no UI. Nothing here starts a process. See below. |
 | Phase 7.3A — Claude integration discovery | **Done** | Not an implementation phase. What the installed Claude Code can actually report, measured rather than assumed, and the design that follows from it. No production code, database, API, or frontend was changed. See `docs/CLAUDE_INTEGRATION.md`. |
 | Phase 7.3B-0 — Runtime environment validation | **Done** | Also not an implementation phase. Whether the mechanism 7.3A found works on Windows, on WSL, and on pure Linux, measured rather than assumed. Windows verified end to end; WSL for everything but the model turn; pure Linux not at all, for want of interactive authentication. See `docs/CLAUDE_RUNTIME_VALIDATION.md`. |
-| Phase 7.3B-1 — ClaudeAdapter foundation | **Done** | The adapter itself: Claude's hooks and its stream-json translated into `agent.*` events and written through the existing event service. Seven event types, one write path, no database, no API, no UI, and nothing that constructs an adapter yet. Validated end to end against Windows Claude Code 2.1.278. See `docs/CLAUDE_ADAPTER.md`. |
-| Phase 7.3B — Claude event adapter | **Partial** | The foundation is built as 7.3B-1. What remains is wiring: an adapter's lifetime owned by a component, the session mapping persisted, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
+| Phase 7.3B-1 — ClaudeAdapter foundation | **Done** | The adapter itself: Claude's hooks and its stream-json translated into `agent.*` events and written through the existing event service. Seven event types, one write path, no database, no API, no UI. Validated end to end against Windows Claude Code 2.1.278. See `docs/CLAUDE_ADAPTER.md`. |
+| Phase 7.3B-2 — Runtime binding | **Done** | `internal/agent` connects the adapter to the product: one call starts the runtime if needed, dictates Claude's session id, attaches a hook receiver, writes the settings document, launches, and binds the attempt. Fixed the silently-refused `session.created` / `session.status_changed` payloads on the way. No schema change, no UI. See `docs/AGENT_RUNTIME_BINDING.md`. |
+| Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
 `features.terminal` is true only when the server is running where tmux is (`runtimeAvailable`) and tmux
@@ -640,15 +641,30 @@ validated end to end against Windows Claude Code 2.1.278 with a real database,
 and `docs/CLAUDE_ADAPTER.md` is the long form, including §8's account of what the
 validation did not cover.
 
-**What remains in 7.3B is wiring, and one decision.** Nothing in the build
-constructs an adapter, so no Claude session is being observed in production yet.
-The component that owns a runtime's identity is the one that would own an
-adapter's lifetime. Before a task's status can be derived from Claude's events,
-two things have to be settled: the session mapping has to be persisted, which
-means a migration; and the permission question has to be answered, because
-`PermissionRequest` is currently record-only and making it actionable turns
-AgentMux from an observer of a Claude session into a participant in one.
-`docs/CLAUDE_ADAPTER.md` §9 and §10 are the list.
+Sub-phase **7.3B-2, the runtime binding, is done**. `internal/agent` is the
+coordinator that connects the adapter to the product, and it is the only place in
+the build that decides which Claude session is which attempt. One call —
+`POST /api/projects/{id}/runtime/agent/start`, optionally naming a task — starts
+the runtime if it is not running, mints the session id AgentMux dictates on the
+command line, attaches a hook receiver, writes the settings document naming it,
+launches Claude, and binds the attempt. On the way it fixed a defect it was
+looking straight at: `session.created` and `session.status_changed` had been
+silently refused by the event service since Phase 7.2, because their payloads
+named a field `sessionId` and any field ending in `sessionid` is refused as a
+session credential. **Those two events had never been written.** The field is now
+`agentSession` and a test runs the real checker over the real builders.
+`docs/AGENT_RUNTIME_BINDING.md` is the long form.
+
+**What remains in 7.3B is one decision and one gap.** The gap: the binding is in
+memory, so a server restart loses it — Claude outlives the server, so the attempt
+it was running is not finished, and nothing reconciles it. Closing that means a
+migration for a `claude_session_id` column and a reconciliation step at boot.
+The decision: whether a task's status can be derived from Claude's events at all,
+which is now closer than it was — the attempt is bound and the events are routed
+— but still blocked on `PermissionRequest` being record-only, since making it
+actionable turns AgentMux from an observer of a Claude session into a
+participant in one. `docs/AGENT_RUNTIME_BINDING.md` §6 and
+`docs/CLAUDE_ADAPTER.md` §10 are the lists.
 
 ## Phase 8 — CC Switch integration
 

@@ -589,10 +589,7 @@ func (s *Service) UpdateSessionStatus(ctx context.Context, id, to string) (*Agen
 		"sessionId", current.ID, "taskId", current.TaskID, "from", current.Status, "to", to)
 	if projectID := s.projectIDOf(ctx, current.TaskID); projectID != "" {
 		s.noteEvent(ctx, projectID, current.RuntimeID, TypeSessionStatusChanged,
-			map[string]any{
-				"taskId": current.TaskID, "sessionId": current.ID,
-				"from": current.Status, "to": to,
-			})
+			sessionStatusPayload(current.TaskID, current.ID, current.Status, to))
 	}
 
 	return s.GetSession(ctx, id)

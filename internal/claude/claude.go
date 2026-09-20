@@ -346,3 +346,60 @@ func Quote(path string) string {
 	}
 	return "'" + strings.ReplaceAll(path, "'", `'\''`) + "'"
 }
+
+// LaunchOptions are the arguments AgentMux adds to the command line.
+//
+// They are the whole of what this build passes, and the emptiness of the rest
+// is deliberate. Nothing here selects a model, sets a permission mode, or
+// resumes anything: the first two are product decisions no phase has made, and
+// the third belongs with a session that is being continued rather than started.
+type LaunchOptions struct {
+	// SessionID is the id the session will use, which AgentMux chooses.
+	//
+	// Claude Code accepts `--session-id` and then reports that exact value back
+	// in every hook payload, in the stream's init message, and in the final
+	// result. It is what makes an observation self-identifying rather than
+	// something matched on a directory or a clock, and it is why the value is
+	// generated before the process starts rather than read from it afterwards.
+	//
+	// Claude refuses an id already in use, so this must be fresh per launch. The
+	// collision is a launch failure and never a retry with the same value.
+	SessionID string
+
+	// SettingsPath is the hook configuration Claude should read, and the whole
+	// of how it comes to deliver anything to AgentMux.
+	//
+	// It is passed as a file rather than merged into a user's own settings so
+	// that nothing AgentMux does is visible outside the runtime it belongs to,
+	// and so that removing the file removes the configuration.
+	SettingsPath string
+}
+
+// LaunchCommand renders the line typed into a runtime's shell to start the
+// agent with the given options.
+//
+// Every argument is shell-quoted, because the line is parsed by a shell before
+// anything else sees it. The session id is the one argument that could not be:
+// it is generated here and is hex and hyphens, but it is quoted anyway rather
+// than trusted, since the rule that every argument is quoted has no exceptions
+// to remember.
+//
+// Empty options render the installation's own command and nothing more, so a
+// launch with nothing configured produces exactly the line it produced before
+// there was anything to configure.
+func LaunchCommand(installation Installation, o LaunchOptions) string {
+	if installation.Command == "" {
+		return ""
+	}
+	args := make([]string, 0, 4)
+	if o.SessionID != "" {
+		args = append(args, "--session-id", Quote(o.SessionID))
+	}
+	if o.SettingsPath != "" {
+		args = append(args, "--settings", Quote(o.SettingsPath))
+	}
+	if len(args) == 0 {
+		return installation.Command
+	}
+	return installation.Command + " " + strings.Join(args, " ")
+}

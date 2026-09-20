@@ -466,7 +466,7 @@ func (h *claudeHarness) paneProcess(t *testing.T, p *project.Project) session.Pa
 // spec resolves the agent the way the server resolves it.
 func (h *claudeHarness) spec(t *testing.T) session.AgentSpec {
 	t.Helper()
-	spec, err := agentSpecs{h.launcher}.Spec(context.Background())
+	spec, err := agentSpecs{h.launcher}.Spec(context.Background(), session.AgentLaunch{})
 	if err != nil {
 		t.Skipf("no Claude Code can be started on this machine: %v", err)
 	}
@@ -489,7 +489,7 @@ func (h *claudeHarness) startRealClaude(t *testing.T, p *project.Project) (sessi
 	var lastStatus session.AgentStatus
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		status, err := h.manager.StartAgent(context.Background(), p.ID)
+		status, err := h.manager.StartAgent(context.Background(), p.ID, session.AgentLaunch{})
 		switch {
 		case err != nil:
 			lastErr = err
@@ -714,7 +714,7 @@ func TestRealClaudeIsResolvedByTheProductionAdapter(t *testing.T) {
 	if !installation.Available {
 		t.Skipf("no Claude Code on this machine: %s", installation.Message)
 	}
-	spec, err := agentSpecs{launcher}.Spec(context.Background())
+	spec, err := agentSpecs{launcher}.Spec(context.Background(), session.AgentLaunch{})
 	if err != nil {
 		t.Fatalf("the production adapter could not produce an agent spec: %v", err)
 	}

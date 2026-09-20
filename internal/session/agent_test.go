@@ -44,12 +44,30 @@ const testAgentStartTimeout = 20 * time.Second
 const testAgentStopGrace = 15 * time.Second
 
 // fakeAgent is an AgentProvider over a fixed spec.
+//
+// It records the launch it was last asked for, so that a test can assert the
+// caller's arguments reached the provider rather than being dropped somewhere
+// between the runtime and the command line.
 type fakeAgent struct {
 	spec AgentSpec
 	err  error
+
+	launches []AgentLaunch
 }
 
-func (f fakeAgent) Spec(context.Context) (AgentSpec, error) { return f.spec, f.err }
+func (f *fakeAgent) Spec(_ context.Context, launch AgentLaunch) (AgentSpec, error) {
+	f.launches = append(f.launches, launch)
+	return f.spec, f.err
+}
+
+// lastLaunch is the most recent launch the provider was asked for, and whether
+// it was asked at all.
+func (f *fakeAgent) lastLaunch() (AgentLaunch, bool) {
+	if len(f.launches) == 0 {
+		return AgentLaunch{}, false
+	}
+	return f.launches[len(f.launches)-1], true
+}
 
 // agentProgram is a real executable the tests start as the agent.
 type agentProgram struct {
@@ -262,13 +280,13 @@ func TestAgentStartRunsInTheProjectDirectory(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_start")
 	spec := sleep.spec(300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
 
-	status, err := m.StartAgent(ctx, p.ID)
+	status, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -322,17 +340,17 @@ func TestAgentStartIsIdempotent(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_twice")
 	spec := sleep.spec(300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	first, err := m.StartAgent(ctx, p.ID)
+	first, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("the first StartAgent returned an error: %v", err)
 	}
 
-	second, err := m.StartAgent(ctx, p.ID)
+	second, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("the second StartAgent returned an error: %v", err)
 	}
@@ -342,7 +360,7 @@ func TestAgentStartIsIdempotent(t *testing.T) {
 
 	// A third call, because a second could have been answered from a record that
 	// was written before anything was typed.
-	if _, err := m.StartAgent(ctx, p.ID); err != nil {
+	if _, err := m.StartAgent(ctx, p.ID, AgentLaunch{}); err != nil {
 		t.Fatalf("the third StartAgent returned an error: %v", err)
 	}
 	if found := paneProcesses(t, runtimes, p, spec.Executable); len(found) != 1 {
@@ -364,13 +382,13 @@ func TestAgentStartRefusesAnAgentThatLeavesTheProject(t *testing.T) {
 	elsewhere := t.TempDir()
 	p := agentTestProject(t, "p_agent_elsewhere")
 	spec := sleep.specRunning(elsewhere, 300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
 
-	_, err := m.StartAgent(ctx, p.ID)
+	_, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err == nil {
 		t.Fatal("an agent that started outside the project's directory was accepted")
 	}
@@ -421,7 +439,7 @@ func TestAgentStartRefusesABusyTerminal(t *testing.T) {
 	idle := agentTestProject(t, "p_agent_idle")
 	busy := agentTestProject(t, "p_agent_busy")
 	spec := sleep.spec(300)
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, idle, busy)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, idle, busy)
 
 	for _, p := range []*project.Project{idle, busy} {
 		if _, err := m.Start(ctx, p.ID); err != nil {
@@ -445,7 +463,7 @@ func TestAgentStartRefusesABusyTerminal(t *testing.T) {
 
 	// An idle terminal is accepted, which is what makes the refusal below a
 	// statement about a busy one.
-	if _, err := m.StartAgent(ctx, idle.ID); err != nil {
+	if _, err := m.StartAgent(ctx, idle.ID, AgentLaunch{}); err != nil {
 		t.Fatalf("StartAgent refused an idle terminal: %v", err)
 	}
 
@@ -457,7 +475,7 @@ func TestAgentStartRefusesABusyTerminal(t *testing.T) {
 	}
 	waitForPaneCommand(t, paneBackend(t, m, busy), busy.SessionName(), blocker.Name)
 
-	_, err = m.StartAgent(ctx, busy.ID)
+	_, err = m.StartAgent(ctx, busy.ID, AgentLaunch{})
 	if err == nil {
 		t.Fatal("an agent was started into a terminal running another program")
 	}
@@ -491,9 +509,9 @@ func TestAgentCannotStartWithoutATerminal(t *testing.T) {
 	sleep := requireSleep(t)
 
 	p := agentTestProject(t, "p_agent_no_runtime")
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: sleep.spec(300)}, p)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: sleep.spec(300)}, p)
 
-	_, err := m.StartAgent(ctx, p.ID)
+	_, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err == nil {
 		t.Fatal("an agent was started in a project whose runtime was never started")
 	}
@@ -527,7 +545,7 @@ func TestAgentWithoutAProviderIsUnavailable(t *testing.T) {
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	if _, err := m.StartAgent(ctx, p.ID); !IsCode(err, CodeAgentUnavailable) {
+	if _, err := m.StartAgent(ctx, p.ID, AgentLaunch{}); !IsCode(err, CodeAgentUnavailable) {
 		t.Errorf("StartAgent returned %v, want code %q", err, CodeAgentUnavailable)
 	}
 	if _, err := m.StopAgent(ctx, p.ID); !IsCode(err, CodeAgentUnavailable) {
@@ -553,13 +571,13 @@ func TestAgentProviderFailureIsReportedNotSwallowed(t *testing.T) {
 	ctx := context.Background()
 
 	p := agentTestProject(t, "p_agent_broken")
-	broken := fakeAgent{err: errors.New("claude was not found on PATH")}
+	broken := &fakeAgent{err: errors.New("claude was not found on PATH")}
 	m, _ := agentTestManager(t, newFakeStore(), broken, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	_, err := m.StartAgent(ctx, p.ID)
+	_, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if !IsCode(err, CodeAgentUnavailable) {
 		t.Fatalf("StartAgent returned %v, want code %q", err, CodeAgentUnavailable)
 	}
@@ -589,12 +607,12 @@ func TestAgentStopInterruptsTheAgentAndKeepsTheTerminal(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_stop")
 	spec := sleep.spec(300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	started, err := m.StartAgent(ctx, p.ID)
+	started, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -637,7 +655,7 @@ func TestAgentStopInterruptsTheAgentAndKeepsTheTerminal(t *testing.T) {
 
 	// The agent can be started again in the same terminal, which is what makes
 	// this a lifecycle rather than a one-shot.
-	restarted, err := m.StartAgent(ctx, p.ID)
+	restarted, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("the agent could not be started again after a stop: %v", err)
 	}
@@ -695,12 +713,12 @@ func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 	// The grace is shortened because this stop is going to be declined, and the
 	// runtime waits the whole of it before it concludes that.
 	m, runtimes := agentTestManagerOn(t, uniqueSocketDir(t), newFakeStore(),
-		fakeAgent{spec: spec}, 2*time.Second, p)
+		&fakeAgent{spec: spec}, 2*time.Second, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	started, err := m.StartAgent(ctx, p.ID)
+	started, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -767,7 +785,7 @@ func TestAgentStopWithNothingRunningIsNotAnError(t *testing.T) {
 	sleep := requireSleep(t)
 
 	p := agentTestProject(t, "p_agent_stop_idle")
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: sleep.spec(300)}, p)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: sleep.spec(300)}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
@@ -797,12 +815,12 @@ func TestAgentThatEndsOnItsOwnIsReportedAsExited(t *testing.T) {
 	// Long enough that the start observes it and short enough that the test does
 	// not wait for it.
 	spec := sleep.spec(1)
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	started, err := m.StartAgent(ctx, p.ID)
+	started, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -859,11 +877,11 @@ func TestAgentSurvivesAServerRestart(t *testing.T) {
 	store := newFakeStore()
 	socketDir := uniqueSocketDir(t)
 
-	first, runtimes := agentTestManagerOn(t, socketDir, store, fakeAgent{spec: spec}, testAgentStopGrace, p)
+	first, runtimes := agentTestManagerOn(t, socketDir, store, &fakeAgent{spec: spec}, testAgentStopGrace, p)
 	if _, err := first.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	before, err := first.StartAgent(ctx, p.ID)
+	before, err := first.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -877,7 +895,7 @@ func TestAgentSurvivesAServerRestart(t *testing.T) {
 		t.Fatalf("the agent did not survive the server stopping: %d processes found", len(found))
 	}
 
-	second, _ := agentTestManagerOn(t, socketDir, store, fakeAgent{spec: spec}, testAgentStopGrace, p)
+	second, _ := agentTestManagerOn(t, socketDir, store, &fakeAgent{spec: spec}, testAgentStopGrace, p)
 	if _, err := second.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile returned an error: %v", err)
 	}
@@ -936,7 +954,7 @@ func TestAgentsAreIsolatedBetweenProjects(t *testing.T) {
 	a := agentTestProject(t, "p_agent_iso_a")
 	b := agentTestProject(t, "p_agent_iso_b")
 	spec := sleep.spec(300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, a, b)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, a, b)
 
 	for _, p := range []*project.Project{a, b} {
 		if _, err := m.Start(ctx, p.ID); err != nil {
@@ -944,7 +962,7 @@ func TestAgentsAreIsolatedBetweenProjects(t *testing.T) {
 		}
 	}
 
-	startedA, err := m.StartAgent(ctx, a.ID)
+	startedA, err := m.StartAgent(ctx, a.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error for the first project: %v", err)
 	}
@@ -976,7 +994,7 @@ func TestAgentsAreIsolatedBetweenProjects(t *testing.T) {
 		t.Errorf("the second project's terminal holds %d agents, want none", len(found))
 	}
 
-	startedB, err := m.StartAgent(ctx, b.ID)
+	startedB, err := m.StartAgent(ctx, b.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error for the second project: %v", err)
 	}
@@ -1008,7 +1026,7 @@ func TestAgentIsReportedInsideTheRuntime(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_nested")
 	spec := sleep.spec(300)
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
@@ -1037,7 +1055,7 @@ func TestAgentIsReportedInsideTheRuntime(t *testing.T) {
 		t.Errorf("the runtime reports its agent as %q, want %q", rt.Agent.State, AgentStopped)
 	}
 
-	if _, err := m.StartAgent(ctx, p.ID); err != nil {
+	if _, err := m.StartAgent(ctx, p.ID, AgentLaunch{}); err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
 	rt, err = m.Runtime(ctx, p.ID)
@@ -1061,12 +1079,12 @@ func TestAgentIsGoneAfterItsRuntimeIsDestroyed(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_destroy")
 	spec := sleep.spec(300)
-	m, _ := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	started, err := m.StartAgent(ctx, p.ID)
+	started, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
 	if err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
@@ -1115,13 +1133,13 @@ func TestFindProcessRunningMatchesOnlyTheRealExecutable(t *testing.T) {
 
 	p := agentTestProject(t, "p_agent_identity")
 	spec := sleep.spec(300)
-	m, runtimes := agentTestManager(t, newFakeStore(), fakeAgent{spec: spec}, p)
+	m, runtimes := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
 
 	ctx := context.Background()
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
 	}
-	if _, err := m.StartAgent(ctx, p.ID); err != nil {
+	if _, err := m.StartAgent(ctx, p.ID, AgentLaunch{}); err != nil {
 		t.Fatalf("StartAgent returned an error: %v", err)
 	}
 

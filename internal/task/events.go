@@ -116,6 +116,40 @@ func taskEventPayload(taskID string) map[string]any {
 // sessionEventPayload is the payload of a session event. It names both the
 // session and the task it is an attempt at, because a reader of the project
 // timeline has no other way to place it.
+//
+// # Why the field is called `agentSession` and not `sessionId`
+//
+// This payload was written as `{"taskId":…, "sessionId":…}` until Phase 7.3B-2,
+// and **the event service refused every one of them**. `event.CheckPayload`
+// rejects any field whose normalised name ends in `sessionid` - the entry is
+// there to catch a session *token*, the thing that is a credential - and
+// `normalizeKey("sessionId")` is exactly that. The refusal was swallowed by
+// noteEvent, so `session.created` and `session.status_changed` were never
+// written and nothing said so.
+//
+// The obvious repair does not work. `agentSessionId` and `agent_session_id`
+// both normalise to `agentsessionid`, which the same suffix rule refuses for the
+// same reason. The name has to stop ending in the forbidden word, and
+// `agentSession` is the concept's own name with the redundant `Id` dropped: the
+// field already holds an identifier, and so does every other field in every
+// payload this package writes.
+//
+// The security rule is not weakened to accommodate this. An event payload is
+// the wrong place for a session token, and it stays the wrong place.
 func sessionEventPayload(taskID, sessionID string) map[string]any {
-	return map[string]any{"taskId": taskID, "sessionId": sessionID}
+	return map[string]any{"taskId": taskID, "agentSession": sessionID}
+}
+
+// sessionStatusPayload is the payload of a session status change.
+//
+// It is a function for the reason taskEventPayload is one, and here that reason
+// has already paid for itself: the shape used to be a map literal written out
+// at its call site, it spelled the session field `sessionId`, and the event
+// service refused it in silence. One place to state the shape is one place for
+// the field names to be checked against the rules that govern payloads.
+func sessionStatusPayload(taskID, sessionID, from, to string) map[string]any {
+	return map[string]any{
+		"taskId": taskID, "agentSession": sessionID,
+		"from": from, "to": to,
+	}
 }

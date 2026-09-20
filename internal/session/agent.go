@@ -96,6 +96,34 @@ type AgentSpec struct {
 	Executable string
 }
 
+// AgentLaunch is how a caller configures one launch.
+//
+// It is what AgentMux wants the agent to be told, and it is the whole of what
+// the runtime passes through: the runtime does not read these values, does not
+// store them, and does not decide them. It hands them to the provider, which
+// turns them into arguments, and types the result into the pane.
+//
+// The zero value means "launch it the way it would launch with nothing
+// configured", which is what a caller that has nothing to say should pass.
+type AgentLaunch struct {
+	// SessionID is the session id the caller has chosen for this launch.
+	//
+	// Empty means the agent picks its own, which is the behaviour this build had
+	// before anything chose one. It matters that the choice is the caller's: a
+	// session id AgentMux chose is what lets an observation be attributed
+	// without guesswork, and a session id the agent chose can only be discovered
+	// by watching it work.
+	SessionID string
+
+	// SettingsPath is a file the agent should read its configuration from.
+	//
+	// Empty means it reads whatever it would otherwise read. The runtime treats
+	// it as an opaque path: what belongs in the file is the agent's business,
+	// and a runtime that knew would be a second place the agent's configuration
+	// format is written down.
+	SettingsPath string
+}
+
 // AgentProvider resolves the agent a runtime may host.
 //
 // It is an interface so that the runtime does not depend on any particular
@@ -104,7 +132,14 @@ type AgentSpec struct {
 type AgentProvider interface {
 	// Spec returns what is needed to start the agent. It returns an error when
 	// no agent can be started here, and the error explains why.
-	Spec(ctx context.Context) (AgentSpec, error)
+	//
+	// The launch is a parameter rather than provider state because the command
+	// line depends on it and a provider holding "what to do next" would be
+	// shared, unordered, and wrong the moment two projects started at once. A
+	// provider that cannot honour a launch must refuse it rather than ignore
+	// it: an agent started without the arguments the caller asked for looks
+	// exactly like one that was started correctly, and is not.
+	Spec(ctx context.Context, launch AgentLaunch) (AgentSpec, error)
 }
 
 // ProcessInspector is implemented by a backend whose sessions run in a process
@@ -220,13 +255,21 @@ func (m *Manager) Agent(ctx context.Context, projectID string) (AgentStatus, err
 // It is idempotent. An agent that is already running is reported as it is and
 // nothing is typed: two agents in one project is the one arrangement this
 // design exists to prevent, and a second `claude` typed at a shell that is
-// already running one would produce exactly that.
+// already running one would produce exactly that. An adopted agent is *not*
+// launched with the given launch - it is already running with whatever it was
+// started with - and a caller that needs the launch to have taken effect has to
+// stop the agent and start it again.
+//
+// It requires the runtime to be RUNNING and does not start one: bringing a
+// terminal up is the runtime's own Start, and a manager that quietly started
+// one would make "start the agent" and "start the terminal" the same request
+// with no way to ask for only the second.
 //
 // The agent is started by typing a command into the runtime's shell rather than
 // executed by AgentMux. That is what makes it visible, interruptible, and part
 // of the terminal's scrollback, and it is why the agent outlives the server:
 // its parent is the shell inside tmux, not this process.
-func (m *Manager) StartAgent(ctx context.Context, projectID string) (AgentStatus, error) {
+func (m *Manager) StartAgent(ctx context.Context, projectID string, launch AgentLaunch) (AgentStatus, error) {
 	if m.agent == nil {
 		return AgentStatus{}, newError(CodeAgentUnavailable,
 			"this build cannot host a coding agent")
@@ -244,7 +287,7 @@ func (m *Manager) StartAgent(ctx context.Context, projectID string) (AgentStatus
 	if err != nil {
 		return AgentStatus{}, err
 	}
-	spec, err := m.agent.Spec(ctx)
+	spec, err := m.agent.Spec(ctx, launch)
 	if err != nil {
 		// The provider's message is carried through rather than replaced. Its
 		// contract is that the error explains why no agent can be started, and
@@ -341,7 +384,11 @@ func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus,
 	if err != nil {
 		return AgentStatus{}, err
 	}
-	spec, err := m.agent.Spec(ctx)
+	// Nothing is being launched here - this is asking what is running - so the
+	// launch is the zero value: it names no session and no settings, and a
+	// provider that wanted one to answer would be answering a different
+	// question.
+	spec, err := m.agent.Spec(ctx, AgentLaunch{})
 	if err != nil {
 		// Same as StartAgent: the provider's reason is the one a user can act
 		// on, so it is carried rather than replaced.
@@ -483,7 +530,10 @@ func (m *Manager) agentAvailability(ctx context.Context) (AgentSpec, string) {
 	if m.agent == nil {
 		return AgentSpec{}, "this build cannot host a coding agent"
 	}
-	spec, err := m.agent.Spec(ctx)
+	// The zero launch again: this answers "can one be started here, and what
+	// would it be", and the arguments a particular launch carries do not change
+	// which agent is installed or where it lives.
+	spec, err := m.agent.Spec(ctx, AgentLaunch{})
 	if err != nil {
 		return AgentSpec{}, err.Error()
 	}

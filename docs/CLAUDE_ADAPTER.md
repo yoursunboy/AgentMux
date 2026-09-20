@@ -103,6 +103,21 @@ Everything an adapter owns is per-instance: its listener, its hook path, its
 session map, its subscribers. Two adapters do not share an address, a path or a
 channel, so a hook delivered to one is never attributed to the other.
 
+Something has to hold them, and since Phase 7.3B-2 that is `Manager`, in
+`internal/claude/manager.go`. It keeps one adapter per runtime id — a runtime is
+what an adapter observes, and the Claude process inside it comes and goes — and
+it exposes `Attach`, `Detach`, `HookSettings` and `Subscribe`, which is the whole
+of how anything else reaches an adapter. `Attach` **replaces**: a second Claude
+session in one runtime has an id of its own, so the first adapter's port, hook
+path and settings document are all describing something that no longer exists,
+and leaving it would be leaving a listener nothing will ever post to.
+
+The adapter still does not start Claude, and it still does not know what a task
+is. The manager that owns it does not either — it is handed a runtime id, a
+project id and a session id as strings. Deciding when to attach is
+`internal/agent`, and `docs/AGENT_RUNTIME_BINDING.md` is where that is written
+down.
+
 ## 3. How Claude reaches the receiver
 
 Claude Code delivers a hook over whichever handler type its settings declare. Two
@@ -445,8 +460,10 @@ Stated rather than hidden. Each of these is a real cost, not a caveat.
    and it is not visible to any other component. A phase that needs the
    correlation to outlive the process, or to be joined against
    `agent_sessions`, has to store it - which means a migration, and a decision
-   about what a Claude session id means to AgentMux that this phase deliberately
-   did not make.
+   about what a Claude session id means to AgentMux that Phase 7.3B-1
+   deliberately did not make and Phase 7.3B-2 deferred again. What that costs
+   once an adapter is actually attached to a runtime is
+   `docs/AGENT_RUNTIME_BINDING.md` §6.
 
 2. **`SessionStart` needs `curl`** on PATH inside the environment Claude runs in.
    That is a real dependency on a program this project does not ship, created by
@@ -479,21 +496,39 @@ Stated rather than hidden. Each of these is a real cost, not a caveat.
    is a record. Nothing reads it. This is the brief's boundary for this phase and
    also a design position: see §10.
 
+8. **The stream half is unreachable in the running product.** Since Phase 7.3B-2,
+   an adapter is attached to a real runtime - and that runtime hosts Claude as a
+   TUI in a tmux pane, with no `--output-format stream-json`. `ConsumeStream` has
+   **no production caller at all**. So `agent.completed` and `agent.failed`, the
+   two types that come from the `result` envelope, do not occur outside the test
+   suite. Wiring the stream would mean reading the pane, which the runtime layer
+   owns. `docs/AGENT_RUNTIME_BINDING.md` §5 is the full statement of what is and
+   is not reachable.
+
 ## 10. Future work
 
 Ordered by what has to be settled first, not by size.
 
-**Phase 7.3B-2 and the permission question.** `PermissionRequest` is currently
-record-only, and the phase that makes it actionable has to answer a question this
-one avoided: whether AgentMux decides a permission and returns a decision to
-Claude Code. The mechanism exists - Phase 7.3A proved a hook's stdout is read as
-a decision - and turning it on makes AgentMux a participant in a Claude session
-rather than an observer of one. Every property of this adapter that says "it
-decides nothing" would have to be re-examined, and the trust boundary in §7 stops
-being a boundary and becomes an authorization surface.
+**The stream, or the absence of it.** §9.8 is the largest open question this
+phase left. Two of the seven `agent.*` types cannot occur on the path a session
+actually runs on, and the question is whether reading a pane's stdout - which the
+runtime layer owns and the adapter is forbidden to parse - is the right way to
+get them, or whether the answer is a different launch mode. Until it is
+answered, "did this turn succeed" has no answer in the product.
 
 **Persisting the session mapping.** Requires a migration, and the decision in
-§9.1.
+§9.1. `docs/AGENT_RUNTIME_BINDING.md` §6 lists the three things that follow from
+not having it, including attempts that a restart can leave `RUNNING` with nothing
+to reconcile them.
+
+**The permission question.** `PermissionRequest` is currently record-only, and
+the phase that makes it actionable has to answer a question this one avoided:
+whether AgentMux decides a permission and returns a decision to Claude Code. The
+mechanism exists - Phase 7.3A proved a hook's stdout is read as a decision - and
+turning it on makes AgentMux a participant in a Claude session rather than an
+observer of one. Every property of this adapter that says "it decides nothing"
+would have to be re-examined, and the trust boundary in §7 stops being a boundary
+and becomes an authorization surface.
 
 **Task state derived from events.** A task's state machine would read
 `agent.started` / `agent.completed` / `agent.failed`. The `Stop` / result split in
@@ -504,15 +539,15 @@ being a boundary and becomes an authorization surface.
 `PostToolUse` and `Notification` are the obvious next three, and each needs the
 same question answered: identifier or enumeration, never content.
 
-**Wiring it into the server.** Nothing in this phase constructs an adapter. The
-runtime manager is the component that knows a runtime's identity, and it is the
-one that would own an adapter's lifetime - which is Phase 7.3B-2's decision, not
-this phase's.
-
 ## 11. Where this sits
 
 - `internal/claude/claude.go` - the CLI launcher, and the package's own account
   of the two halves.
+- `internal/claude/manager.go` - what owns an adapter, one per runtime.
+- `internal/agent/` - what decides when one should exist.
+- `docs/AGENT_RUNTIME_BINDING.md` - the join between this adapter and the
+  product: the lifecycle, the binding, the settings document's location, and
+  the failure handling.
 - `docs/CLAUDE_INTEGRATION.md` - what Claude Code offers and how it was measured.
 - `docs/CLAUDE_RUNTIME_VALIDATION.md` - the environment measurements, including
   the `SessionStart` refusal and the `subtype` / `is_error` divergence.

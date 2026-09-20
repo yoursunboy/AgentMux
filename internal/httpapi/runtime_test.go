@@ -417,6 +417,17 @@ func (b *fakeBackend) PaneProcess(_ context.Context, name string) (session.PaneP
 }
 
 // setPane makes the backend report this as the terminal's foreground process.
+// createdCount is how many sessions the backend has been asked to create.
+//
+// A count rather than the slice, because the callers that want it are asking
+// "was a runtime started at all" - and after a failed agent launch the runtime
+// is stopped again, so the live state cannot answer that and the history can.
+func (b *fakeBackend) createdCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.created)
+}
+
 func (b *fakeBackend) setPane(pane session.PaneProcess) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

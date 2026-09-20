@@ -1281,8 +1281,43 @@ func TestCreateSessionRecordsOneEvent(t *testing.T) {
 	if last.RuntimeID != "" {
 		t.Errorf("runtimeId = %q; no runtime has been attached", last.RuntimeID)
 	}
-	if last.Payload["sessionId"] != sess.ID || last.Payload["taskId"] != tk.ID {
+	if last.Payload["agentSession"] != sess.ID || last.Payload["taskId"] != tk.ID {
 		t.Errorf("payload = %v; want both identifiers", last.Payload)
+	}
+}
+
+// TestSessionPayloadsAreAcceptedByTheEventService is the test that would have
+// caught the defect this field name was renamed for.
+//
+// Until Phase 7.3B-2 the payloads named their session `sessionId`, which
+// event.CheckPayload refuses - its forbidden list catches any field ending in
+// "sessionid" - and the refusal was swallowed by noteEvent, so session.created
+// and session.status_changed were never written and the suite stayed green
+// because the recorder double here does not check payloads.
+//
+// So this one does not use the double. It runs the real checker, over the real
+// builders, and it is the only way the difference between "recorded" and
+// "silently dropped" is visible from this package.
+func TestSessionPayloadsAreAcceptedByTheEventService(t *testing.T) {
+	h := newHarness(t)
+	tk := h.createTask(t, "p_alpha", "Fix the viewer")
+	sess := h.createSession(t, tk.ID)
+
+	payloads := map[string]map[string]any{
+		"session.created": sessionEventPayload(tk.ID, sess.ID),
+		"session.status_changed": sessionStatusPayload(
+			tk.ID, sess.ID, StatusSessionCreated, StatusSessionRunning),
+	}
+	for name, payload := range payloads {
+		encoded, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("%s: could not encode the payload: %v", name, err)
+		}
+		if err := event.CheckPayload(encoded); err != nil {
+			t.Errorf("%s payload %v is refused by the event service: %v\n"+
+				"this event would never be written, and nothing would say so",
+				name, payload, err)
+		}
 	}
 }
 

@@ -300,6 +300,21 @@ be with no adapter running. Phase 7.3B-1 is under an explicit prohibition on
 permission control; `docs/CLAUDE_ADAPTER.md` §10 covers what making it actionable
 would mean.
 
+**Five of the seven are what a running session actually produces.** Phase 7.3B-2
+attached the adapter to a real runtime, and that runtime hosts Claude as a TUI in
+a tmux pane - so the stream-json half of the adapter, which is where
+`agent.completed` and `agent.failed` come from, has no caller in the product.
+The five hook events are the reachable vocabulary on this path.
+`docs/AGENT_RUNTIME_BINDING.md` §5 says what that costs and what would close it;
+the table above is the vocabulary, not a promise that every row occurs.
+
+**An event does not name the attempt it belongs to.** It names its project and
+its runtime, and the attempt is reached from the runtime - a project's attempts
+are listed under their task, and each carries the runtime it ran in. Nothing was
+added to the payload shape to carry an attempt id, and the Claude session id does
+not appear in an event at all. `docs/AGENT_RUNTIME_BINDING.md` §7 is the routing
+rule.
+
 ### Where the state stays
 
 ```text
@@ -450,7 +465,11 @@ partially wired:
   which of the two paths an event came from, and neither path is a fallback for
   the other;
 - no state inference from anything an event contains;
-- no task model, no notification, no token or model accounting;
+- no task status change, ever. The task model is connected to a running agent
+  since Phase 7.3B-2 - an attempt is created, bound and closed - and the task
+  itself is not touched by any of it. An attempt ending is not the work ending,
+  and nothing in this build is in a position to say the work succeeded;
+- no notification, no token or model accounting;
 - no automatic decision of any kind. A hook's stdout *is* read by Claude as a
   decision, which is why every response the receiver sends has an empty body;
 - no permission control. `agent.permission_requested` is recorded and read by
@@ -460,13 +479,19 @@ partially wired:
 
 There is no event type in this build that no code emits. `runtime.*` are the four
 the runtime bridge produces, `agent.*` are the seven the Claude adapter produces,
-and the vocabulary stops there until a phase produces a twelfth.
+and the vocabulary stops there until a phase produces a twelfth. "Emits" is the
+weaker of the two claims worth making, and it is the one made here: two of the
+seven cannot occur on the path a session actually runs on, for the reason given
+under the agent bridge above.
 
 **A correction, kept rather than quietly edited.** Until Phase 7.3B-1 this
 section read "no Claude Code hooks", and that was true when it was written. The
 adapter now exists, so the line is gone. The claim it was making - that nothing
 in this layer wraps terminal parsing and calls it an integration - still holds,
-and is now the first bullet above.
+and is now the first bullet above. Until Phase 7.3B-2 it also read "no task
+model", and that line has been rewritten rather than deleted: the connection
+exists now, and what it does not do - change a task's status - is the part worth
+stating.
 
 ## 9. Where this sits
 

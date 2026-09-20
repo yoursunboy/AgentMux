@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -58,6 +59,7 @@ type Server struct {
 	events     *event.Service
 	tasks      *task.Service
 	agent      AgentResolver
+	agents     *agent.Service
 	terminal   *terminal.Hub
 	log        *slog.Logger
 
@@ -106,6 +108,19 @@ type Options struct {
 	// reports that it has none, which is a legitimate configuration.
 	Agent AgentResolver
 
+	// Agents is the coordinator that starts a coding agent inside a runtime,
+	// observes it and records the attempt. It is the thing the two agent
+	// endpoints act through.
+	//
+	// It is optional in the same way Events and Tasks are - a test of the REST
+	// surface that is not about agents should not have to build one - and a
+	// server without it explains itself on those two routes rather than
+	// launching an unobserved agent. There is deliberately no fallback that
+	// starts the agent without it: an agent that is running and not observed
+	// looks exactly like one that is running and has nothing to say, and that
+	// is the confusion this phase exists to remove.
+	Agents *agent.Service
+
 	// Terminal carries browser sockets to the runtime. It is optional only so
 	// that tests of the REST surface do not have to build one; a server
 	// without it answers the real-time endpoint with an explanation rather
@@ -150,6 +165,7 @@ func New(o Options) (*Server, error) {
 		events:     o.Events,
 		tasks:      o.Tasks,
 		agent:      o.Agent,
+		agents:     o.Agents,
 		terminal:   o.Terminal,
 		log:        o.Logger,
 		startedAt:  o.StartedAt,

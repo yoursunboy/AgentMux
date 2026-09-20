@@ -35,7 +35,9 @@ type pinnedAgent struct {
 	err  error
 }
 
-func (a pinnedAgent) Spec(context.Context) (session.AgentSpec, error) { return a.spec, a.err }
+func (a pinnedAgent) Spec(context.Context, session.AgentLaunch) (session.AgentSpec, error) {
+	return a.spec, a.err
+}
 
 // testAgentSpec is a spec that names an executable no machine has.
 //
@@ -171,19 +173,65 @@ func TestAgentEndpointsAreRefusedWhereRuntimesCannotRun(t *testing.T) {
 // Starting the agent
 // ---------------------------------------------------------------------------
 
-// TestStartingAnAgentWithoutARunningRuntimeIsRefused is the rule that an agent
-// needs a terminal to be in.
+// TestStartingAnAgentOnAStoppedProjectBringsTheRuntimeUp is the phase's
+// replacement for the rule that an agent needs a terminal to be in.
 //
-// An agent with no terminal is a process nobody can see, interrupt, or read,
-// and this product's premise is that a coding agent runs where its work can be
-// watched. So the start is refused with a conflict rather than quietly creating
-// a terminal the caller did not ask for.
-func TestStartingAnAgentWithoutARunningRuntimeIsRefused(t *testing.T) {
+// The rule has not been dropped, it has moved. An agent with no terminal is
+// still a process nobody can see, interrupt, or read - so the call does not
+// launch one into nothing. It brings the terminal up first and then launches
+// into it, which is what makes one request enough to go from a stopped project
+// to a running agent.
+//
+// The launch itself fails here, because the pinned agent names an executable no
+// machine has - and the failure takes the terminal back with it, which is the
+// other half of the same rule. So the evidence is the *sequence*: a session was
+// created, and then it was stopped. A project that had simply been refused
+// would show neither.
+func TestStartingAnAgentOnAStoppedProjectBringsTheRuntimeUp(t *testing.T) {
 	h := newHarnessOpts(t, harnessOptions{agent: pinnedAgent{spec: testAgentSpec}, runtimeAvailable: true})
 	projectID, _ := h.registerProject(t, "checkout-service")
 
+	if created := h.backend.createdCount(); created != 0 {
+		t.Fatalf("the project already has %d runtime(s); want none before the call", created)
+	}
+
 	recorder := h.call(http.MethodPost, "/api/projects/"+projectID+"/runtime/agent/start", "")
-	h.wantError(t, recorder, http.StatusConflict, session.CodeNotRunning)
+	if recorder.Code == http.StatusConflict {
+		t.Fatalf("a stopped runtime was refused instead of started: %s", recorder.Body)
+	}
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d; want 500 from a launch whose agent never appeared: %s",
+			recorder.Code, recorder.Body)
+	}
+
+	if created := h.backend.createdCount(); created != 1 {
+		t.Errorf("the runtime was created %d time(s); want once: "+
+			"an agent asked for on a stopped project starts its terminal", created)
+	}
+	if after := h.runtimeState(t, projectID); after.State != session.StateStopped {
+		t.Errorf("runtime state after a failed launch = %s; want STOPPED: "+
+			"a runtime this call started is taken back when the launch fails", after.State)
+	}
+}
+
+// TestStartingAnAgentWithNoCoordinatorSaysSo is the branch a server built
+// without one takes.
+//
+// There is deliberately no fallback that launches the agent anyway: an agent
+// running with nothing observing it behaves exactly like an agent that has
+// nothing to say, and telling those two apart is the whole of what this phase
+// added.
+func TestStartingAnAgentWithNoCoordinatorSaysSo(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{
+		agent:            pinnedAgent{spec: testAgentSpec},
+		runtimeAvailable: true,
+		withoutAgents:    true,
+	})
+	projectID, _ := h.registerProject(t, "checkout-service")
+	h.startRuntime(t, projectID)
+
+	recorder := h.call(http.MethodPost, "/api/projects/"+projectID+"/runtime/agent/start", "")
+	h.wantError(t, recorder, http.StatusServiceUnavailable, CodeInternal)
 }
 
 // TestStartingAnAgentOnAServerThatCannotHostOneIsUnavailable covers the status

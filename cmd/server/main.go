@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -260,6 +261,48 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The adapter manager. It owns one hook receiver per observed runtime, and
+	// it is built here rather than after the coordinator because the coordinator
+	// is handed it rather than allowed to make one: an observer that could be
+	// constructed anywhere would be an observer nobody could close.
+	//
+	// Its recorder is the same event service everything else writes through, so
+	// the `agent.*` rows land in the one log with the `runtime.*` rows beside
+	// them and there is still exactly one door into the table.
+	adapters := claude.NewManager(claude.ManagerOptions{
+		Adapter: claude.AdapterOptions{
+			Recorder: eventLog,
+			Logger:   agentLog,
+		},
+		Logger: agentLog,
+	})
+
+	// The coordinator. It is the one thing in the build that decides which
+	// Claude session is which attempt, and it decides it in memory - see
+	// docs/AGENT_RUNTIME_BINDING.md §6. It starts nothing itself: every process
+	// operation below it is the runtime manager's.
+	agentService, err := agent.NewService(agent.Options{
+		Runtimes: runtimes,
+		Adapters: adapters,
+		Sessions: taskService,
+		Settings: agent.NewFileSettings(cfg.DataDir),
+		Logger:   agentLog,
+	})
+	if err != nil {
+		return err
+	}
+	// Registered after the runtime manager's own defer, so it runs before it:
+	// every hook receiver is detached, and every settings document describing
+	// one, before the runtime manager closes the terminals those sessions run
+	// in. The sessions themselves are left alone, in both cases and for the
+	// same reason - Claude is a child of the shell inside tmux and outlives this
+	// process.
+	defer func() {
+		if err := adapters.Close(context.Background()); err != nil {
+			agentLog.Warn("could not close the claude adapter manager", "error", err)
+		}
+	}()
+
 	bridge.manager = runtimes
 
 	// Closing the manager detaches every control client. It deliberately does
@@ -317,6 +360,7 @@ func run(args []string) error {
 		Events:     eventLog,
 		Tasks:      taskService,
 		Agent:      agents,
+		Agents:     agentService,
 		Terminal:   terminalHub,
 		Logger:     logging.Component(logger, logging.ComponentAPI),
 		WebDir:     webDir,
@@ -485,15 +529,24 @@ type agentSpecs struct {
 }
 
 // Spec implements session.AgentProvider.
-func (a agentSpecs) Spec(ctx context.Context) (session.AgentSpec, error) {
+//
+// The launch is translated rather than passed on: the runtime's description of
+// what the caller asked for is not the launcher's description of a command
+// line, and this is the one place the two meet. What comes back is a single
+// line the runtime types into a shell, with the binary and every argument
+// quoted for it.
+func (a agentSpecs) Spec(ctx context.Context, launch session.AgentLaunch) (session.AgentSpec, error) {
 	installation := a.launcher.Resolve(ctx)
 	if !installation.Available {
 		return session.AgentSpec{}, errors.New(installation.Message)
 	}
 	return session.AgentSpec{
-		Type:       installation.Type,
-		Version:    installation.Version,
-		Command:    installation.Command,
+		Type:    installation.Type,
+		Version: installation.Version,
+		Command: claude.LaunchCommand(installation, claude.LaunchOptions{
+			SessionID:    launch.SessionID,
+			SettingsPath: launch.SettingsPath,
+		}),
 		Executable: installation.Path,
 	}, nil
 }

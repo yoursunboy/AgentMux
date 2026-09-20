@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -55,6 +56,12 @@ type harness struct {
 	// record a task or an attempt directly when what it is asserting about is
 	// not the call that would have created it.
 	tasks *task.Service
+
+	// agents is the coordinator the server holds, and adapters is the manager
+	// it drives. Both are kept here so that a test can ask what was bound and
+	// what is being observed without going back through the API to find out.
+	agents   *agent.Service
+	adapters *claude.Manager
 }
 
 // harnessOptions describes the environment a test wants its server to believe
@@ -127,6 +134,12 @@ type harnessOptions struct {
 	// caller that does not use the task model runs it. The task routes must
 	// then explain themselves rather than panic or answer with an empty list.
 	withoutTasks bool
+
+	// withoutAgents builds the server with no agent coordinator. It is the
+	// other branch of the same question the flag above asks, and the agent
+	// routes have to explain themselves rather than launch an agent nothing is
+	// watching.
+	withoutAgents bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -312,6 +325,39 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		resolver = pinnedClaude{*o.claude}
 	}
 
+	// The adapter manager and the coordinator, both real. The adapter binds a
+	// real loopback port - an injected listener would make every hook-delivery
+	// assertion a statement about a fake - and the coordinator is wired to the
+	// same runtime manager and task service the rest of the harness uses, so a
+	// test that starts an agent exercises the chain the server actually runs.
+	cliAdapters := claude.NewManager(claude.ManagerOptions{
+		Adapter: claude.AdapterOptions{
+			Recorder: events,
+			Logger:   discardLogger(),
+		},
+		Logger: discardLogger(),
+	})
+	t.Cleanup(func() {
+		if err := cliAdapters.Close(context.Background()); err != nil {
+			t.Errorf("closing the claude adapter manager failed: %v", err)
+		}
+	})
+
+	coordinator, err := agent.NewService(agent.Options{
+		Runtimes: manager,
+		Adapters: cliAdapters,
+		Sessions: tasks,
+		Settings: agent.NewFileSettings(dataDir),
+		Logger:   discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("agent.NewService returned an error: %v", err)
+	}
+	var servedAgents *agent.Service = coordinator
+	if o.withoutAgents {
+		servedAgents = nil
+	}
+
 	server, err := New(Options{
 		Config:     cfg,
 		Host:       adapter,
@@ -320,6 +366,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Runtime:    manager,
 		Events:     events,
 		Tasks:      servedTasks,
+		Agents:     servedAgents,
 		Terminal:   hub,
 		Logger:     discardLogger(),
 		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
@@ -331,15 +378,17 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		t.Fatalf("httpapi.New returned an error: %v", err)
 	}
 	return &harness{
-		t:       t,
-		server:  server,
-		root:    root,
-		dataDir: dataDir,
-		store:   store,
-		backend: backend,
-		runtime: manager,
-		events:  events,
-		tasks:   tasks,
+		t:        t,
+		server:   server,
+		root:     root,
+		dataDir:  dataDir,
+		store:    store,
+		backend:  backend,
+		runtime:  manager,
+		events:   events,
+		tasks:    tasks,
+		agents:   coordinator,
+		adapters: cliAdapters,
 	}
 }
 

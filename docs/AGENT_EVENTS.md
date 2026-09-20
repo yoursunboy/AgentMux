@@ -205,7 +205,8 @@ warning.
 
 ## 5. The runtime bridge
 
-`internal/session` emits four events. It is the only emitter in this phase.
+`internal/session` emits four events. It is the only emitter of the `runtime.*`
+vocabulary.
 
 | Event | When | Payload |
 | --- | --- | --- |
@@ -262,6 +263,42 @@ there would contradict the start written in the same instant and send a reader
 looking for a failed runtime that is in fact running. That failure is logged, is
 returned to the caller, and leaves the runtime `RUNNING`, which is what it is.
 The timeline says the runtime started, and it did.
+
+### The agent bridge
+
+`internal/claude` emits seven events, added in Phase 7.3B-1. It observes a Claude
+Code session - through Claude's hooks and through the CLI's stream-json output -
+and records what it sees. `docs/CLAUDE_ADAPTER.md` is the long form; what belongs
+here is what the vocabulary means.
+
+| Event | When | Payload |
+| --- | --- | --- |
+| `agent.started` | a Claude session began | `{"event":"SessionStart","source":"startup"}` |
+| `agent.prompt_submitted` | a prompt was submitted | `{"event":"UserPromptSubmit"}` |
+| `agent.permission_requested` | Claude asked to use a tool | `{"event":"PermissionRequest","tool":"Bash"}` |
+| `agent.completed_candidate` | the model stopped producing | `{"event":"Stop"}` |
+| `agent.completed` | a turn finished and reported success | `{"event":"result","isError":false,"terminalReason":"completed"}` |
+| `agent.failed` | a turn finished and reported failure | `{"event":"result","isError":true,"terminalReason":"api_error"}` |
+| `agent.session_ended` | the session ended, for any reason | `{"event":"SessionEnd","reason":"other"}` |
+
+Every one of them is written with `source = "agent"`, which is the source this
+table exists to give a meaning to. The payloads carry an identifier or an
+enumeration and never content - no prompt, no assistant message, no tool input,
+no transcript path. `docs/CLAUDE_ADAPTER.md` §7 is the rule and §5 is the table.
+
+**`agent.completed_candidate` is not `agent.completed`.** The model stopping is
+not the work succeeding: an aborted turn, a refused tool call and a crash after
+the last token all look the same from the `Stop` hook. The outcome is recorded
+separately, from the CLI's `result` envelope, which is the only thing that
+reports it. A reader asking "did this work" reads `agent.completed` or
+`agent.failed`; a reader asking "did it stop" reads the candidate. The two are
+different questions and the log answers them separately.
+
+**`agent.permission_requested` is a record and nothing else.** Nothing reads it,
+nothing answers it, and the permission is decided by Claude exactly as it would
+be with no adapter running. Phase 7.3B-1 is under an explicit prohibition on
+permission control; `docs/CLAUDE_ADAPTER.md` §10 covers what making it actionable
+would mean.
 
 ### Where the state stays
 
@@ -402,22 +439,34 @@ string copied into an append-only row is a string that can never be redacted -
 and the one place it would matter is the tmux failure that names a socket path
 under the data directory, which §6 says must not be returned.
 
-## 8. What this phase does not do
+## 8. What this does not do
 
 None of the following exists, and none of it is stubbed, scaffolded, or
 partially wired:
 
-- no Claude Code hooks;
-- no terminal output parsing, and no pattern matching against a pane;
+- no terminal output parsing, and no pattern matching against a pane. The
+  `internal/claude` bridge reads Claude's hooks and its stream-json output, and
+  it reads nothing off a terminal. Nothing downstream of the adapter can tell
+  which of the two paths an event came from, and neither path is a fallback for
+  the other;
 - no state inference from anything an event contains;
 - no task model, no notification, no token or model accounting;
-- no automatic decision of any kind;
+- no automatic decision of any kind. A hook's stdout *is* read by Claude as a
+  decision, which is why every response the receiver sends has an empty body;
+- no permission control. `agent.permission_requested` is recorded and read by
+  nobody;
 - no user interface. The only consumer is the API, and the API exists so the
   data model can be exercised and tested before anything is built on it.
 
-There is no event type in this build that no code emits. `runtime.*` are the
-four the bridge produces, and the vocabulary stops there until a phase produces
-a fifth.
+There is no event type in this build that no code emits. `runtime.*` are the four
+the runtime bridge produces, `agent.*` are the seven the Claude adapter produces,
+and the vocabulary stops there until a phase produces a twelfth.
+
+**A correction, kept rather than quietly edited.** Until Phase 7.3B-1 this
+section read "no Claude Code hooks", and that was true when it was written. The
+adapter now exists, so the line is gone. The claim it was making - that nothing
+in this layer wraps terminal parsing and calls it an integration - still holds,
+and is now the first bullet above.
 
 ## 9. Where this sits
 

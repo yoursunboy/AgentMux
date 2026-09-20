@@ -1,12 +1,33 @@
-// Package claude finds the Claude Code CLI and describes how to start it
-// inside a project's persistent runtime.
+// Package claude finds the Claude Code CLI, describes how to start it inside a
+// project's persistent runtime, and observes the session it starts.
 //
 // It owns as little as it can. It does not own a tmux socket, does not create
 // or resize a terminal, does not transport a single byte of terminal output,
 // and does not know what a browser is. Those belong to the session package and,
-// from Phase 4, to the WebSocket layer. What is here is the one thing nothing
-// else can answer: which Claude Code is installed, what version it is, and what
-// command line starts it.
+// from Phase 4, to the WebSocket layer. What is here is the two things nothing
+// else can answer: which Claude Code is installed and what command line starts
+// it, and what Claude reports about a session once it is running.
+//
+// # The two halves
+//
+// The launcher - claude.go - resolves the CLI. The adapter - model.go,
+// adapter.go, hooks.go, stream.go, mapper.go and events.go, added in Phase
+// 7.3B-1 - receives what Claude reports and records it as AgentMux events.
+//
+// They are in one package because they are one subject and the second does not
+// work without the first: the adapter's settings document is built from the
+// same resolution the launcher performs, and the alternative was a package
+// named after a package it re-exports. They are not coupled beyond that. The
+// launcher starts nothing and the adapter starts nothing; neither imports the
+// other's state.
+//
+//	Claude Code ──hook delivery──▶ hookReceiver ─┐
+//	           ──stream-json────▶ ConsumeStream ─┴─▶ Event ──▶ event.Service
+//
+// Nothing goes the other way. The adapter does not answer a hook, does not
+// decide a permission, and does not write to the Claude process's input. A
+// reader looking for control will not find it here, and that is the design
+// rather than an unfinished edge. docs/CLAUDE_ADAPTER.md is the long form.
 //
 // # What this package will not do
 //
@@ -19,6 +40,11 @@
 // exist, and the first place for one to leak into a log line or an API
 // response.
 //
+// The adapter holds the same line, and it is the reason its decoders have so
+// few fields. A Claude hook payload carries the prompt and the tool input; a
+// stream line carries the whole conversation. None of it is decoded, so none of
+// it can be logged, stored, or returned. See docs/CLAUDE_ADAPTER.md §5.
+//
 // # Where it runs
 //
 // The Claude Code CLI is a Linux process. On Windows the AgentMux server runs
@@ -26,6 +52,12 @@
 // environment as the tmux server that hosts it. A Windows-native server never
 // reaches the point of launching anything: the runtime itself is unavailable
 // there, and it says so.
+//
+// The adapter has no such constraint. It speaks HTTP and reads a pipe, so it
+// runs wherever the AgentMux server runs and observes a Claude process wherever
+// that process is - as long as it can reach its hook endpoint. On this machine
+// it was validated with a native Windows Claude delivering to a native Windows
+// adapter. docs/CLAUDE_RUNTIME_VALIDATION.md §4 is the measurement.
 package claude
 
 import (

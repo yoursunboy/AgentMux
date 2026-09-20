@@ -1125,10 +1125,22 @@ client that saw `500` there would report a bug where the honest answer is "not o
 
 ## Not implemented
 
-There is no provider switching, no Claude Hooks and no Waiting/Completed state detection. There is no
-Task UI: the task and session endpoints above exist and the frontend has types and functions for them,
-and no screen shows either. `docs/PROTOCOL.md` sections 4 to 13 describe the agreed design for the
-rest, and none of them answers today.
+There is no provider switching and no Waiting/Completed state detection. There is
+no Task UI: the task and session endpoints above exist and the frontend has types
+and functions for them, and no screen shows either. `docs/PROTOCOL.md` sections 4
+to 13 describe the agreed design for the rest, and none of them answers today.
+
+Claude Hooks are read — Phase 7.3B-1 built an adapter that receives them and
+records `agent.*` events — and **no endpoint exposes that adapter.** Nothing in
+this build constructs one, nothing starts it, and no request can ask what a
+Claude session has done. The events it writes land in the same `agent_events`
+table as `runtime.*` and are returned by the two timeline endpoints below, which
+is the whole of how they are reachable: a client reading
+`GET /api/projects/{id}/events` will see `agent.started`, `agent.prompt_submitted`,
+`agent.completed_candidate`, `agent.completed`, `agent.failed` and
+`agent.session_ended` rows without any request having asked for them.
+`docs/CLAUDE_ADAPTER.md` describes the adapter and §10 of it says which component
+would own one.
 
 The event timelines record what happened and nothing reads them to decide anything — in particular the
 task service does not, and a task's status is never derived from its events. There is no endpoint that

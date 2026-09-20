@@ -18,6 +18,7 @@ iPad / Phone / PC
 │ Workspace                   │   web/src/workspace       — built in Phase 5
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
+│ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1
 │ Event Log                   │   internal/event          — built in Phase 7.1
 │ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
@@ -51,6 +52,13 @@ runtime's shell, so its parent is the pane leader inside tmux; the server recogn
 process table and never by parsing the terminal. That is what lets it outlive a restart, and it is
 why the arrow above runs `shell → claude` rather than `server → claude`. See
 `docs/CLAUDE_RUNTIME.md` §1 and §6.
+
+The Claude Adapter is the second half of `internal/claude`, added in Phase 7.3B-1, and it is the one
+component above that **nothing constructs yet**. It receives what Claude reports — a hook delivery or
+a line of stream-json — translates it into the AgentMux event vocabulary, and writes it through the
+Event Log. It sits above nothing: it does not own the Claude process, does not read the terminal, and
+does not answer the agent. Wiring it into a lifetime is a later phase, and `docs/CLAUDE_ADAPTER.md`
+§10 says which component that is and why.
 
 ## 2. Project vs Collection
 

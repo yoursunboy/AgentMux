@@ -710,3 +710,43 @@ experiments. Nothing observed on Windows or WSL suggests Linux will differ —
 WSL runs a native Linux kernel and a native Linux binary, and behaved identically
 to Windows on every shared check — but that is an expectation, and this document
 does not promote expectations to results.
+
+## 14. Implementation Status
+
+Phase 7.3B-1 built the adapter this document's §10 recommended, and the shape it
+was built in is worth recording against the design that proposed it.
+
+| §10 element | What was built |
+|---|---|
+| A hook receiver | one loopback HTTP endpoint, reached by both transports |
+| `SessionStart` over a command handler | a generated `curl` command, exactly as §13 requires |
+| The other events over HTTP | four `http` handlers, with `allowedHttpHookUrls` naming the receiver |
+| stream-json for the outcome | a reader for `system/init`, `system/hook_started`, `system/hook_response` and `result` |
+| Session correlation by Claude's `session_id` | kept in the adapter's mapping, not written to a row |
+| No terminal parsing | none, and no fallback to it |
+
+Three things changed on contact with the code, and none of them is a departure
+from the design:
+
+**The stream is read for one field.** §2.2 listed the stream as a source of
+structured events. In the adapter it is read for the `result` envelope's
+`is_error` and for a second path to the `session_id`, and for nothing else,
+because every other fact the hooks already deliver first-hand. §11.2's finding —
+`subtype` reading `"success"` on a failed turn — is why the classification is
+`is_error` and not `subtype`.
+
+**`Stop` is recorded as a candidate, not a completion.** A hook ordering that
+§3 read as "the turn ended" is not strong enough to write `agent.completed`.
+`agent.completed_candidate` exists for it, and the outcome is written separately
+from the stream. `docs/CLAUDE_ADAPTER.md` §5 has the reasoning.
+
+**The session id is not stored.** §4 proposed correlating Claude's session id
+with an AgentMux session. `internal/event` refuses any payload field whose
+normalised name ends in `sessionid`, and that rule was left alone rather than
+weakened; the mapping is in memory for this version. `docs/CLAUDE_ADAPTER.md`
+§6 and §9.1 record the cost and what a later phase would add.
+
+The adapter was validated end to end on 2026-09-20 against Windows Claude Code
+2.1.278, with a real event service over a real database:
+`docs/CLAUDE_ADAPTER.md` §8 records what was observed and, as importantly, what
+was not.

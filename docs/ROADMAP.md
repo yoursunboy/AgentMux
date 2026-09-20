@@ -18,6 +18,7 @@ As of version 0.6.5:
 | Phase 7.1 — Agent event foundation | **Done** | Not a capability phase, and deliberately invisible in the product. The event model, `agent_events`, one write path, the runtime bridge, and two read-only timeline endpoints. No Claude Hooks, no output parsing, no state inference, no UI. See below. |
 | Phase 7.2 — Task and agent session model | **Done** | Not a capability phase either, and the last piece of Phase 7 that is not about Claude. `tasks` and `agent_sessions`, their lifecycles, the service that owns both, the eight endpoints that read and move them, and no UI. Nothing here starts a process. See below. |
 | Phase 7.3A — Claude integration discovery | **Done** | Not an implementation phase. What the installed Claude Code can actually report, measured rather than assumed, and the design that follows from it. No production code, database, API, or frontend was changed. See `docs/CLAUDE_INTEGRATION.md`. |
+| Phase 7.3B-0 — Runtime environment validation | **Done** | Also not an implementation phase. Whether the mechanism 7.3A found works on Windows, on WSL, and on pure Linux, measured rather than assumed. Windows verified end to end; WSL for everything but the model turn; pure Linux not at all, for want of interactive authentication. See `docs/CLAUDE_RUNTIME_VALIDATION.md`. |
 | Phase 7.3B — Claude event adapter | **Next** | Not started, not stubbed. A `ClaudeAdapter` that turns Claude's own hook and stream events into AgentMux session events, through the existing event service, with the Runtime Layer unchanged. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -620,6 +621,16 @@ The shape is decided and recorded in `docs/CLAUDE_INTEGRATION.md` §10: a
 stream, writes AgentMux events through the existing `event.Service`, and leaves
 the Runtime Layer's process, pane, input, and output handling exactly as it is.
 §12 of that document is the ordered plan.
+
+Sub-phase **7.3B-0, runtime environment validation, is done** and changed one
+thing the plan assumed. Claude's hooks, its settings injection, its session-id
+dictation and its JSON stream all work *without authentication* — verified on
+WSL with no credentials at all — so an adapter observes a session starting and
+ending even when the account behind it is broken. The same work corrected a
+phase-7.3A claim about `PATH` and found that `result.subtype` can read
+`success` on a failed turn. `docs/CLAUDE_RUNTIME_VALIDATION.md` is the record;
+Windows is verified end to end, WSL for everything but the model turn, and pure
+Linux not at all, because that host needs interactive authentication.
 
 Nothing about it is stubbed, and no code in this build anticipates it. It is
 listed so that a reader can see what 7.3A was for.

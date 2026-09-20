@@ -34,13 +34,15 @@ same build.
 
 Three consequences worth carrying forward.
 
-The Windows binary is **not on `PATH`**. `where.exe claude` fails and Git Bash
-does not find it either; the only working invocation is the absolute path into
-the extension directory. Any launcher that assumes `claude` resolves through
-`PATH` will work on a machine where Claude Code was installed by npm and fail on
-one where it came with the IDE extension. AgentMux's existing launcher already
-resolves the binary itself rather than trusting `PATH`, and this discovery is a
-reason to keep doing that.
+The Windows binary was **not on `PATH`** when this phase measured it.
+`where.exe claude` failed and Git Bash did not find it either; the only working
+invocation was the absolute path into the extension directory. That has since
+changed, and Phase 7.3B-0 corrected it: `claude` now resolves on `PATH` to
+`C:\Users\yours\.local\bin\claude.exe`, and three extension versions sit side by
+side in `.vscode\extensions`. The lesson survives the correction even though the
+specific fact did not — a launcher should resolve the binary rather than trust
+that `PATH` means what it meant yesterday, and AgentMux's existing launcher
+already does. `docs/CLAUDE_RUNTIME_VALIDATION.md` §1 has the current state.
 
 The WSL installation **is not signed in**, so no WSL turn could be run. Every
 cross-platform claim in this document that rests on a live turn is therefore a
@@ -303,8 +305,10 @@ Phase 7.2's rule that state is not re-derived by querying the event log.
 
 ## 6. Windows and WSL
 
-**Windows.** Full turn behaviour verified against 2.1.278. The binary is not on
-`PATH` (§1). Hooks fire; `--settings` injection works; `--session-id` dictation
+**Windows.** Full turn behaviour verified against 2.1.278, and re-verified
+independently in Phase 7.3B-0 — see `docs/CLAUDE_RUNTIME_VALIDATION.md` §4 for
+the current state, including the `PATH` correction in §1 above. Hooks fire;
+`--settings` injection works; `--session-id` dictation
 works; `--output-format stream-json` and `--input-format stream-json` both work;
 a `command` hook runs through the configured shell (Git Bash was used, and the
 handler takes an explicit `shell` field). An `http` hook delivered its payload to
@@ -313,13 +317,18 @@ URL was listed in `allowedHttpHookUrls`, and an unlisted URL is silently not
 delivered rather than erroring loudly. That silent-drop behaviour is a real
 operational hazard and belongs in any runbook for the adapter.
 
-**WSL.** Version and help text verified; **turn behaviour not verified**, because
-the WSL installation is not signed in and signing in is an interactive step this
-phase was not permitted to take. What can be said without guessing: the CLI is
-native `linux-x64`, the hook system is the same subsystem, and the settings
-schema is the same — so the mechanism is expected to behave identically, but
-*expected* is the honest word. This is the largest single unverified area in the
-document and §12 schedules it as the first task of 7.3B rather than assuming it.
+**WSL.** Version and help text verified here; the *mechanism* verified in Phase
+7.3B-0 and the *turn* still not, because the WSL installation is not signed in
+and signing in is an interactive step this phase was not permitted to take.
+7.3B-0's result is more useful than "expected" was: with no credentials at all,
+a 2.1.274 native `linux-x64` binary read a `--settings` file, fired a
+`SessionStart` command hook and captured its output, honoured a dictated
+`--session-id` in every payload and in `system/init`, emitted the full
+`stream-json` stream with `--include-hook-events`, and delivered
+`UserPromptSubmit` and `SessionEnd` to an HTTP hook — all while the model turn
+failed with `authentication_failed`. Authentication gates the API call, not the
+CLI's own machinery. `docs/CLAUDE_RUNTIME_VALIDATION.md` §5 and §11 have the
+detail; the one thing still unmeasured on WSL is the turn itself.
 
 WSL 1 is documented as unsupported; WSL 2 only. Git for Windows is optional but
 its absence removes the Bash tool on Windows, which changes hook `shell`
@@ -509,7 +518,7 @@ row grounded in §3 and §11:
 | `PermissionRequest` + decision output | `session.permission_answered` | Verified, controlled pair |
 | `Stop` | `session.turn_completed` | Verified |
 | `system/init` on the stream | session identity binding | Verified |
-| `result` message on the stream | `session.turn_completed` | Verified |
+| `result` message on the stream | `session.turn_completed` **only if `is_error` is false** | Verified — see §11 |
 | `StopFailure` | `session.failed` | **Not observed** |
 | `SessionEnd` | `session.ended` | Verified |
 | *process exited* | **not** `session.completed` | See §11 |
@@ -547,6 +556,14 @@ Permission and waiting must be distinguished by reading that field, not by
 treating `Notification` as one signal. A permission request arrives *both* as a
 `Notification` with `permission_prompt` and as a `PermissionRequest` hook; the
 latter is the more useful of the two because it is the one that can be answered.
+
+**`result.subtype` does not mean the turn succeeded.** Phase 7.3B-0 found a run
+that failed authentication and still reported `"subtype":"success"`, with the
+failure carried in `is_error: true` and `terminal_reason: "api_error"`. A
+completion check keyed on `subtype` would record a broken account as a finished
+turn. Read `is_error`; read `terminal_reason` for why; treat `subtype` as a
+category, not a verdict. This qualifies every row of §10's table that mentions
+the `result` message.
 
 **Process exit is not task completion.** Stated in §10's table and repeated here
 because it is the most common way this class of integration goes wrong. `Stop`
@@ -597,10 +614,14 @@ failure.
 Not started, not stubbed, nothing in the current build anticipates it. This is
 what 7.3B would do, in the order that retires risk fastest.
 
-**1. Close the platform gap first.** Re-run the core hook experiment on pure
-Linux and on a signed-in WSL, since those are the deployment targets and they are
-the thinnest measurements in this document (§6, §7). Everything below is worth
-less if the mechanism behaves differently there.
+**1. Close the platform gap first — partly done.** Phase 7.3B-0 verified the
+mechanism on Windows and on WSL, and found that hooks, settings, session id and
+the stream all work without authentication. What is still missing is the model
+turn on WSL and the entire pure-Linux column, both blocked on interactive
+authentication rather than on anything technical. Finish those before building on
+top of them; `docs/CLAUDE_RUNTIME_VALIDATION.md` §10 says exactly what would
+close each. Everything below is worth less if the mechanism behaves differently
+on the deployment target than it does on the two hosts measured so far.
 
 **2. `internal/claudeadapter`.** A package following the project's existing
 shape — model, repository, service, errors — that receives Claude events and
@@ -653,3 +674,39 @@ needs, and a runbook for the failure modes in §11.
 user's behalf (the adapter observes; deciding is a later phase with its own
 threat model), any UI, any dashboard, and any change to the Runtime Layer's
 process, pane, or output handling.
+
+## 13. Environment Compatibility
+
+Phase 7.3B-0 measured the mechanism in §2–§3 against three environments rather
+than the one it was discovered on. The full record, method, and evidence are in
+`docs/CLAUDE_RUNTIME_VALIDATION.md`; this is the conclusion.
+
+| Environment | Version | State |
+|---|---|---|
+| Windows | 2.1.278 | **Verified** — full turn, every capability exercised |
+| WSL (Ubuntu 24.04, native `linux-x64`) | 2.1.274 | **Verified for hooks, settings, session id and the stream; the model turn not verified** — not logged in |
+| Pure Linux (`128.1.128.21`) | — | **Not verified** — the host requires interactive authentication |
+
+The design in §10 survives contact with all three, and one finding sharpens it:
+**hooks fire without authentication.** On WSL, with no credentials at all, the
+`SessionStart` command hook executed and its output was captured, and HTTP hooks
+for `UserPromptSubmit` and `SessionEnd` were delivered, while the turn failed
+with `authentication_failed`. An adapter built on the §10 shape therefore
+observes a session starting, a prompt being submitted, and a session ending even
+when the account behind it is broken — which is precisely the situation where
+someone needs to be told something rather than left with a silent pane.
+
+Two constraints from the validation are carried into §12's plan. `SessionStart`
+does not accept an HTTP handler, so the hook configuration is not uniform and
+needs a `command` handler for that one event; and hook output is copied verbatim
+into `system/hook_response` on the stream, so the redaction rule in §8 applies to
+the stream as well as to the endpoint, and hooks AgentMux writes should print
+nothing they would not put in a log.
+
+The Linux column is the one gap, and it is a gap in *access*, not in evidence:
+the host was reachable and its SSH authentication is interactive by design. An
+interactive session or an authorized key closes it in one pass of the same
+experiments. Nothing observed on Windows or WSL suggests Linux will differ —
+WSL runs a native Linux kernel and a native Linux binary, and behaved identically
+to Windows on every shared check — but that is an expectation, and this document
+does not promote expectations to results.

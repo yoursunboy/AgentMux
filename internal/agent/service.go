@@ -26,15 +26,18 @@ import (
 //	create the attempt      the record exists before the thing it records
 //	attach the receiver     the endpoint has to be listening before Claude is told where it is
 //	write the settings      the document names the endpoint, so the endpoint comes first
+//	bind                    the attempt is attached to its runtime, and RUNNING
 //	launch                  the command line names both the id and the document
-//	bind                    the attempt is attached to a runtime that is now running
 //
-// The two that are easy to get wrong are the middle ones. The settings document
-// names the adapter's port, so an adapter started after it would produce a
-// document pointing at nothing - and because an undelivered hook is *silent*,
-// that failure looks exactly like an agent that had nothing to say. And the
-// session id has to be chosen before the process starts, because once it is
-// running its id is a fact rather than a decision.
+// Three of those are easy to get wrong and each one has cost something already.
+// The settings document names the adapter's port, so an adapter started after it
+// would produce a document pointing at nothing - and because an undelivered hook
+// is *silent*, that failure looks exactly like an agent that had nothing to say.
+// The session id has to be chosen before the process starts, because once it is
+// running its id is a fact rather than a decision. And the bind has to happen
+// before the launch: Claude's first hook fires while the launch is still waiting
+// for its process, so a launch that came first would put an event into the log
+// naming a runtime that nothing had yet said belonged to the attempt.
 //
 // # Undoing
 //
@@ -312,18 +315,20 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 	}
 	u.wroteSettings = true
 
-	// 7. The launch, carrying the id and the document.
-	status, err := s.runtimes.StartAgent(ctx, projectID, session.AgentLaunch{
-		SessionID:    sessionID,
-		SettingsPath: settingsPath,
-	})
-	if err != nil {
-		u.run(ctx)
-		return Result{}, err
-	}
-	u.launched = true
-
-	// 8. The attempt, attached to the runtime that turned out to start.
+	// 7. The attempt, attached to the runtime and moved to RUNNING *before* the
+	// agent is launched.
+	//
+	// The order is the whole point of this step. `UpdateSessionStatus` is what
+	// writes the event that binds the runtime to the attempt, and Claude's first
+	// hook fires while the launch below is still waiting for its process - so a
+	// launch that came first would let `agent.started` reach the event log
+	// before anything said which attempt the runtime belonged to. Every
+	// projection of that event would then have nowhere to put it.
+	//
+	// The cost is that an attempt reads RUNNING for the moment between here and
+	// the launch returning, which is a few hundred milliseconds of a state that
+	// is about to be true. The alternative was a first event nobody could
+	// attribute, permanently.
 	if attempt != nil {
 		if attempt, err = s.sessions.AttachSessionRuntime(ctx, attempt.ID, runtimeID); err != nil {
 			u.run(ctx)
@@ -334,6 +339,17 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 			return Result{}, err
 		}
 	}
+
+	// 8. The launch, carrying the id and the document.
+	status, err := s.runtimes.StartAgent(ctx, projectID, session.AgentLaunch{
+		SessionID:    sessionID,
+		SettingsPath: settingsPath,
+	})
+	if err != nil {
+		u.run(ctx)
+		return Result{}, err
+	}
+	u.launched = true
 
 	run := &Run{
 		ProjectID:      projectID,

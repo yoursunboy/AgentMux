@@ -144,8 +144,9 @@ func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 	tables := tableNames(t, store)
 
 	want := []string{
-		"agent_events", "agent_sessions", "agent_states", "project_runtime",
-		"projects", "schema_migrations", "settings", "tasks",
+		"agent_actions", "agent_attention", "agent_events", "agent_sessions",
+		"agent_states", "project_runtime", "projects", "schema_migrations",
+		"settings", "tasks",
 	}
 	if strings.Join(tables, ",") != strings.Join(want, ",") {
 		t.Errorf("tables = %v, want %v", tables, want)
@@ -235,8 +236,7 @@ func TestMigrationFilesAreWellFormed(t *testing.T) {
 	}
 }
 
-// TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt is §二十 of the phase
-// that added agent_states.
+// TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt covers the projections.
 //
 // The earlier upgrade test brings a database to Phase 7.1, when only projects,
 // runtime records and events existed. This one brings a database to the phase
@@ -261,7 +261,9 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, schemaMigrationsTable); err != nil {
 		t.Fatalf("creating schema_migrations failed: %v", err)
 	}
-	target := latestVersion(t) - 1
+	// Two versions back, so that the upgrade under test is the pair this phase
+	// added rather than one of them.
+	target := latestVersion(t) - 2
 	for _, m := range all {
 		if m.Version > target {
 			break
@@ -321,8 +323,14 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
-	if len(result.Applied) != 1 || !strings.HasPrefix(result.Applied[0], "0006_") {
-		t.Fatalf("Migrate applied %v; want exactly the agent state migration", result.Applied)
+	want := []string{"0007_agent_attention", "0008_agent_actions"}
+	if len(result.Applied) != len(want) {
+		t.Fatalf("Migrate applied %v; want %v", result.Applied, want)
+	}
+	for i := range want {
+		if !strings.HasPrefix(result.Applied[i], want[i]) {
+			t.Errorf("Migrate applied %q; want %q", result.Applied[i], want[i])
+		}
 	}
 
 	// Every row is still there, unchanged.
@@ -342,14 +350,28 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 		t.Errorf("the event did not survive the upgrade: %v", err)
 	}
 
-	// And the new table is empty rather than populated with a guess. A
+	// And the new tables are empty rather than populated with a guess. A
 	// migration that seeded rows would be a migration inventing history.
-	count, err := store.AgentStates().Count(ctx)
+	states, err := store.AgentStates().Count(ctx)
 	if err != nil {
-		t.Fatalf("counting the new table failed: %v", err)
+		t.Fatalf("counting the state table failed: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("the upgrade left %d agent state(s); a schema change does not invent history", count)
+	if states != 0 {
+		t.Errorf("the upgrade left %d agent state(s); a schema change does not invent history", states)
+	}
+	attentionRows, err := store.Attention().CountAttention(ctx)
+	if err != nil {
+		t.Fatalf("counting the attention table failed: %v", err)
+	}
+	if attentionRows != 0 {
+		t.Errorf("the upgrade left %d attention row(s); a schema change does not invent history", attentionRows)
+	}
+	actions, err := store.Attention().CountActions(ctx)
+	if err != nil {
+		t.Fatalf("counting the action table failed: %v", err)
+	}
+	if actions != 0 {
+		t.Errorf("the upgrade left %d action(s); a schema change does not invent history", actions)
 	}
 }
 

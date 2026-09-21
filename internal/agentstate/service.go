@@ -303,6 +303,25 @@ func (s *Service) State(ctx context.Context, agentSessionID string) (AgentState,
 	return s.repo.Get(ctx, id)
 }
 
+// StateByRuntime returns the state of the attempt currently bound to a runtime.
+//
+// It is how a package that holds an event naming only a runtime - an `agent.*`
+// event does - finds the attempt it is about. internal/attention is the caller,
+// and it reads this rather than repeating the binding rule: the log establishes
+// the binding once, in one projection, and a second place that worked it out
+// would be a second place for it to be wrong.
+//
+// It returns an error carrying CodeNotFound when no attempt is bound, which is
+// what an agent started without a task produces.
+func (s *Service) StateByRuntime(ctx context.Context, runtimeID string) (AgentState, error) {
+	id := strings.TrimSpace(runtimeID)
+	if id == "" {
+		return AgentState{}, newError(CodeInvalidState,
+			"an agent state must be asked for by runtime").withDetail("field", "runtimeId")
+	}
+	return s.repo.ByRuntime(ctx, id)
+}
+
 // ListByProject returns a project's agent states, most recently updated first.
 func (s *Service) ListByProject(ctx context.Context, projectID string, limit int) ([]AgentState, error) {
 	id := strings.TrimSpace(projectID)

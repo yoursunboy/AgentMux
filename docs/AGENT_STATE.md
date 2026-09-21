@@ -318,3 +318,9 @@ created and never started, and for an agent started without a task.
 There is no write. §15 forbids one, and the reason is not symmetry: a client that
 could set a status would make the state a second place the truth lives, and the
 two would disagree the moment the next event arrived.
+
+A state says what an agent is doing. It does not say whether anybody needs to
+care about it, and the endpoints that answer that are a layer above this one:
+`GET /api/sessions/{id}/attention`, `GET /api/projects/{id}/attention` and
+`GET /api/projects/{id}/actions`. `docs/AGENT_ATTENTION.md` is that layer, and
+§2 of it is the difference between the two questions.

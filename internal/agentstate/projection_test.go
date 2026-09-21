@@ -714,7 +714,7 @@ func TestTheEventServiceIsTheOnlyPathIntoState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("event.NewService returned an error: %v", err)
 	}
-	eventLog.SetProjector(h.service)
+	eventLog.SetProjectors(h.service)
 
 	// A project row, because an event names a project and the store checks it.
 	if err := h.store.Projects().Create(ctx, &project.Project{
@@ -770,7 +770,7 @@ func TestAnEventTheLogRefusesWritesNoState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("event.NewService returned an error: %v", err)
 	}
-	eventLog.SetProjector(h.service)
+	eventLog.SetProjectors(h.service)
 
 	if err := h.store.Projects().Create(ctx, &project.Project{
 		ID: testProject, Name: "checkout", HostPath: "/tmp/checkout",

@@ -16,6 +16,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/agentstate"
+	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -67,6 +68,9 @@ type harness struct {
 	// projection is the coordinator the server holds, kept here so a test can
 	// read a state without going through the API that is being tested.
 	projection *agentstate.Service
+
+	// attentionProjection is the same for attention and the action queue.
+	attentionProjection *attention.Service
 }
 
 // harnessOptions describes the environment a test wants its server to believe
@@ -151,6 +155,10 @@ type harnessOptions struct {
 	// state routes with an explanation rather than with a state it never
 	// computed.
 	withoutAgentStates bool
+
+	// withoutAttention is the same branch once more, for the attention
+	// projection.
+	withoutAttention bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -348,7 +356,20 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if err != nil {
 		t.Fatalf("agentstate.NewService returned an error: %v", err)
 	}
-	events.SetProjector(projection)
+	// The attention projection, downstream of the state one and installed as
+	// the second projector - which is the order a running server installs them
+	// in, because attention reads the state.
+	attentionProjection, err := attention.NewService(attention.Options{
+		Repository: store.Attention(),
+		States:     projection,
+		Events:     events,
+		Projects:   service,
+		Logger:     discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("attention.NewService returned an error: %v", err)
+	}
+	events.SetProjectors(projection, attentionProjection)
 
 	// The adapter manager and the coordinator, both real. The adapter binds a
 	// real loopback port - an injected listener would make every hook-delivery
@@ -386,6 +407,10 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if o.withoutAgentStates {
 		servedStates = nil
 	}
+	var servedAttention *attention.Service = attentionProjection
+	if o.withoutAttention {
+		servedAttention = nil
+	}
 
 	server, err := New(Options{
 		Config:      cfg,
@@ -397,6 +422,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Tasks:       servedTasks,
 		Agents:      servedAgents,
 		AgentStates: servedStates,
+		Attention:   servedAttention,
 		Terminal:    hub,
 		Logger:      discardLogger(),
 		StartedAt:   time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
@@ -408,18 +434,19 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		t.Fatalf("httpapi.New returned an error: %v", err)
 	}
 	return &harness{
-		t:          t,
-		server:     server,
-		root:       root,
-		dataDir:    dataDir,
-		store:      store,
-		backend:    backend,
-		runtime:    manager,
-		events:     events,
-		tasks:      tasks,
-		agents:     coordinator,
-		adapters:   cliAdapters,
-		projection: projection,
+		t:                   t,
+		server:              server,
+		root:                root,
+		dataDir:             dataDir,
+		store:               store,
+		backend:             backend,
+		runtime:             manager,
+		events:              events,
+		tasks:               tasks,
+		agents:              coordinator,
+		adapters:            cliAdapters,
+		projection:          projection,
+		attentionProjection: attentionProjection,
 	}
 }
 

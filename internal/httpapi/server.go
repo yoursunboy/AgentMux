@@ -25,6 +25,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/agentstate"
+	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -62,6 +63,7 @@ type Server struct {
 	agent       AgentResolver
 	agents      *agent.Service
 	agentStates *agentstate.Service
+	attention   *attention.Service
 	terminal    *terminal.Hub
 	log         *slog.Logger
 
@@ -132,6 +134,14 @@ type Options struct {
 	// that was never computed.
 	AgentStates *agentstate.Service
 
+	// Attention is the projection of the log into whether anybody needs to look
+	// at an agent and what they might do about it. It is read by the three
+	// attention routes and written by nothing in this package.
+	//
+	// It is optional like the others, and a server without it explains itself on
+	// those routes rather than answering with a level it never derived.
+	Attention *attention.Service
+
 	// Terminal carries browser sockets to the runtime. It is optional only so
 	// that tests of the REST surface do not have to build one; a server
 	// without it answers the real-time endpoint with an explanation rather
@@ -178,6 +188,7 @@ func New(o Options) (*Server, error) {
 		agent:       o.Agent,
 		agents:      o.Agents,
 		agentStates: o.AgentStates,
+		attention:   o.Attention,
 		terminal:    o.Terminal,
 		log:         o.Logger,
 		startedAt:   o.StartedAt,
@@ -230,6 +241,14 @@ func (s *Server) routes() http.Handler {
 	// the timelines would be one per panel.
 	mux.HandleFunc("GET /api/projects/{id}/agent-states", s.handleListAgentStates)
 
+	// Whether anybody needs to look, and what they might do about it. Three
+	// reads and no writes: the actions these endpoints report are things a
+	// person looks at, and the thing they do about them is at the terminal.
+	// There is deliberately no endpoint that answers one - see
+	// internal/httpapi/attention.go.
+	mux.HandleFunc("GET /api/projects/{id}/attention", s.handleListAttention)
+	mux.HandleFunc("GET /api/projects/{id}/actions", s.handleListActions)
+
 	// The runtime of one project. The operations are nested under the runtime
 	// because that is the resource they act on: the session is what is started,
 	// stopped, or removed, and a project is not.
@@ -265,6 +284,10 @@ func (s *Server) routes() http.Handler {
 	// the events add up to, and an endpoint that could set one would be a
 	// second place the truth lives.
 	mux.HandleFunc("GET /api/sessions/{id}/state", s.handleGetAgentState)
+
+	// The same question asked about a person rather than about the agent: the
+	// state says what it is doing, and this says whether that needs anybody.
+	mux.HandleFunc("GET /api/sessions/{id}/attention", s.handleGetAttention)
 
 	// The work somebody wants done, and the attempts made at it.
 	//

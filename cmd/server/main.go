@@ -30,6 +30,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/agentstate"
+	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -245,19 +246,45 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	eventLog.SetProjector(stateService)
+	// Whether anybody needs to look, and what they might do about it.
+	//
+	// It is built after the state projection because it reads it: an `agent.*`
+	// event names a runtime and no attempt, and the state is what says which
+	// attempt a runtime belongs to. That is also why it is the second of the
+	// two projectors rather than the first.
+	attentionLog := logging.Component(logger, logging.ComponentAttention)
+	attentionService, err := attention.NewService(attention.Options{
+		Repository: store.Attention(),
+		States:     stateService,
+		Events:     eventLog,
+		Projects:   projectService,
+		Logger:     attentionLog,
+	})
+	if err != nil {
+		return err
+	}
+
+	// The projectors, in the order they run, and the order is a dependency:
+	// attention reads the state the first one keeps. Neither projection knows
+	// the other exists; this line is the whole of what relates them.
+	eventLog.SetProjectors(stateService, attentionService)
 
 	// An empty projection over a log that has events in it is what a first run
-	// after this phase leaves behind, so it is recomputed once, here. A
-	// projection that already holds something is left alone: it is kept current
-	// as events are written, and rebuilding on every start would pay the whole
-	// history every time for nothing.
-	// The service reports what it did; this only reports what it could not do.
+	// after these phases leaves behind, so each is recomputed once, here, in
+	// dependency order - the state first, because attention is folded from it.
+	// A projection that already holds something is left alone: it is kept
+	// current as events are written, and rebuilding on every start would pay the
+	// whole history every time for nothing.
+	//
+	// The services report what they did; this only reports what they could not
+	// do. A projection that could not be rebuilt is not a reason to refuse to
+	// start: the event log is intact and is the record, and what is derived from
+	// it can be recomputed on the next start.
 	if _, _, err := stateService.RebuildIfNeeded(ctx); err != nil {
-		// A projection that could not be rebuilt is not a reason to refuse to
-		// start. The event log is intact and is the record; the state table is
-		// derived from it and can be recomputed on the next start.
 		stateLog.Error("could not rebuild the agent states", "error", err)
+	}
+	if _, _, err := attentionService.RebuildIfNeeded(ctx); err != nil {
+		attentionLog.Error("could not rebuild attention", "error", err)
 	}
 
 	// The task model. It reads the project store to check that the project a
@@ -398,6 +425,7 @@ func run(args []string) error {
 		Agent:       agents,
 		Agents:      agentService,
 		AgentStates: stateService,
+		Attention:   attentionService,
 		Terminal:    terminalHub,
 		Logger:      logging.Component(logger, logging.ComponentAPI),
 		WebDir:      webDir,

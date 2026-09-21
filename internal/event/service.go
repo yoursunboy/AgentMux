@@ -26,33 +26,40 @@ type Service struct {
 	newID func() (string, error)
 	log   *slog.Logger
 
-	// projectorMu guards projector, and is the only lock this service has.
+	// projectorMu guards projectors, and is the only lock this service has.
 	//
-	// It is here because the projector is installed after the service is built:
-	// the projection is rebuilt from the event log, so the two depend on each
-	// other and one has to be constructed first. "The setter is called once at
-	// start-up" is a claim about the caller, and a lock is what makes such a
+	// It is here because the projectors are installed after the service is
+	// built: a projection is rebuilt from the event log, so the two depend on
+	// each other and one has to be constructed first. "The setter is called once
+	// at start-up" is a claim about the caller, and a lock is what makes such a
 	// claim unnecessary rather than merely believed.
 	projectorMu sync.RWMutex
-	projector   Projector
+	projectors  []Projector
 }
 
-// SetProjector installs the projector that is told about each stored event.
+// SetProjectors installs the projectors that are told about each stored event.
 //
-// It is called once, at start-up, by whatever composes the two - see the note
-// on the field. A nil projector is a valid argument and means nothing is
-// derived, which is where every server starts.
-func (s *Service) SetProjector(p Projector) {
+// They are called in the order they are given, and the order is a real
+// dependency rather than a preference: `internal/attention` reads the state
+// `internal/agentstate` projects, so the state has to be current before the
+// attention is derived from it. The caller that composes them is the only place
+// that ordering is expressed, which is where it belongs - neither projection
+// knows the other exists.
+//
+// It is called once, at start-up. No projectors is a valid argument and means
+// nothing is derived, which is where every server starts and where a test that
+// is not about a projection stays.
+func (s *Service) SetProjectors(ps ...Projector) {
 	s.projectorMu.Lock()
 	defer s.projectorMu.Unlock()
-	s.projector = p
+	s.projectors = append([]Projector(nil), ps...)
 }
 
-// Projector returns the installed projector, or nil.
-func (s *Service) projectorFor() Projector {
+// projectorsNow returns the installed projectors.
+func (s *Service) projectorsNow() []Projector {
 	s.projectorMu.RLock()
 	defer s.projectorMu.RUnlock()
-	return s.projector
+	return s.projectors
 }
 
 // Projector is told about an event after it has been stored.
@@ -87,11 +94,12 @@ type Options struct {
 	// Logger receives one record per stored event. Nil means slog.Default.
 	Logger *slog.Logger
 
-	// Projector is told about each stored event, so that whatever is derived
-	// from the log stays current. Nil means nothing is derived, which is a
-	// legitimate configuration - an event log on its own is complete, and every
-	// projection of it can be computed later from what is in it.
-	Projector Projector
+	// Projectors are told about each stored event, in order, so that whatever
+	// is derived from the log stays current. Empty means nothing is derived,
+	// which is a legitimate configuration - an event log on its own is
+	// complete, and every projection of it can be computed later from what is
+	// in it.
+	Projectors []Projector
 }
 
 // NewService builds a Service.
@@ -100,11 +108,11 @@ func NewService(o Options) (*Service, error) {
 		return nil, errors.New("event: Repository is required")
 	}
 	s := &Service{
-		repo:      o.Repository,
-		now:       o.Now,
-		newID:     o.NewID,
-		log:       o.Logger,
-		projector: o.Projector,
+		repo:       o.Repository,
+		now:        o.Now,
+		newID:      o.NewID,
+		log:        o.Logger,
+		projectors: append([]Projector(nil), o.Projectors...),
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -208,8 +216,11 @@ func (s *Service) CreateEvent(
 	// This is also what keeps the log the single entry point to derived state.
 	// An observer that wrote a state directly would be an observer whose states
 	// could not be rebuilt, because the log would not be what produced them.
-	if projector := s.projectorFor(); projector != nil {
+	for _, projector := range s.projectorsNow() {
 		if err := projector.Project(ctx, ev); err != nil {
+			// One projection failing does not stop the next. They are
+			// independent readings of the same fact, and a reading that could
+			// not be computed does not make the others wrong.
 			s.log.Warn("could not project an event into derived state",
 				"eventId", ev.ID, "type", ev.Type, "error", err)
 		}

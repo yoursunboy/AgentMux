@@ -1143,6 +1143,103 @@ project that exists and has nothing running.
 the projection, the status vocabulary and which parts of it are reachable, and how the whole table is
 rebuilt from the log.
 
+## Agent attention and actions
+
+What needs a person, as opposed to what is happening. A state says what an agent is doing; a level
+says whether anybody needs to care; an action says what they might do about it. Two agents can both be
+working and only one of them be blocked — which is the difference these endpoints exist to report.
+
+**There is no write, and there is deliberately no way to answer an action.** A `PERMISSION_REQUEST`
+action records that Claude asked for something; it does not allow it, deny it, or influence it in any
+way. An endpoint that answered one would make AgentMux a participant in a Claude session rather than
+an observer of one, and that decision belongs to a phase with its own threat model.
+`docs/AGENT_ATTENTION.md` §6 is the reasoning.
+
+### GET /api/sessions/{id}/attention
+
+```json
+{
+  "agentSessionId": "sess_9a27…",
+  "projectId": "p_6f1a…",
+  "level": "ACTION_REQUIRED",
+  "reason": "permission requested",
+  "updatedAt": "2026-09-21T09:00:12Z"
+}
+```
+
+The levels are `NONE`, `ACTION_REQUIRED`, `WARNING` and `INFO` — about a person, not about the agent.
+`ACTION_REQUIRED` means nothing progresses without somebody; `WARNING` means something went wrong and
+can be read later; `INFO` is worth knowing; `NONE` is nothing to see.
+
+`reason` is a short fixed phrase from the server's own vocabulary, never a quotation from a payload.
+It never names a tool and never includes anything a person wrote.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The log has never mentioned this attempt | 404 | `agent_attention_not_found` |
+| The attempt id is empty | 400 | `agent_attention_invalid` |
+| The server was built without the projection | 503 | `internal_error` |
+
+Every attempt gets a level from its own creation event, so a 404 means the attempt is not one this
+server knows rather than that nothing has happened to it yet.
+
+### GET /api/projects/{id}/attention
+
+```json
+{
+  "attention": [
+    {
+      "agentSessionId": "sess_9a27…",
+      "projectId": "p_6f1a…",
+      "level": "WARNING",
+      "reason": "attempt failed",
+      "updatedAt": "2026-09-21T09:00:12Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+Most recently updated first. `limit` behaves as it does elsewhere in this API.
+
+### GET /api/projects/{id}/actions
+
+```json
+{
+  "actions": [
+    {
+      "id": "act_3c9b…",
+      "agentSessionId": "sess_9a27…",
+      "projectId": "p_6f1a…",
+      "type": "PERMISSION_REQUEST",
+      "status": "PENDING",
+      "reason": "permission requested",
+      "createdAt": "2026-09-21T09:00:12Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+**Pending first, then newest first.** A list ordered only by time would put a settled action above one
+that is still waiting, and what a reader of a queue is looking for is what is still waiting.
+
+The types are `PERMISSION_REQUEST`, `VIEW_FAILURE` and `VIEW_COMPLETION` — every one of them something
+a person *looks at*. The statuses are `PENDING`, `RESOLVED` and `EXPIRED`; `RESOLVED` is reached when
+a later event shows the attempt moved on, and `EXPIRED` is in the vocabulary with nothing producing it.
+
+`resolvedAt` is absent while an action is pending and carries the time of the event that resolved it
+afterwards.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The project does not exist | 404 | `project_not_found` |
+| `limit` is not a whole number, or is below 1 | 400 | `invalid_request` |
+| The server was built without the projection | 503 | `internal_error` |
+
+`docs/AGENT_ATTENTION.md` is the long form: the four readings of one log, the action lifecycle, why an
+action's id is derived from its event, and why the loop closes at the terminal rather than here.
+
 ## GET /api/ws
 
 **The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per
@@ -1277,7 +1374,8 @@ Since Phase 7.3C-1 what that adapter reports is also readable as a **current
 state** rather than only as a history: `GET /api/sessions/{id}/state` and
 `GET /api/projects/{id}/agent-states` answer from a projection of the log, and
 `docs/AGENT_STATE.md` is that layer. The two timeline endpoints remain the way to
-read what happened; the two state endpoints are the way to read what is true now.
+read what happened; the two state endpoints are the way to read what is true now, and the attention
+and action endpoints are the way to read what needs a person.
 
 What is still not implemented, and is not stubbed:
 

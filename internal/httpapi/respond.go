@@ -8,6 +8,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/agentstate"
+	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -106,11 +107,11 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Six packages define codes - the project model, the runtime, the event log,
-// the task model, the agent coordinator and the state projection - and all are
-// passed through to the client unchanged, so a client switches on one
-// vocabulary across the whole API. The HTTP layer adds only the codes for
-// failures it produces itself.
+// Seven packages define codes - the project model, the runtime, the event log,
+// the task model, the agent coordinator, the state projection and the attention
+// projection - and all are passed through to the client unchanged, so a client
+// switches on one vocabulary across the whole API. The HTTP layer adds only the
+// codes for failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
@@ -127,7 +128,10 @@ func codeOf(err error) string {
 	if code := agent.CodeOf(err); code != "" {
 		return code
 	}
-	return agentstate.CodeOf(err)
+	if code := agentstate.CodeOf(err); code != "" {
+		return code
+	}
+	return attention.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -155,6 +159,10 @@ func detailsOf(err error) map[string]any {
 	var stateErr *agentstate.Error
 	if errors.As(err, &stateErr) {
 		return stateErr.Details
+	}
+	var attentionErr *attention.Error
+	if errors.As(err, &attentionErr) {
+		return attentionErr.Details
 	}
 	return nil
 }
@@ -184,6 +192,10 @@ func messageFor(err error, code string) string {
 	var stateErr *agentstate.Error
 	if errors.As(err, &stateErr) && stateErr.Message != "" {
 		return stateErr.Message
+	}
+	var attentionErr *attention.Error
+	if errors.As(err, &attentionErr) && attentionErr.Message != "" {
+		return attentionErr.Message
 	}
 	switch code {
 	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure,
@@ -243,7 +255,10 @@ func statusForCode(code string) int {
 		agent.CodeTaskMismatch,
 		// A state asked for without naming what it is about, or listed without
 		// a project. Both are the caller's input.
-		agentstate.CodeInvalidState:
+		agentstate.CodeInvalidState,
+		// An attention or an action asked for without naming what it is about.
+		attention.CodeInvalidAttention,
+		attention.CodeInvalidAction:
 		return http.StatusBadRequest
 
 	case project.CodePathNotFound,
@@ -265,7 +280,11 @@ func statusForCode(code string) int {
 		// An attempt nothing has observed, or a runtime no attempt is bound to.
 		// It is the ordinary answer rather than a failure: an attempt that was
 		// created and never started has no state because no event produced one.
-		agentstate.CodeNotFound:
+		agentstate.CodeNotFound,
+		// An attempt the log has never mentioned. Every attempt that exists gets
+		// a level from its own creation event, so this means the attempt is not
+		// one this server knows.
+		attention.CodeNotFound:
 		return http.StatusNotFound
 
 	case project.CodePathNotAccessible,
@@ -359,7 +378,10 @@ func statusForCode(code string) int {
 		// be folded into one. The second is the server failing to keep a derived
 		// reading current, which is its own problem and not the caller's.
 		agentstate.CodeStorageFailure,
-		agentstate.CodeProjectionFailed:
+		agentstate.CodeProjectionFailed,
+		// Attention or an action that could not be read, written, or folded.
+		attention.CodeStorageFailure,
+		attention.CodeProjectionFailed:
 		return http.StatusInternalServerError
 
 	default:

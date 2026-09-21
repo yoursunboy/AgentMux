@@ -23,11 +23,12 @@ POST /api/projects/{id}/runtime/agent/start   {"taskId": "task_…"}   (optional
   5. receiver         adapters.Attach              → a bound port and a nonce path
   6. settings         adapters.HookSettings        → the document naming that port
                       settings.Write               → a file under the data directory
-  7. launch           claude --session-id <uuid> --settings <path>
-  8. bind             tasks.AttachSessionRuntime, then → RUNNING
+  7. bind             tasks.AttachSessionRuntime, then → RUNNING
+  8. launch           claude --session-id <uuid> --settings <path>
 ```
 
-Two of those steps are ordered the way they are for reasons worth stating.
+Three of those steps are ordered the way they are for reasons worth stating, and
+each one has cost something already.
 
 **The receiver comes before the document.** The settings document names the
 adapter's port. A document written first would name a port nothing is listening
@@ -40,6 +41,16 @@ which is the exact failure this ordering removes.
 be a fact read back from the CLI rather than a decision, and there would be a
 window in which a running session's hooks named a session AgentMux had never
 heard of. Choosing first is what makes every payload self-identifying.
+
+**The bind comes before the launch.** `UpdateSessionStatus` is what writes the
+event that binds a runtime to an attempt, and Claude's first hook fires while the
+launch is still waiting for its process - so a launch that came first would let
+`agent.started` reach the event log before anything said which attempt the
+runtime belonged to. Every projection of that event would then have nowhere to
+put it. Phase 7.3B-2 had these two the other way round; Phase 7.3C-2 swapped them
+when the state projection made the consequence visible. The cost is that an
+attempt reads `RUNNING` for the few hundred milliseconds between the bind and the
+launch returning, which is a state that is about to be true anyway.
 
 ### Adoption
 

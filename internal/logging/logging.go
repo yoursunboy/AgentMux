@@ -69,9 +69,15 @@ const (
 	// it says what the log added up to, which is a different question and a
 	// different component.
 	ComponentAgentState = "agentstate"
-	ComponentTerminal   = "terminal"
-	ComponentAPI        = "httpapi"
-	ComponentServer     = "server"
+	// ComponentAttention is the projection of the event log into whether
+	// anybody needs to look at an agent. It is a component of its own rather
+	// than part of agentstate, because a record about attention is a record
+	// about the relationship between an agent and a person, not about the
+	// agent.
+	ComponentAttention = "attention"
+	ComponentTerminal  = "terminal"
+	ComponentAPI       = "httpapi"
+	ComponentServer    = "server"
 )
 
 // Placeholder is written in place of any value that must not reach a log.

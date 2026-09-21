@@ -138,6 +138,10 @@ func (s *Store) Tasks() *TaskStore { return &TaskStore{db: s.db} }
 // outside the projection writes to it.
 func (s *Store) AgentStates() *AgentStateStore { return &AgentStateStore{db: s.db} }
 
+// Attention returns the projected attention and action queue. Both are derived
+// from agent_events and can be rebuilt from them at any time.
+func (s *Store) Attention() *AttentionStore { return &AttentionStore{db: s.db} }
+
 // dataSourceName builds the driver connection string.
 //
 // Pragmas are passed as DSN parameters rather than executed after opening, so

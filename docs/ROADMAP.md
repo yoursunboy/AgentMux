@@ -22,6 +22,7 @@ As of version 0.6.5:
 | Phase 7.3B-1 — ClaudeAdapter foundation | **Done** | The adapter itself: Claude's hooks and its stream-json translated into `agent.*` events and written through the existing event service. Seven event types, one write path, no database, no API, no UI. Validated end to end against Windows Claude Code 2.1.278. See `docs/CLAUDE_ADAPTER.md`. |
 | Phase 7.3B-2 — Runtime binding | **Done** | `internal/agent` connects the adapter to the product: one call starts the runtime if needed, dictates Claude's session id, attaches a hook receiver, writes the settings document, launches, and binds the attempt. Fixed the silently-refused `session.created` / `session.status_changed` payloads on the way. No schema change, no UI. See `docs/AGENT_RUNTIME_BINDING.md`. |
 | Phase 7.3C-1 — Agent state projection | **Done** | `internal/agentstate` folds `agent_events` into what is true about an agent now, stored in a new `agent_states` table and read by two endpoints. Driven from inside the event service, so the projection can be deleted and rebuilt from the log at any moment. No UI, no write endpoint. See `docs/AGENT_STATE.md`. |
+| Phase 7.3C-2 — Attention and action queue | **Done** | `internal/attention` answers "what needs me": a level per attempt and a queue of pending actions, both projected from the same log, with three read endpoints and no way to answer an action. See `docs/AGENT_ATTENTION.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -676,6 +677,12 @@ driven from inside the event service so there is no path to a state that skips
 the log. Two endpoints read it and nothing writes it —
 `GET /api/sessions/{id}/state` and `GET /api/projects/{id}/agent-states`.
 `docs/AGENT_STATE.md` is the long form.
+
+Sub-phase **7.3C-2, attention and actions, is done**. The same log now answers
+"does anybody need to care", as a level per attempt and a queue of pending
+actions, with three read endpoints and deliberately no way to answer one — an
+action records that Claude asked for something and decides nothing.
+`docs/AGENT_ATTENTION.md` is the long form.
 
 **What remains in 7.3C is reach, not mechanism.** Three of the seven statuses
 cannot occur as things stand: `WAITING_INPUT` because no event produces it, and

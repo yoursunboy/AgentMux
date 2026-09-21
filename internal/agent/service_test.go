@@ -78,6 +78,12 @@ type fakeRuntimes struct {
 	// failAgent, when set, makes StartAgent fail. It is how a test reaches
 	// "the runtime is up and the agent never appeared".
 	failAgent error
+
+	// launchProbe, when set, runs at the moment the runtime is asked to launch
+	// the agent. It is how a test sees the world as it stood *before* the
+	// command was typed - which is the only place the ordering of the chain is
+	// observable.
+	launchProbe func()
 }
 
 // setState puts a project's runtime into a state before anything runs.
@@ -159,6 +165,14 @@ func (f *fakeRuntimes) Stop(_ context.Context, projectID string) (*session.Runti
 }
 
 func (f *fakeRuntimes) StartAgent(_ context.Context, projectID string, launch session.AgentLaunch) (session.AgentStatus, error) {
+	f.mu.Lock()
+	probe := f.launchProbe
+	f.mu.Unlock()
+
+	if probe != nil {
+		probe()
+	}
+
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.failAgent != nil {
@@ -1205,4 +1219,44 @@ func (fakeSessions) AttachSessionRuntime(context.Context, string, string) (*task
 }
 func (fakeSessions) UpdateSessionStatus(context.Context, string, string) (*task.AgentSession, error) {
 	return nil, nil
+}
+
+// TestTheAttemptIsBoundBeforeTheAgentIsLaunched is the ordering the projection
+// depends on.
+//
+// Claude's first hook fires while the launch is still waiting for its process,
+// so an event naming the runtime can reach the log before the launch returns.
+// If the bind came after it, that event would name a runtime nothing had yet
+// said belonged to the attempt - and every projection of it would have nowhere
+// to put it. The test looks at the world from inside the launch, which is the
+// only place the difference is visible.
+func TestTheAttemptIsBoundBeforeTheAgentIsLaunched(t *testing.T) {
+	h := newHarness(t, Options{})
+	p := h.registerProject("checkout-service")
+	tk := h.createTask(p.ID, "Fix the viewer")
+
+	var atLaunch *task.AgentSession
+	h.runtimes.launchProbe = func() {
+		attempts := h.sessionsOf(tk.ID)
+		if len(attempts) == 1 {
+			atLaunch = attempts[0]
+		}
+	}
+
+	if _, err := h.service.Start(context.Background(), startInput(p, tk)); err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+
+	if atLaunch == nil {
+		t.Fatal("the launch ran before the attempt existed at all")
+	}
+	if atLaunch.Status != task.StatusSessionRunning {
+		t.Errorf("the attempt was %s when the agent was launched; want RUNNING: "+
+			"the event that binds the runtime to the attempt has to be stored first",
+			atLaunch.Status)
+	}
+	if atLaunch.RuntimeID != project.SessionNameFor(p.ID) {
+		t.Errorf("the attempt was bound to %q when the agent was launched; want %q",
+			atLaunch.RuntimeID, project.SessionNameFor(p.ID))
+	}
 }

@@ -22,6 +22,7 @@ iPad / Phone / PC
 │ Agent Coordinator           │   internal/agent          — built in Phase 7.3B-2
 │ Event Log                   │   internal/event          — built in Phase 7.1
 │ Agent State                 │   internal/agentstate     — built in Phase 7.3C-1
+│ Attention & Actions         │   internal/attention      — built in Phase 7.3C-2
 │ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
@@ -76,6 +77,15 @@ the log — which is what lets the whole table be deleted and recomputed from `a
 moment. It decides nothing and changes nothing: a state is a reading, and nothing in the build reads
 one to make a decision. `docs/AGENT_STATE.md` §1 draws the line between an event and a state, §2 is
 the projection, and §6 is what it does not cover.
+
+The Attention and Action projection, added in Phase 7.3C-2 as `internal/attention`, is the fourth
+reading of the same log and answers a different question again: not what the agent is doing, but
+whether anybody needs to care. It runs after the state projection, which is a real dependency rather
+than a preference — an `agent.*` event names a runtime and no attempt, and the state is what says
+which attempt a runtime belongs to. It holds a level per attempt and a queue of pending actions, and
+**it answers nothing**: an action records that Claude asked for something, and there is no endpoint
+that decides it. `docs/AGENT_ATTENTION.md` §1 separates the layers, §3 is the action lifecycle, and
+§6 is why the loop closes at the terminal rather than here.
 
 ## 2. Project vs Collection
 

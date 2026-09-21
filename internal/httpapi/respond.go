@@ -9,6 +9,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/agent"
 	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/attention"
+	"github.com/kutonlagos/agentmux/internal/controller"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -107,11 +108,11 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Seven packages define codes - the project model, the runtime, the event log,
-// the task model, the agent coordinator, the state projection and the attention
-// projection - and all are passed through to the client unchanged, so a client
-// switches on one vocabulary across the whole API. The HTTP layer adds only the
-// codes for failures it produces itself.
+// Eight packages define codes - the project model, the runtime, the event log,
+// the task model, the agent coordinator, the state projection, the attention
+// projection and the controller aggregation - and all are passed through to the
+// client unchanged, so a client switches on one vocabulary across the whole API.
+// The HTTP layer adds only the codes for failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
@@ -131,7 +132,10 @@ func codeOf(err error) string {
 	if code := agentstate.CodeOf(err); code != "" {
 		return code
 	}
-	return attention.CodeOf(err)
+	if code := attention.CodeOf(err); code != "" {
+		return code
+	}
+	return controller.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -163,6 +167,10 @@ func detailsOf(err error) map[string]any {
 	var attentionErr *attention.Error
 	if errors.As(err, &attentionErr) {
 		return attentionErr.Details
+	}
+	var controllerErr *controller.Error
+	if errors.As(err, &controllerErr) {
+		return controllerErr.Details
 	}
 	return nil
 }
@@ -196,6 +204,10 @@ func messageFor(err error, code string) string {
 	var attentionErr *attention.Error
 	if errors.As(err, &attentionErr) && attentionErr.Message != "" {
 		return attentionErr.Message
+	}
+	var controllerErr *controller.Error
+	if errors.As(err, &controllerErr) && controllerErr.Message != "" {
+		return controllerErr.Message
 	}
 	switch code {
 	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure,
@@ -381,7 +393,11 @@ func statusForCode(code string) int {
 		agentstate.CodeProjectionFailed,
 		// Attention or an action that could not be read, written, or folded.
 		attention.CodeStorageFailure,
-		attention.CodeProjectionFailed:
+		attention.CodeProjectionFailed,
+		// A dashboard that could not list the projects it is about. Everything
+		// else in the aggregation degrades to an `available: false` section
+		// rather than reaching here - see internal/controller/service.go.
+		controller.CodeUnavailable:
 		return http.StatusInternalServerError
 
 	default:

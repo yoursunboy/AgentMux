@@ -322,6 +322,28 @@ func (s *Service) StateByRuntime(ctx context.Context, runtimeID string) (AgentSt
 	return s.repo.ByRuntime(ctx, id)
 }
 
+// StatesForProjects returns the most recent state of each of the given
+// projects, keyed by project id.
+//
+// It is what the controller dashboard reads: one call for every project on the
+// screen rather than one call each. A project that has no state is absent from
+// the map, which is the honest answer - there is no attempt to describe rather
+// than an attempt with nothing in it.
+func (s *Service) StatesForProjects(ctx context.Context, projectIDs []string) (map[string]AgentState, error) {
+	if len(projectIDs) == 0 {
+		return map[string]AgentState{}, nil
+	}
+	list, err := s.repo.NewestByProjects(ctx, projectIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]AgentState, len(list))
+	for _, state := range list {
+		out[state.ProjectID] = state
+	}
+	return out, nil
+}
+
 // ListByProject returns a project's agent states, most recently updated first.
 func (s *Service) ListByProject(ctx context.Context, projectID string, limit int) ([]AgentState, error) {
 	id := strings.TrimSpace(projectID)

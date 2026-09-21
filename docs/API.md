@@ -1240,6 +1240,73 @@ afterwards.
 `docs/AGENT_ATTENTION.md` is the long form: the four readings of one log, the action lifecycle, why an
 action's id is derived from its event, and why the loop closes at the terminal rather than here.
 
+## The controller dashboard
+
+One response for a console, instead of the seven it would otherwise have to call and join itself. The
+join happens here, once, in four queries rather than four per project.
+
+It is a **read model**: no table, no cache, no state that survives a request, and every route is a
+GET. `docs/CONTROLLER_API.md` is the long form.
+
+### GET /api/controller
+
+```json
+{
+  "server": {
+    "status": "online",
+    "runtimeAvailable": true,
+    "version": "0.6.5",
+    "uptimeSeconds": 4211
+  },
+  "projects": [
+    {
+      "id": "p_6f1a…",
+      "name": "checkout-service",
+      "runtime": { "status": "running" },
+      "agent": {
+        "available": true,
+        "sessionId": "sess_9a27…",
+        "status": "WAITING_PERMISSION",
+        "lastEvent": "agent.permission_requested",
+        "updatedAt": "2026-09-21T09:00:12Z"
+      },
+      "attention": { "available": true, "level": "ACTION_REQUIRED", "reason": "permission requested" },
+      "actions": { "available": true, "pending": 1 },
+      "updatedAt": "2026-09-21T09:00:12Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+Cards come back **most in need of attention first**: `ACTION_REQUIRED`, then `WARNING`, then what is
+running, then what has finished, then everything else. Within that, most recently changed first.
+
+Each section speaks its own layer's vocabulary and none is translated — `runtime.status` is the
+project model's, `agent.status` is the agent state projection's, `attention.level` is the attention
+projection's. A client that knows one endpoint's vocabulary should not have to learn a second spelling
+of it here.
+
+**Null and unavailable are different** and the response distinguishes them:
+
+| | Means |
+| --- | --- |
+| `"agent": null` | nothing has ever run in this project |
+| `"agent": {"available": false}` | the server cannot answer — no state projection is wired |
+
+A missing or failing projection degrades its own section rather than failing the request. A dashboard
+that shows five of seven things is worth more than an error page.
+
+### GET /api/controller/projects
+
+The same cards without the server block, for a client that already knows what server it is talking to:
+`{"projects": [...], "count": n}`.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The project list could not be read | 500 | `controller_unavailable` |
+| The server was built without the aggregation | 503 | `internal_error` |
+
 ## GET /api/ws
 
 **The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per

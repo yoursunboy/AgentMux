@@ -258,3 +258,60 @@ func TestUpsertReportsAStorageFailure(t *testing.T) {
 		t.Errorf("DeleteAll error = %v; want %q", err, agentstate.CodeStorageFailure)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Batch reads
+// ---------------------------------------------------------------------------
+
+// TestNewestByProjectsPicksEachProjectsLatest is the query the controller
+// dashboard reads, and the one that keeps it from being an N+1.
+func TestNewestByProjectsPicksEachProjectsLatest(t *testing.T) {
+	repo, _ := newStateStore(t)
+	ctx := context.Background()
+
+	entries := []agentstate.AgentState{
+		state("sess_a1", "p_a", "amx-p_a", agentstate.StatusStopped, stateAt(10), "agent.session_ended"),
+		state("sess_a2", "p_a", "amx-p_a", agentstate.StatusRunning, stateAt(20), "agent.started"),
+		state("sess_b1", "p_b", "amx-p_b", agentstate.StatusFailed, stateAt(15), "agent.failed"),
+		state("sess_c1", "p_c", "amx-p_c", agentstate.StatusRunning, stateAt(5), "agent.started"),
+	}
+	for _, s := range entries {
+		if _, err := repo.Upsert(ctx, s); err != nil {
+			t.Fatalf("Upsert returned an error: %v", err)
+		}
+	}
+
+	got, err := repo.NewestByProjects(ctx, []string{"p_a", "p_b", "p_c", "p_absent"})
+	if err != nil {
+		t.Fatalf("NewestByProjects returned an error: %v", err)
+	}
+
+	byProject := map[string]string{}
+	for _, s := range got {
+		byProject[s.ProjectID] = s.AgentSessionID
+	}
+	if len(got) != 3 {
+		t.Fatalf("NewestByProjects returned %d row(s); want 3 - one per project that has any", len(got))
+	}
+	if byProject["p_a"] != "sess_a2" {
+		t.Errorf("p_a's newest state is %q; want the later of its two attempts", byProject["p_a"])
+	}
+	if byProject["p_b"] != "sess_b1" || byProject["p_c"] != "sess_c1" {
+		t.Errorf("the other projects are %v", byProject)
+	}
+	if _, ok := byProject["p_absent"]; ok {
+		t.Error("a project with no state was reported")
+	}
+}
+
+func TestNewestByProjectsWithNoProjects(t *testing.T) {
+	repo, _ := newStateStore(t)
+
+	got, err := repo.NewestByProjects(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("NewestByProjects returned an error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("NewestByProjects(nil) = %v; want nothing", got)
+	}
+}

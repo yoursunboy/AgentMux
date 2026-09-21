@@ -23,6 +23,7 @@ iPad / Phone / PC
 │ Event Log                   │   internal/event          — built in Phase 7.1
 │ Agent State                 │   internal/agentstate     — built in Phase 7.3C-1
 │ Attention & Actions         │   internal/attention      — built in Phase 7.3C-2
+│ Controller Aggregation      │   internal/controller     — built in Phase 7.4A
 │ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
@@ -86,6 +87,14 @@ which attempt a runtime belongs to. It holds a level per attempt and a queue of 
 **it answers nothing**: an action records that Claude asked for something, and there is no endpoint
 that decides it. `docs/AGENT_ATTENTION.md` §1 separates the layers, §3 is the action lifecycle, and
 §6 is why the loop closes at the terminal rather than here.
+
+The Controller Aggregation, added in Phase 7.4A as `internal/controller`, is the one component that
+reads several of the others to build a single answer. It exists because a console would otherwise
+call seven endpoints and join them itself — once per client, and four times per project — and the join
+belongs where it can be four queries instead of four hundred. **It owns nothing**: no table, no cache,
+no state that survives a request, and every route it serves is a GET. Delete the package and nothing
+is lost but the convenience. `docs/CONTROLLER_API.md` §1 is the boundary, §4 the sort, and §7 what it
+does not cover.
 
 ## 2. Project vs Collection
 

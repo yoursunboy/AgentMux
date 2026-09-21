@@ -198,3 +198,26 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(msg, "UNIQUE constraint failed") ||
 		strings.Contains(msg, "constraint failed: UNIQUE")
 }
+
+// placeholders renders a comma-separated list of n SQL parameter markers, for
+// an IN clause whose length is only known at run time.
+//
+// It is a helper rather than a string built at each call site so that the one
+// thing that matters about it is stated once: the count is derived from the
+// slice being bound, never from anything a caller supplied, so the statement and
+// its arguments cannot disagree.
+func placeholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Repeat("?,", n), ",")
+}
+
+// argsOf turns a slice of strings into the arguments an IN clause binds.
+func argsOf(values []string) []any {
+	out := make([]any, len(values))
+	for i, v := range values {
+		out[i] = v
+	}
+	return out
+}

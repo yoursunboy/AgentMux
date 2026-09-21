@@ -28,6 +28,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/controller"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
@@ -64,6 +65,7 @@ type Server struct {
 	agents      *agent.Service
 	agentStates *agentstate.Service
 	attention   *attention.Service
+	controller  *controller.Service
 	terminal    *terminal.Hub
 	log         *slog.Logger
 
@@ -142,6 +144,15 @@ type Options struct {
 	// those routes rather than answering with a level it never derived.
 	Attention *attention.Service
 
+	// Controller aggregates the services above into the one response a console
+	// reads. It is optional like the others, and a server without it explains
+	// itself on those two routes.
+	//
+	// It is the only service here that holds no state and owns no table: it
+	// reads the others and arranges what they say. That is why it takes the
+	// projects, the states and the attention rather than a database.
+	Controller *controller.Service
+
 	// Terminal carries browser sockets to the runtime. It is optional only so
 	// that tests of the REST surface do not have to build one; a server
 	// without it answers the real-time endpoint with an explanation rather
@@ -189,6 +200,7 @@ func New(o Options) (*Server, error) {
 		agents:      o.Agents,
 		agentStates: o.AgentStates,
 		attention:   o.Attention,
+		controller:  o.Controller,
 		terminal:    o.Terminal,
 		log:         o.Logger,
 		startedAt:   o.StartedAt,
@@ -248,6 +260,12 @@ func (s *Server) routes() http.Handler {
 	// internal/httpapi/attention.go.
 	mux.HandleFunc("GET /api/projects/{id}/attention", s.handleListAttention)
 	mux.HandleFunc("GET /api/projects/{id}/actions", s.handleListActions)
+
+	// What a console needs, in one response rather than seven. It is a read
+	// model over the services above and owns nothing: two GETs, no writes, and
+	// no state of its own to fall out of step.
+	mux.HandleFunc("GET /api/controller", s.handleController)
+	mux.HandleFunc("GET /api/controller/projects", s.handleControllerProjects)
 
 	// The runtime of one project. The operations are nested under the runtime
 	// because that is the resource they act on: the session is what is started,

@@ -43,6 +43,16 @@ type Repository interface {
 	// runtime, which is what an agent started without a task produces.
 	ByRuntime(ctx context.Context, runtimeID string) (AgentState, error)
 
+	// NewestByProjects returns the most recent state of each of the given
+	// projects, in one query.
+	//
+	// It exists because a dashboard reads one state per project, and doing that
+	// a project at a time is the N+1 that the controller API is explicitly not
+	// allowed to commit. A project with no state is absent from the result
+	// rather than present with a zero value, so a caller cannot mistake "no
+	// attempt" for "an attempt with empty fields".
+	NewestByProjects(ctx context.Context, projectIDs []string) ([]AgentState, error)
+
 	// Count returns how many states the projection holds.
 	//
 	// It is what decides whether a rebuild is needed at start-up: an empty

@@ -393,3 +393,102 @@ func scanAction(row rowScanner) (attention.Action, error) {
 	}
 	return a, nil
 }
+
+// NewestAttentionByProjects returns the most recent level of each of the given
+// projects, in one query, for the reason NewestByProjects gives.
+func (r *AttentionStore) NewestAttentionByProjects(ctx context.Context, projectIDs []string) ([]attention.Attention, error) {
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+
+	statement := `
+		SELECT ` + attentionColumns + ` FROM agent_attention a
+		WHERE a.project_id IN (` + placeholders(len(projectIDs)) + `)
+		  AND a.agent_session_id = (
+			SELECT b.agent_session_id FROM agent_attention b
+			WHERE b.project_id = a.project_id
+			ORDER BY b.updated_at DESC, b.agent_session_id DESC
+			LIMIT 1
+		  )`
+
+	rows, err := r.db.QueryContext(ctx, statement, argsOf(projectIDs)...)
+	if err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not list attention for several projects",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+
+	out := make([]attention.Attention, 0, len(projectIDs))
+	for rows.Next() {
+		a, err := scanAttention(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not read attention for several projects",
+			Err:     err,
+		}
+	}
+	return out, nil
+}
+
+// PendingActionCounts returns how many actions are waiting, per project.
+//
+// It is a single grouped count rather than a read per project, and it counts
+// only what is pending: a settled action is history, and a dashboard asking
+// "how much is waiting here" is not asking about history.
+//
+// A project with nothing pending is absent from the map rather than present
+// with a zero, so a caller reads the same way it reads the other batch
+// lookups - see agentstate's NewestByProjects.
+func (r *AttentionStore) PendingActionCounts(ctx context.Context, projectIDs []string) (map[string]int, error) {
+	if len(projectIDs) == 0 {
+		return map[string]int{}, nil
+	}
+
+	statement := `
+		SELECT project_id, COUNT(*) FROM agent_actions
+		WHERE project_id IN (` + placeholders(len(projectIDs)) + `) AND status = 'PENDING'
+		GROUP BY project_id`
+
+	rows, err := r.db.QueryContext(ctx, statement, argsOf(projectIDs)...)
+	if err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not count pending actions for several projects",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+
+	out := make(map[string]int, len(projectIDs))
+	for rows.Next() {
+		var (
+			projectID string
+			count     int
+		)
+		if err := rows.Scan(&projectID, &count); err != nil {
+			return nil, &attention.Error{
+				Code:    attention.CodeStorageFailure,
+				Message: "could not read a pending action count",
+				Err:     err,
+			}
+		}
+		out[projectID] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not read pending action counts",
+			Err:     err,
+		}
+	}
+	return out, nil
+}

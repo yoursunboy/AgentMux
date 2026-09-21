@@ -405,3 +405,95 @@ func TestAttentionStoreReportsAStorageFailure(t *testing.T) {
 		t.Errorf("DeleteAllActions error = %v; want %q", err, attention.CodeStorageFailure)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Batch reads
+// ---------------------------------------------------------------------------
+
+func TestNewestAttentionByProjectsPicksEachProjectsLatest(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	entries := []attention.Attention{
+		attentionRow("sess_a1", "p_a", attention.LevelWarning, "agent failed", attentionAt(10)),
+		attentionRow("sess_a2", "p_a", attention.LevelNone, "agent started", attentionAt(20)),
+		attentionRow("sess_b1", "p_b", attention.LevelActionRequired, "permission requested", attentionAt(15)),
+	}
+	for _, a := range entries {
+		if _, err := repo.UpsertAttention(ctx, a); err != nil {
+			t.Fatalf("UpsertAttention returned an error: %v", err)
+		}
+	}
+
+	got, err := repo.NewestAttentionByProjects(ctx, []string{"p_a", "p_b", "p_absent"})
+	if err != nil {
+		t.Fatalf("NewestAttentionByProjects returned an error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("returned %d row(s); want 2", len(got))
+	}
+	byProject := map[string]string{}
+	for _, a := range got {
+		byProject[a.ProjectID] = a.AgentSessionID
+	}
+	if byProject["p_a"] != "sess_a2" {
+		t.Errorf("p_a's newest attention is %q; want the later of its two attempts", byProject["p_a"])
+	}
+	if byProject["p_b"] != "sess_b1" {
+		t.Errorf("p_b's attention is %q", byProject["p_b"])
+	}
+}
+
+// TestPendingActionCountsGroupsByProject is the other half of the dashboard's
+// queue badge, and it counts only what is waiting.
+func TestPendingActionCountsGroupsByProject(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	rows := []attention.Action{
+		actionRow(anActionID("a001"), "sess_a1", "p_a", attention.ActionPermissionRequest, attentionAt(10)),
+		actionRow(anActionID("a002"), "sess_a2", "p_a", attention.ActionViewFailure, attentionAt(11)),
+		actionRow(anActionID("a003"), "sess_a3", "p_a", attention.ActionViewCompletion, attentionAt(12)),
+		actionRow(anActionID("a004"), "sess_b1", "p_b", attention.ActionPermissionRequest, attentionAt(13)),
+	}
+	for _, a := range rows {
+		if _, err := repo.RaiseAction(ctx, a); err != nil {
+			t.Fatalf("RaiseAction returned an error: %v", err)
+		}
+	}
+	// Settle one of p_a's, so the count has to notice.
+	if _, err := repo.ResolveActions(ctx, "sess_a3", []attention.ActionType{attention.ActionViewCompletion}, attentionAt(20)); err != nil {
+		t.Fatalf("ResolveActions returned an error: %v", err)
+	}
+
+	counts, err := repo.PendingActionCounts(ctx, []string{"p_a", "p_b", "p_absent"})
+	if err != nil {
+		t.Fatalf("PendingActionCounts returned an error: %v", err)
+	}
+	if counts["p_a"] != 2 {
+		t.Errorf("p_a has %d pending; want 2 - the settled one is not waiting", counts["p_a"])
+	}
+	if counts["p_b"] != 1 {
+		t.Errorf("p_b has %d pending; want 1", counts["p_b"])
+	}
+	if _, ok := counts["p_absent"]; ok {
+		t.Error("a project with nothing pending was reported")
+	}
+}
+
+func TestBatchReadsWithNoProjects(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	attentionRows, err := repo.NewestAttentionByProjects(ctx, nil)
+	if err != nil || attentionRows != nil {
+		t.Errorf("NewestAttentionByProjects(nil) = %v, %v; want nothing", attentionRows, err)
+	}
+	counts, err := repo.PendingActionCounts(ctx, nil)
+	if err != nil {
+		t.Fatalf("PendingActionCounts(nil) returned an error: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Errorf("PendingActionCounts(nil) = %v; want an empty map", counts)
+	}
+}

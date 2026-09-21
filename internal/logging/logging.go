@@ -75,9 +75,13 @@ const (
 	// about the relationship between an agent and a person, not about the
 	// agent.
 	ComponentAttention = "attention"
-	ComponentTerminal  = "terminal"
-	ComponentAPI       = "httpapi"
-	ComponentServer    = "server"
+	// ComponentController is the aggregation a console reads. It is a component
+	// of its own because a record about it is about assembling an answer from
+	// other components rather than about any of them.
+	ComponentController = "controller"
+	ComponentTerminal   = "terminal"
+	ComponentAPI        = "httpapi"
+	ComponentServer     = "server"
 )
 
 // Placeholder is written in place of any value that must not reach a log.

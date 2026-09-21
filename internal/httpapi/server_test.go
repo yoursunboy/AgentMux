@@ -19,6 +19,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/controller"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/project"
@@ -159,6 +160,9 @@ type harnessOptions struct {
 	// withoutAttention is the same branch once more, for the attention
 	// projection.
 	withoutAttention bool
+
+	// withoutController builds the server with no dashboard aggregation.
+	withoutController bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -371,6 +375,35 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	}
 	events.SetProjectors(projection, attentionProjection)
 
+	// The controller aggregation, which reads the projections above and owns
+	// nothing. It is built from the *served* ones rather than the real ones, so
+	// that a harness which drops a projection drops it everywhere - otherwise
+	// the server would answer a state route with "unavailable" while the
+	// dashboard reported it working, and the two would be testing different
+	// servers.
+	//
+	// The two variables are typed as the interfaces rather than as the concrete
+	// services on purpose: a nil *agentstate.Service stored in a
+	// controller.StateReader is not a nil interface, and the aggregation's
+	// availability check would not see it.
+	var controllerAgents controller.StateReader
+	if !o.withoutAgentStates {
+		controllerAgents = projection
+	}
+	var controllerAttention controller.AttentionReader
+	if !o.withoutAttention {
+		controllerAttention = attentionProjection
+	}
+	controllerService, err := controller.NewService(controller.Options{
+		Projects:  service,
+		Agents:    controllerAgents,
+		Attention: controllerAttention,
+		Logger:    discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("controller.NewService returned an error: %v", err)
+	}
+
 	// The adapter manager and the coordinator, both real. The adapter binds a
 	// real loopback port - an injected listener would make every hook-delivery
 	// assertion a statement about a fake - and the coordinator is wired to the
@@ -411,6 +444,10 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if o.withoutAttention {
 		servedAttention = nil
 	}
+	var servedController *controller.Service = controllerService
+	if o.withoutController {
+		servedController = nil
+	}
 
 	server, err := New(Options{
 		Config:      cfg,
@@ -423,6 +460,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		Agents:      servedAgents,
 		AgentStates: servedStates,
 		Attention:   servedAttention,
+		Controller:  servedController,
 		Terminal:    hub,
 		Logger:      discardLogger(),
 		StartedAt:   time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),

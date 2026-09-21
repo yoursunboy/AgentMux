@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -153,10 +154,14 @@ type serverInfoResponse struct {
 }
 
 // handleServerInfo implements GET /api/server.
-func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := s.contextWithTimeout(r, 5*time.Second)
-	defer cancel()
-
+// serverInfo assembles the server's own report.
+//
+// It is a method rather than the body of the handler so that the controller
+// dashboard can reuse it. §5 of the phase brief asks that the existing report be
+// called rather than re-derived, and the only way to make that true is for there
+// to be one place it is built: a second assembly would be a second answer to
+// "can this machine run a terminal", and the two would drift.
+func (s *Server) serverInfo(ctx context.Context) serverInfoResponse {
 	info := s.host.Info(ctx)
 	roots := s.host.ProjectsRoots()
 	firstRoot := ""
@@ -277,7 +282,15 @@ func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
 	if response.Warnings == nil {
 		response.Warnings = []string{}
 	}
-	writeJSON(w, s.log, http.StatusOK, response)
+	return response
+}
+
+// handleServerInfo implements GET /api/server.
+func (s *Server) handleServerInfo(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+
+	writeJSON(w, s.log, http.StatusOK, s.serverInfo(ctx))
 }
 
 // healthResponse is the body of GET /health.

@@ -37,6 +37,18 @@ type Repository interface {
 	// first.
 	ListAttentionByProject(ctx context.Context, projectID string, limit int) ([]Attention, error)
 
+	// NewestAttentionByProjects returns the most recent level of each of the
+	// given projects, in one query.
+	//
+	// It exists for the reason agentstate's NewestByProjects does: a dashboard
+	// reads one level per project, and a read per project is the N+1 the
+	// controller API is not allowed to commit.
+	NewestAttentionByProjects(ctx context.Context, projectIDs []string) ([]Attention, error)
+
+	// PendingActionCounts returns how many actions are waiting, per project, in
+	// one grouped query. A project with nothing pending is absent from the map.
+	PendingActionCounts(ctx context.Context, projectIDs []string) (map[string]int, error)
+
 	// CountAttention returns how many rows the projection holds.
 	CountAttention(ctx context.Context) (int, error)
 

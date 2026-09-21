@@ -311,3 +311,90 @@ export interface UpdateSessionInput {
    */
   runtimeId?: string
 }
+
+/**
+ * The console, from GET /api/controller.
+ *
+ * One response instead of seven. A client that wants a dashboard would
+ * otherwise call the server report, the project list, and then a runtime, a
+ * task list, a state, an attention and an action queue for every project - and
+ * join them itself. The join happens on the server, once, in a handful of
+ * queries rather than a handful per project.
+ *
+ * This is a read model. There is nothing here that writes anything.
+ */
+export interface Dashboard {
+  server: ControllerServer
+  /** The cards, most in need of attention first. */
+  projects: ProjectCard[]
+  count: number
+}
+
+/**
+ * What the server says about itself, in the few fields a console header needs.
+ *
+ * It is deliberately not the whole of GET /api/server, which is the diagnostics
+ * surface: tmux paths, dependency checks, the filesystem layout. A client that
+ * wants that still has the endpoint it has always had.
+ */
+export interface ControllerServer {
+  status: string
+  /** Whether a terminal can run on this machine at all. */
+  runtimeAvailable: boolean
+  /** Why it cannot, when it cannot. Empty otherwise. */
+  runtimeUnavailableReason?: string
+  version: string
+  uptimeSeconds: number
+}
+
+/**
+ * One project, as a console shows it.
+ *
+ * Every field is a status, an identifier or a count. There is no room in it for
+ * a prompt, a transcript, terminal output, a command or a credential.
+ */
+export interface ProjectCard {
+  id: string
+  name: string
+  runtime: { status: string }
+  /**
+   * What the agent is doing, or null.
+   *
+   * Null means nothing has ever run in this project - an agent that has never
+   * started is reported as absent rather than invented. `available: false`
+   * inside it means something different: the server has no state projection
+   * wired, so it cannot answer at all.
+   */
+  agent: AgentSummary | null
+  /** Whether anybody needs to look, or null if nothing has happened here. */
+  attention: AttentionSummary | null
+  actions: { available: boolean; pending: number }
+  updatedAt: string
+}
+
+/** What the agent in a project is doing. */
+export interface AgentSummary {
+  /** False when the server cannot answer this at all, as opposed to "nothing is running". */
+  available: boolean
+  sessionId?: string
+  /** The agent state vocabulary: `RUNNING`, `WAITING_PERMISSION` and so on. */
+  status?: string
+  /** The type of the event that last moved it, never a payload. */
+  lastEvent?: string
+  /** When that event happened. Absent when there is no state to describe. */
+  updatedAt?: string
+}
+
+/** Whether anybody needs to look at a project. */
+export interface AttentionSummary {
+  available: boolean
+  level: string
+  /** A short fixed phrase, never a quotation from a payload. */
+  reason?: string
+}
+
+/** The body of GET /api/controller/projects - the cards without the server block. */
+export interface ControllerProjects {
+  projects: ProjectCard[]
+  count: number
+}

@@ -33,6 +33,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/attention"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
+	"github.com/kutonlagos/agentmux/internal/controller"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/host"
 	"github.com/kutonlagos/agentmux/internal/httpapi"
@@ -264,6 +265,21 @@ func run(args []string) error {
 		return err
 	}
 
+	// The aggregation a console reads. It holds nothing and owns no table: it
+	// asks the project service, the state projection and the attention
+	// projection, and arranges what they say into one response. It is built
+	// last because it depends on all of them.
+	controllerLog := logging.Component(logger, logging.ComponentController)
+	controllerService, err := controller.NewService(controller.Options{
+		Projects:  projectService,
+		Agents:    stateService,
+		Attention: attentionService,
+		Logger:    controllerLog,
+	})
+	if err != nil {
+		return err
+	}
+
 	// The projectors, in the order they run, and the order is a dependency:
 	// attention reads the state the first one keeps. Neither projection knows
 	// the other exists; this line is the whole of what relates them.
@@ -426,6 +442,7 @@ func run(args []string) error {
 		Agents:      agentService,
 		AgentStates: stateService,
 		Attention:   attentionService,
+		Controller:  controllerService,
 		Terminal:    terminalHub,
 		Logger:      logging.Component(logger, logging.ComponentAPI),
 		WebDir:      webDir,

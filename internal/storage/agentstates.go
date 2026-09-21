@@ -226,3 +226,59 @@ func scanAgentState(row rowScanner) (agentstate.AgentState, error) {
 	}
 	return state, nil
 }
+
+// NewestByProjects returns the most recent state of each of the given projects.
+//
+// # Why this is one query
+//
+// A dashboard reads one state per project, and doing that a project at a time
+// would be a query per project - the N+1 the controller API is explicitly not
+// allowed to commit. This asks for them together: the `IN` narrows to the
+// projects that were asked for, and the correlated subquery picks each one's
+// newest row.
+//
+// "Newest" is by the event's own time, which is what last_event_at holds, so it
+// is the same ordering the projection itself is guarded by. A project with no
+// state is simply absent from the result, not an error.
+func (r *AgentStateStore) NewestByProjects(ctx context.Context, projectIDs []string) ([]agentstate.AgentState, error) {
+	if len(projectIDs) == 0 {
+		return nil, nil
+	}
+
+	statement := `
+		SELECT ` + agentStateColumns + ` FROM agent_states a
+		WHERE a.project_id IN (` + placeholders(len(projectIDs)) + `)
+		  AND a.agent_session_id = (
+			SELECT b.agent_session_id FROM agent_states b
+			WHERE b.project_id = a.project_id
+			ORDER BY b.last_event_at DESC, b.agent_session_id DESC
+			LIMIT 1
+		  )`
+
+	rows, err := r.db.QueryContext(ctx, statement, argsOf(projectIDs)...)
+	if err != nil {
+		return nil, &agentstate.Error{
+			Code:    agentstate.CodeStorageFailure,
+			Message: "could not list agent states for several projects",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+
+	out := make([]agentstate.AgentState, 0, len(projectIDs))
+	for rows.Next() {
+		state, err := scanAgentState(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, state)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &agentstate.Error{
+			Code:    agentstate.CodeStorageFailure,
+			Message: "could not read agent states for several projects",
+			Err:     err,
+		}
+	}
+	return out, nil
+}

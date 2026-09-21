@@ -343,6 +343,35 @@ func (s *Service) ListAttentionByProject(ctx context.Context, projectID string, 
 	return s.repo.ListAttentionByProject(ctx, id, LimitOr(limit))
 }
 
+// AttentionForProjects returns the most recent level of each of the given
+// projects, keyed by project id.
+//
+// A project with no level is absent from the map rather than present with one,
+// for the reason the state lookup gives.
+func (s *Service) AttentionForProjects(ctx context.Context, projectIDs []string) (map[string]Attention, error) {
+	if len(projectIDs) == 0 {
+		return map[string]Attention{}, nil
+	}
+	list, err := s.repo.NewestAttentionByProjects(ctx, projectIDs)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]Attention, len(list))
+	for _, a := range list {
+		out[a.ProjectID] = a
+	}
+	return out, nil
+}
+
+// PendingCountsForProjects returns how many actions are waiting, per project.
+//
+// It is the one number a dashboard wants from the queue. The actions themselves
+// are read from the per-project endpoint, which is where somebody who wants to
+// look at them goes.
+func (s *Service) PendingCountsForProjects(ctx context.Context, projectIDs []string) (map[string]int, error) {
+	return s.repo.PendingActionCounts(ctx, projectIDs)
+}
+
 // Actions returns one attempt's actions, newest first.
 func (s *Service) Actions(ctx context.Context, agentSessionID string) ([]Action, error) {
 	id := strings.TrimSpace(agentSessionID)

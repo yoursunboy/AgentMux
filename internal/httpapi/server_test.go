@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/agent"
+	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -62,6 +63,10 @@ type harness struct {
 	// what is being observed without going back through the API to find out.
 	agents   *agent.Service
 	adapters *claude.Manager
+
+	// projection is the coordinator the server holds, kept here so a test can
+	// read a state without going through the API that is being tested.
+	projection *agentstate.Service
 }
 
 // harnessOptions describes the environment a test wants its server to believe
@@ -140,6 +145,12 @@ type harnessOptions struct {
 	// routes have to explain themselves rather than launch an agent nothing is
 	// watching.
 	withoutAgents bool
+
+	// withoutAgentStates builds the server with no state projection, which is
+	// the third branch of the same question. A server without one answers the
+	// state routes with an explanation rather than with a state it never
+	// computed.
+	withoutAgentStates bool
 }
 
 func newHarness(t *testing.T) *harness {
@@ -325,6 +336,20 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 		resolver = pinnedClaude{*o.claude}
 	}
 
+	// The projection, installed on the event service the way a running server
+	// installs it. Every event this harness writes is therefore projected, and
+	// a test that goes through the API sees the same states a user would.
+	projection, err := agentstate.NewService(agentstate.Options{
+		Repository: store.AgentStates(),
+		Events:     events,
+		Projects:   service,
+		Logger:     discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("agentstate.NewService returned an error: %v", err)
+	}
+	events.SetProjector(projection)
+
 	// The adapter manager and the coordinator, both real. The adapter binds a
 	// real loopback port - an injected listener would make every hook-delivery
 	// assertion a statement about a fake - and the coordinator is wired to the
@@ -357,38 +382,44 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if o.withoutAgents {
 		servedAgents = nil
 	}
+	var servedStates *agentstate.Service = projection
+	if o.withoutAgentStates {
+		servedStates = nil
+	}
 
 	server, err := New(Options{
-		Config:     cfg,
-		Host:       adapter,
-		Projects:   service,
-		Discoverer: discoverer,
-		Runtime:    manager,
-		Events:     events,
-		Tasks:      servedTasks,
-		Agents:     servedAgents,
-		Terminal:   hub,
-		Logger:     discardLogger(),
-		StartedAt:  time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
-		WebDir:     "",
-		Now:        func() time.Time { return time.Date(2026, time.September, 17, 12, 0, 30, 0, time.UTC) },
-		Agent:      resolver,
+		Config:      cfg,
+		Host:        adapter,
+		Projects:    service,
+		Discoverer:  discoverer,
+		Runtime:     manager,
+		Events:      events,
+		Tasks:       servedTasks,
+		Agents:      servedAgents,
+		AgentStates: servedStates,
+		Terminal:    hub,
+		Logger:      discardLogger(),
+		StartedAt:   time.Date(2026, time.September, 17, 12, 0, 0, 0, time.UTC),
+		WebDir:      "",
+		Now:         func() time.Time { return time.Date(2026, time.September, 17, 12, 0, 30, 0, time.UTC) },
+		Agent:       resolver,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.New returned an error: %v", err)
 	}
 	return &harness{
-		t:        t,
-		server:   server,
-		root:     root,
-		dataDir:  dataDir,
-		store:    store,
-		backend:  backend,
-		runtime:  manager,
-		events:   events,
-		tasks:    tasks,
-		agents:   coordinator,
-		adapters: cliAdapters,
+		t:          t,
+		server:     server,
+		root:       root,
+		dataDir:    dataDir,
+		store:      store,
+		backend:    backend,
+		runtime:    manager,
+		events:     events,
+		tasks:      tasks,
+		agents:     coordinator,
+		adapters:   cliAdapters,
+		projection: projection,
 	}
 }
 

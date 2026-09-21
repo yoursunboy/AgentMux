@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,48 @@ type Service struct {
 	now   func() time.Time
 	newID func() (string, error)
 	log   *slog.Logger
+
+	// projectorMu guards projector, and is the only lock this service has.
+	//
+	// It is here because the projector is installed after the service is built:
+	// the projection is rebuilt from the event log, so the two depend on each
+	// other and one has to be constructed first. "The setter is called once at
+	// start-up" is a claim about the caller, and a lock is what makes such a
+	// claim unnecessary rather than merely believed.
+	projectorMu sync.RWMutex
+	projector   Projector
+}
+
+// SetProjector installs the projector that is told about each stored event.
+//
+// It is called once, at start-up, by whatever composes the two - see the note
+// on the field. A nil projector is a valid argument and means nothing is
+// derived, which is where every server starts.
+func (s *Service) SetProjector(p Projector) {
+	s.projectorMu.Lock()
+	defer s.projectorMu.Unlock()
+	s.projector = p
+}
+
+// Projector returns the installed projector, or nil.
+func (s *Service) projectorFor() Projector {
+	s.projectorMu.RLock()
+	defer s.projectorMu.RUnlock()
+	return s.projector
+}
+
+// Projector is told about an event after it has been stored.
+//
+// It is how a derived reading of the log is kept current - internal/agentstate
+// is the one implementation - and it is declared here, by the package that
+// calls it, so that the event log does not depend on anything that reads it.
+//
+// The method is called with the stored event, which means the projection sees
+// exactly what a later reader would: the same identifiers, the same type, the
+// same payload, the same timestamp. A projection that worked from the caller's
+// arguments instead would be a projection that could disagree with the log.
+type Projector interface {
+	Project(ctx context.Context, ev *AgentEvent) error
 }
 
 // Options configures a Service. Only Repository is required.
@@ -43,6 +86,12 @@ type Options struct {
 
 	// Logger receives one record per stored event. Nil means slog.Default.
 	Logger *slog.Logger
+
+	// Projector is told about each stored event, so that whatever is derived
+	// from the log stays current. Nil means nothing is derived, which is a
+	// legitimate configuration - an event log on its own is complete, and every
+	// projection of it can be computed later from what is in it.
+	Projector Projector
 }
 
 // NewService builds a Service.
@@ -51,10 +100,11 @@ func NewService(o Options) (*Service, error) {
 		return nil, errors.New("event: Repository is required")
 	}
 	s := &Service{
-		repo:  o.Repository,
-		now:   o.Now,
-		newID: o.NewID,
-		log:   o.Logger,
+		repo:      o.Repository,
+		now:       o.Now,
+		newID:     o.NewID,
+		log:       o.Logger,
+		projector: o.Projector,
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -148,6 +198,22 @@ func (s *Service) CreateEvent(
 		"projectId", ev.ProjectID,
 		"runtimeId", ev.RuntimeID,
 	)
+
+	// Whatever is derived from the log is brought up to date here, and a
+	// failure to do so is reported rather than returned. The event is already
+	// stored: it is a fact about the past, and a reading that could not be
+	// computed from it does not un-happen it. The caller is told the event was
+	// written, because it was.
+	//
+	// This is also what keeps the log the single entry point to derived state.
+	// An observer that wrote a state directly would be an observer whose states
+	// could not be rebuilt, because the log would not be what produced them.
+	if projector := s.projectorFor(); projector != nil {
+		if err := projector.Project(ctx, ev); err != nil {
+			s.log.Warn("could not project an event into derived state",
+				"eventId", ev.ID, "type", ev.Type, "error", err)
+		}
+	}
 	return ev, nil
 }
 

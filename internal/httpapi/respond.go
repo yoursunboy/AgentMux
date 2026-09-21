@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/kutonlagos/agentmux/internal/agent"
+	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
@@ -105,10 +106,11 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
 //
-// Five packages define codes - the project model, the runtime, the event log,
-// the task model and the agent coordinator - and all are passed through to the
-// client unchanged, so a client switches on one vocabulary across the whole
-// API. The HTTP layer adds only the codes for failures it produces itself.
+// Six packages define codes - the project model, the runtime, the event log,
+// the task model, the agent coordinator and the state projection - and all are
+// passed through to the client unchanged, so a client switches on one
+// vocabulary across the whole API. The HTTP layer adds only the codes for
+// failures it produces itself.
 func codeOf(err error) string {
 	if code := project.CodeOf(err); code != "" {
 		return code
@@ -122,7 +124,10 @@ func codeOf(err error) string {
 	if code := task.CodeOf(err); code != "" {
 		return code
 	}
-	return agent.CodeOf(err)
+	if code := agent.CodeOf(err); code != "" {
+		return code
+	}
+	return agentstate.CodeOf(err)
 }
 
 // detailsOf returns the structured context attached to err, if any.
@@ -146,6 +151,10 @@ func detailsOf(err error) map[string]any {
 	var agentErr *agent.Error
 	if errors.As(err, &agentErr) {
 		return agentErr.Details
+	}
+	var stateErr *agentstate.Error
+	if errors.As(err, &stateErr) {
+		return stateErr.Details
 	}
 	return nil
 }
@@ -171,6 +180,10 @@ func messageFor(err error, code string) string {
 	var agentErr *agent.Error
 	if errors.As(err, &agentErr) && agentErr.Message != "" {
 		return agentErr.Message
+	}
+	var stateErr *agentstate.Error
+	if errors.As(err, &stateErr) && stateErr.Message != "" {
+		return stateErr.Message
 	}
 	switch code {
 	// One clause, because project.CodeStorageFailure, session.CodeStorageFailure,
@@ -227,7 +240,10 @@ func statusForCode(code string) int {
 		// its task belongs to. Both are the caller's input and both are things
 		// the caller can send differently.
 		agent.CodeInvalidInput,
-		agent.CodeTaskMismatch:
+		agent.CodeTaskMismatch,
+		// A state asked for without naming what it is about, or listed without
+		// a project. Both are the caller's input.
+		agentstate.CodeInvalidState:
 		return http.StatusBadRequest
 
 	case project.CodePathNotFound,
@@ -245,7 +261,11 @@ func statusForCode(code string) int {
 		// A task that does not exist. A task belonging to another project is
 		// deliberately *not* here - it exists, and telling the caller it does
 		// not would send them looking for something they already have.
-		agent.CodeTaskNotFound:
+		agent.CodeTaskNotFound,
+		// An attempt nothing has observed, or a runtime no attempt is bound to.
+		// It is the ordinary answer rather than a failure: an attempt that was
+		// created and never started has no state because no event produced one.
+		agentstate.CodeNotFound:
 		return http.StatusNotFound
 
 	case project.CodePathNotAccessible,
@@ -334,7 +354,12 @@ func statusForCode(code string) int {
 		// said it would prepare, and there is nothing the caller could send
 		// differently - the alternative would be to launch a session that can
 		// never report anything, which is worse than saying so.
-		agent.CodeSettingsFailure:
+		agent.CodeSettingsFailure,
+		// A state that could not be read or written, and an event that could not
+		// be folded into one. The second is the server failing to keep a derived
+		// reading current, which is its own problem and not the caller's.
+		agentstate.CodeStorageFailure,
+		agentstate.CodeProjectionFailed:
 		return http.StatusInternalServerError
 
 	default:

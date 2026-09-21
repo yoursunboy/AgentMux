@@ -5,8 +5,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/kutonlagos/agentmux/internal/event"
 	"github.com/kutonlagos/agentmux/internal/project"
+	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/migrations"
 )
 
@@ -140,8 +144,8 @@ func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 	tables := tableNames(t, store)
 
 	want := []string{
-		"agent_events", "agent_sessions", "project_runtime", "projects",
-		"schema_migrations", "settings", "tasks",
+		"agent_events", "agent_sessions", "agent_states", "project_runtime",
+		"projects", "schema_migrations", "settings", "tasks",
 	}
 	if strings.Join(tables, ",") != strings.Join(want, ",") {
 		t.Errorf("tables = %v, want %v", tables, want)
@@ -228,5 +232,144 @@ func TestMigrationFilesAreWellFormed(t *testing.T) {
 		if got, want := migration.String(), strings.TrimSuffix(migration.Source, ".sql"); got != want {
 			t.Errorf("String() = %q, want %q", got, want)
 		}
+	}
+}
+
+// TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt is §二十 of the phase
+// that added agent_states.
+//
+// The earlier upgrade test brings a database to Phase 7.1, when only projects,
+// runtime records and events existed. This one brings a database to the phase
+// immediately before the projection - every table this build already had, each
+// with a row in it - and then migrates. What it checks is not just that the new
+// table appears, but that nothing else moved: an additive migration that
+// rewrote a neighbour would be a migration that cost somebody their history.
+func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, OpenOptions{Path: newDatabasePath(t)})
+	if err != nil {
+		t.Fatalf("Open returned an error: %v", err)
+	}
+	defer store.Close()
+
+	all, err := migrations.All()
+	if err != nil {
+		t.Fatalf("migrations.All returned an error: %v", err)
+	}
+
+	// Bring the database to the version before agent_states by hand.
+	if _, err := store.db.ExecContext(ctx, schemaMigrationsTable); err != nil {
+		t.Fatalf("creating schema_migrations failed: %v", err)
+	}
+	target := latestVersion(t) - 1
+	for _, m := range all {
+		if m.Version > target {
+			break
+		}
+		if _, err := store.db.ExecContext(ctx, m.SQL); err != nil {
+			t.Fatalf("applying %s failed: %v", m, err)
+		}
+		if _, err := store.db.ExecContext(ctx,
+			`INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)`,
+			m.Version, m.Name, formatTime(at(2026, time.September, 1, 0)),
+		); err != nil {
+			t.Fatalf("recording %s failed: %v", m, err)
+		}
+	}
+
+	// One row in every table this build already had.
+	const (
+		projectID = "p_0123456789abcdef0123"
+		taskID    = "task_0123456789abcdef0123"
+		sessionID = "sess_0123456789abcdef0123"
+		eventID   = "evt_0123456789abcdef01234567"
+	)
+	if err := store.Projects().Create(ctx, testProject(projectID, "App", `D:\AI\Projects\App`)); err != nil {
+		t.Fatalf("creating the project failed: %v", err)
+	}
+	if err := store.Runtimes().Save(ctx, session.Record{
+		ProjectID: projectID,
+		Session:   "amx-" + projectID,
+		State:     session.StateRunning,
+		Cols:      120,
+		Rows:      30,
+		CreatedAt: at(2026, time.September, 1, 0),
+		UpdatedAt: at(2026, time.September, 1, 0),
+	}); err != nil {
+		t.Fatalf("saving the runtime record failed: %v", err)
+	}
+	if err := store.Tasks().CreateTask(ctx, &task.Task{
+		ID: taskID, ProjectID: projectID, Title: "Fix the viewer",
+		Status:    task.StatusCreated,
+		CreatedAt: at(2026, time.September, 1, 0),
+		UpdatedAt: at(2026, time.September, 1, 0),
+	}); err != nil {
+		t.Fatalf("creating the task failed: %v", err)
+	}
+	if err := store.Tasks().CreateSession(ctx, &task.AgentSession{
+		ID: sessionID, TaskID: taskID, Status: task.StatusSessionCreated,
+		CreatedAt: at(2026, time.September, 1, 0),
+	}); err != nil {
+		t.Fatalf("creating the session failed: %v", err)
+	}
+	if err := store.Events().Create(ctx, eventForTest(eventID, projectID)); err != nil {
+		t.Fatalf("creating the event failed: %v", err)
+	}
+
+	// The upgrade.
+	result, err := store.Migrate(ctx)
+	if err != nil {
+		t.Fatalf("Migrate returned an error: %v", err)
+	}
+	if len(result.Applied) != 1 || !strings.HasPrefix(result.Applied[0], "0006_") {
+		t.Fatalf("Migrate applied %v; want exactly the agent state migration", result.Applied)
+	}
+
+	// Every row is still there, unchanged.
+	if _, err := store.Projects().GetByID(ctx, projectID); err != nil {
+		t.Errorf("the project did not survive the upgrade: %v", err)
+	}
+	if _, err := store.Runtimes().Get(ctx, projectID); err != nil {
+		t.Errorf("the runtime record did not survive the upgrade: %v", err)
+	}
+	if _, err := store.Tasks().GetTask(ctx, taskID); err != nil {
+		t.Errorf("the task did not survive the upgrade: %v", err)
+	}
+	if _, err := store.Tasks().GetSession(ctx, sessionID); err != nil {
+		t.Errorf("the session did not survive the upgrade: %v", err)
+	}
+	if _, err := store.Events().List(ctx, event.Query{ProjectID: projectID, Limit: 10}); err != nil {
+		t.Errorf("the event did not survive the upgrade: %v", err)
+	}
+
+	// And the new table is empty rather than populated with a guess. A
+	// migration that seeded rows would be a migration inventing history.
+	count, err := store.AgentStates().Count(ctx)
+	if err != nil {
+		t.Fatalf("counting the new table failed: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("the upgrade left %d agent state(s); a schema change does not invent history", count)
+	}
+}
+
+// TestMigrateIsIdempotentOverAFullDatabase runs it twice.
+func TestMigrateIsIdempotentOverAFullDatabase(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	first, err := store.Migrate(ctx)
+	if err != nil {
+		t.Fatalf("the first Migrate returned an error: %v", err)
+	}
+	second, err := store.Migrate(ctx)
+	if err != nil {
+		t.Fatalf("the second Migrate returned an error: %v", err)
+	}
+	if len(second.Applied) != 0 {
+		t.Errorf("the second Migrate applied %v; want nothing", second.Applied)
+	}
+	if first.Version != second.Version {
+		t.Errorf("schema version moved from %d to %d on a second Migrate", first.Version, second.Version)
 	}
 }

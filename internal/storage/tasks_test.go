@@ -1189,7 +1189,7 @@ func TestMigrateUpgradesAPhase71Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
-	want := []string{"0004_tasks", "0005_agent_sessions"}
+	want := []string{"0004_tasks", "0005_agent_sessions", "0006_agent_states"}
 	if len(result.Applied) != len(want) {
 		t.Fatalf("Migrate applied %v, want %v", result.Applied, want)
 	}

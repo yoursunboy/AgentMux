@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/agent"
+	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -51,17 +52,18 @@ type AgentResolver interface {
 
 // Server is the AgentMux HTTP API.
 type Server struct {
-	cfg        *config.Config
-	host       host.Adapter
-	projects   *project.Service
-	discoverer *project.Discoverer
-	runtime    *session.Manager
-	events     *event.Service
-	tasks      *task.Service
-	agent      AgentResolver
-	agents     *agent.Service
-	terminal   *terminal.Hub
-	log        *slog.Logger
+	cfg         *config.Config
+	host        host.Adapter
+	projects    *project.Service
+	discoverer  *project.Discoverer
+	runtime     *session.Manager
+	events      *event.Service
+	tasks       *task.Service
+	agent       AgentResolver
+	agents      *agent.Service
+	agentStates *agentstate.Service
+	terminal    *terminal.Hub
+	log         *slog.Logger
 
 	startedAt time.Time
 	webDir    string
@@ -121,6 +123,15 @@ type Options struct {
 	// is the confusion this phase exists to remove.
 	Agents *agent.Service
 
+	// AgentStates is the projection of the event log into what is true about
+	// an agent now. It is read by the two state endpoints and written by
+	// nothing in this package.
+	//
+	// It is optional in the same way the others are, and a server without it
+	// explains itself on those two routes rather than answering with a state
+	// that was never computed.
+	AgentStates *agentstate.Service
+
 	// Terminal carries browser sockets to the runtime. It is optional only so
 	// that tests of the REST surface do not have to build one; a server
 	// without it answers the real-time endpoint with an explanation rather
@@ -157,20 +168,21 @@ func New(o Options) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:        o.Config,
-		host:       o.Host,
-		projects:   o.Projects,
-		discoverer: o.Discoverer,
-		runtime:    o.Runtime,
-		events:     o.Events,
-		tasks:      o.Tasks,
-		agent:      o.Agent,
-		agents:     o.Agents,
-		terminal:   o.Terminal,
-		log:        o.Logger,
-		startedAt:  o.StartedAt,
-		webDir:     o.WebDir,
-		now:        o.Now,
+		cfg:         o.Config,
+		host:        o.Host,
+		projects:    o.Projects,
+		discoverer:  o.Discoverer,
+		runtime:     o.Runtime,
+		events:      o.Events,
+		tasks:       o.Tasks,
+		agent:       o.Agent,
+		agents:      o.Agents,
+		agentStates: o.AgentStates,
+		terminal:    o.Terminal,
+		log:         o.Logger,
+		startedAt:   o.StartedAt,
+		webDir:      o.WebDir,
+		now:         o.Now,
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -212,6 +224,12 @@ func (s *Server) routes() http.Handler {
 	// endpoint.
 	mux.HandleFunc("PATCH /api/projects/{id}", s.handleUpdateProject)
 
+	// Every agent state in a project, most recently updated first. It is what a
+	// workspace asks for when it wants to show what each of its projects is
+	// doing without reading a timeline per project - and it is one query, where
+	// the timelines would be one per panel.
+	mux.HandleFunc("GET /api/projects/{id}/agent-states", s.handleListAgentStates)
+
 	// The runtime of one project. The operations are nested under the runtime
 	// because that is the resource they act on: the session is what is started,
 	// stopped, or removed, and a project is not.
@@ -237,6 +255,16 @@ func (s *Server) routes() http.Handler {
 	// client reads a history, and never writes one.
 	mux.HandleFunc("GET /api/projects/{id}/events", s.handleListProjectEvents)
 	mux.HandleFunc("GET /api/runtime/{id}/events", s.handleListRuntimeEvents)
+
+	// What the events add up to, as opposed to what happened. A state is
+	// derived from the timeline above and kept current as it is written, so a
+	// client that wants to know what an agent is doing now reads one row rather
+	// than paging through everything that has ever happened to it.
+	//
+	// There is no write here, and its absence is the design: a state is what
+	// the events add up to, and an endpoint that could set one would be a
+	// second place the truth lives.
+	mux.HandleFunc("GET /api/sessions/{id}/state", s.handleGetAgentState)
 
 	// The work somebody wants done, and the attempts made at it.
 	//

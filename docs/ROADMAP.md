@@ -21,6 +21,7 @@ As of version 0.6.5:
 | Phase 7.3B-0 — Runtime environment validation | **Done** | Also not an implementation phase. Whether the mechanism 7.3A found works on Windows, on WSL, and on pure Linux, measured rather than assumed. Windows verified end to end; WSL for everything but the model turn; pure Linux not at all, for want of interactive authentication. See `docs/CLAUDE_RUNTIME_VALIDATION.md`. |
 | Phase 7.3B-1 — ClaudeAdapter foundation | **Done** | The adapter itself: Claude's hooks and its stream-json translated into `agent.*` events and written through the existing event service. Seven event types, one write path, no database, no API, no UI. Validated end to end against Windows Claude Code 2.1.278. See `docs/CLAUDE_ADAPTER.md`. |
 | Phase 7.3B-2 — Runtime binding | **Done** | `internal/agent` connects the adapter to the product: one call starts the runtime if needed, dictates Claude's session id, attaches a hook receiver, writes the settings document, launches, and binds the attempt. Fixed the silently-refused `session.created` / `session.status_changed` payloads on the way. No schema change, no UI. See `docs/AGENT_RUNTIME_BINDING.md`. |
+| Phase 7.3C-1 — Agent state projection | **Done** | `internal/agentstate` folds `agent_events` into what is true about an agent now, stored in a new `agent_states` table and read by two endpoints. Driven from inside the event service, so the projection can be deleted and rebuilt from the log at any moment. No UI, no write endpoint. See `docs/AGENT_STATE.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -665,6 +666,26 @@ which is now closer than it was — the attempt is bound and the events are rout
 actionable turns AgentMux from an observer of a Claude session into a
 participant in one. `docs/AGENT_RUNTIME_BINDING.md` §6 and
 `docs/CLAUDE_ADAPTER.md` §10 are the lists.
+
+## Phase 7.3C — Agent state
+
+**Partly built.** 7.3B made the agent report what it is doing; 7.3C makes that
+report answerable as a question. Sub-phase **7.3C-1, the projection, is done**:
+`internal/agentstate` folds the event log into an `agent_states` row per attempt,
+driven from inside the event service so there is no path to a state that skips
+the log. Two endpoints read it and nothing writes it —
+`GET /api/sessions/{id}/state` and `GET /api/projects/{id}/agent-states`.
+`docs/AGENT_STATE.md` is the long form.
+
+**What remains in 7.3C is reach, not mechanism.** Three of the seven statuses
+cannot occur as things stand: `WAITING_INPUT` because no event produces it, and
+`COMPLETED` / `FAILED` because the events that would come from the CLI's `result`
+envelope are on a stream the runtime does not feed (7.3B-2 finding 3). An agent
+started without a task is not projected at all, because the adapter knows the
+attempt and does not put it in the payload. All three close the same way — more
+of what Claude says reaching the log — and none of them is a change to the
+projection, which already maps whatever arrives. §6 of `docs/AGENT_STATE.md` is
+the list.
 
 ## Phase 8 — CC Switch integration
 

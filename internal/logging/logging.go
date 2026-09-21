@@ -55,17 +55,23 @@ const ComponentField = "component"
 // They follow the package layout, so that a record can be traced back to the
 // code that wrote it without a lookup table.
 const (
-	ComponentConfig   = "config"
-	ComponentStorage  = "storage"
-	ComponentHost     = "host"
-	ComponentProject  = "project"
-	ComponentRuntime  = "session"
-	ComponentEvent    = "event"
-	ComponentTask     = "task"
-	ComponentAgent    = "claude"
-	ComponentTerminal = "terminal"
-	ComponentAPI      = "httpapi"
-	ComponentServer   = "server"
+	ComponentConfig  = "config"
+	ComponentStorage = "storage"
+	ComponentHost    = "host"
+	ComponentProject = "project"
+	ComponentRuntime = "session"
+	ComponentEvent   = "event"
+	ComponentTask    = "task"
+	ComponentAgent   = "claude"
+	// ComponentAgentState is the projection of the event log into what is true
+	// about an agent now. It is named after its package rather than after the
+	// agent, because a record about a projection is not a record about Claude:
+	// it says what the log added up to, which is a different question and a
+	// different component.
+	ComponentAgentState = "agentstate"
+	ComponentTerminal   = "terminal"
+	ComponentAPI        = "httpapi"
+	ComponentServer     = "server"
 )
 
 // Placeholder is written in place of any value that must not reach a log.

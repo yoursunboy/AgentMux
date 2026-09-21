@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/agent"
+	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/event"
@@ -224,6 +225,41 @@ func run(args []string) error {
 		return err
 	}
 
+	// The projection of the event log into what is true about an agent now.
+	//
+	// It is built after the event log because it is told about every event that
+	// log stores, and before everything else because everything else writes
+	// events: a projection installed late would be a projection that had missed
+	// whatever happened in the meantime.
+	//
+	// The two depend on each other - every stored event is projected, and a
+	// projection is rebuilt from the log - so one of them has to exist first.
+	// The event log does, and it is handed the projector on the next line.
+	stateLog := logging.Component(logger, logging.ComponentAgentState)
+	stateService, err := agentstate.NewService(agentstate.Options{
+		Repository: store.AgentStates(),
+		Events:     eventLog,
+		Projects:   projectService,
+		Logger:     stateLog,
+	})
+	if err != nil {
+		return err
+	}
+	eventLog.SetProjector(stateService)
+
+	// An empty projection over a log that has events in it is what a first run
+	// after this phase leaves behind, so it is recomputed once, here. A
+	// projection that already holds something is left alone: it is kept current
+	// as events are written, and rebuilding on every start would pay the whole
+	// history every time for nothing.
+	// The service reports what it did; this only reports what it could not do.
+	if _, _, err := stateService.RebuildIfNeeded(ctx); err != nil {
+		// A projection that could not be rebuilt is not a reason to refuse to
+		// start. The event log is intact and is the record; the state table is
+		// derived from it and can be recomputed on the next start.
+		stateLog.Error("could not rebuild the agent states", "error", err)
+	}
+
 	// The task model. It reads the project store to check that the project a
 	// task names exists, and it writes to the event log the same way the runtime
 	// manager does - through the service, never through the table.
@@ -352,18 +388,19 @@ func run(args []string) error {
 	}
 
 	api, err := httpapi.New(httpapi.Options{
-		Config:     cfg,
-		Host:       adapter,
-		Projects:   projectService,
-		Discoverer: discoverer,
-		Runtime:    runtimes,
-		Events:     eventLog,
-		Tasks:      taskService,
-		Agent:      agents,
-		Agents:     agentService,
-		Terminal:   terminalHub,
-		Logger:     logging.Component(logger, logging.ComponentAPI),
-		WebDir:     webDir,
+		Config:      cfg,
+		Host:        adapter,
+		Projects:    projectService,
+		Discoverer:  discoverer,
+		Runtime:     runtimes,
+		Events:      eventLog,
+		Tasks:       taskService,
+		Agent:       agents,
+		Agents:      agentService,
+		AgentStates: stateService,
+		Terminal:    terminalHub,
+		Logger:      logging.Component(logger, logging.ComponentAPI),
+		WebDir:      webDir,
 	})
 	if err != nil {
 		return err

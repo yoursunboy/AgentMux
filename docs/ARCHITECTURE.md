@@ -21,6 +21,7 @@ iPad / Phone / PC
 │ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1
 │ Agent Coordinator           │   internal/agent          — built in Phase 7.3B-2
 │ Event Log                   │   internal/event          — built in Phase 7.1
+│ Agent State                 │   internal/agentstate     — built in Phase 7.3C-1
 │ Controller Manager          │   internal/terminal       — built in Phase 6
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
@@ -67,6 +68,14 @@ receiver to the hooks it will fire, and binds the attempt. It starts nothing its
 operation below it belongs to the runtime manager, which this phase did not change. It is also the
 only component that knows the three, which is a cost as well as a licence — `docs/AGENT_RUNTIME_BINDING.md`
 §11 is the boundary as drawn and §6 is what the binding's lifetime costs.
+
+The Agent State projection, added in Phase 7.3C-1 as `internal/agentstate`, reads the Event Log and
+answers a different question from it: not what happened, but what is true now. It is driven from
+inside the event service, so there is no path from an observer of Claude to a state row that skips
+the log — which is what lets the whole table be deleted and recomputed from `agent_events` at any
+moment. It decides nothing and changes nothing: a state is a reading, and nothing in the build reads
+one to make a decision. `docs/AGENT_STATE.md` §1 draws the line between an event and a state, §2 is
+the projection, and §6 is what it does not cover.
 
 ## 2. Project vs Collection
 

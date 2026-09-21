@@ -1065,6 +1065,84 @@ has no runtime would be told it now has the one it asked for, and nothing would 
 `docs/TASK_MODEL.md` is the long form of this layer: what a task is, why it is not a runtime, what the
 lifecycle refuses and why, and what this phase deliberately does not do.
 
+## Agent state
+
+What the event log adds up to right now, as opposed to what happened — which is what the two timeline
+endpoints answer. A state is one row per attempt, derived from `agent_events` as they are written, so
+asking what an agent is doing costs one row rather than the whole history.
+
+**There is no write.** Not a PATCH, not a PUT, not a POST. A state is what the events add up to, and
+an endpoint that could set one would make it a second place the truth lives — and the two would
+disagree the moment the next event arrived. §15 of the phase that built this is the rule, and
+`docs/AGENT_STATE.md` §8 is the reasoning.
+
+### GET /api/sessions/{id}/state
+
+```json
+{
+  "agentSessionId": "sess_9a27…",
+  "projectId": "p_6f1a…",
+  "runtimeId": "amx-p_6f1a…",
+  "status": "WAITING_PERMISSION",
+  "lastEvent": "agent.permission_requested",
+  "lastEventAt": "2026-09-21T09:00:12Z",
+  "updatedAt": "2026-09-21T09:00:12Z"
+}
+```
+
+`runtimeId` is absent until the attempt is bound to a runtime, which happens when it starts. The
+statuses are `CREATED`, `RUNNING`, `WAITING_INPUT`, `WAITING_PERMISSION`, `COMPLETED`, `FAILED` and
+`STOPPED` — the agent's own vocabulary, deliberately not the runtime's and not the task's.
+
+`lastEvent` is an event **type**, never a payload. The row holds no prompt, no tool input and no
+transcript path, and `docs/AGENT_STATE.md` §7 is why.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| No event has produced a state for this attempt | 404 | `agent_state_not_found` |
+| The attempt id is empty | 400 | `agent_state_invalid` |
+| The server was built without the projection | 503 | `internal_error` |
+
+A 404 is the **ordinary answer**, not a failure: an attempt that was created and never started has
+none, and neither does an agent started without a task — there is no attempt for its events to be the
+state of. `docs/AGENT_STATE.md` §6 is the list of what is not projected.
+
+### GET /api/projects/{id}/agent-states
+
+```json
+{
+  "states": [
+    {
+      "agentSessionId": "sess_9a27…",
+      "projectId": "p_6f1a…",
+      "runtimeId": "amx-p_6f1a…",
+      "status": "RUNNING",
+      "lastEvent": "agent.started",
+      "lastEventAt": "2026-09-21T09:00:04Z",
+      "updatedAt": "2026-09-21T09:00:04Z"
+    }
+  ],
+  "count": 1
+}
+```
+
+Most recently updated first. `limit` is accepted the same way it is elsewhere in this API: absent
+means the service's default, and a value below 1 is a 400 rather than "no limit".
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The project does not exist | 404 | `project_not_found` |
+| `limit` is not a whole number, or is below 1 | 400 | `invalid_request` |
+| The server was built without the projection | 503 | `internal_error` |
+
+An unknown project is answered as a missing project rather than as a project with no agents. Those
+two answers mean different things, and an empty list is the one a client cannot tell apart from a
+project that exists and has nothing running.
+
+`docs/AGENT_STATE.md` is the long form of this layer: the difference between an event and a state,
+the projection, the status vocabulary and which parts of it are reachable, and how the whole table is
+rebuilt from the log.
+
 ## GET /api/ws
 
 **The one real-time endpoint.** Phase 4's terminal is served here and nowhere else: one WebSocket per
@@ -1194,6 +1272,12 @@ launches Claude under a session id AgentMux chose, attaches a receiver and binds
 the attempt. The adapter is no longer something a client has to imagine: starting
 an agent is what constructs one, and `docs/AGENT_RUNTIME_BINDING.md` is the whole
 of that chain.
+
+Since Phase 7.3C-1 what that adapter reports is also readable as a **current
+state** rather than only as a history: `GET /api/sessions/{id}/state` and
+`GET /api/projects/{id}/agent-states` answer from a projection of the log, and
+`docs/AGENT_STATE.md` is that layer. The two timeline endpoints remain the way to
+read what happened; the two state endpoints are the way to read what is true now.
 
 What is still not implemented, and is not stubbed:
 

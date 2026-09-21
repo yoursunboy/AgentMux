@@ -16,6 +16,7 @@ iPad / Phone / PC
 │ Terminal Manager            │   part of session.Manager — sequence, history
 │ Terminal Transport          │   internal/terminal       — built in Phase 4
 │ Workspace                   │   web/src/workspace       — built in Phase 5
+│ Console (read-only)         │   web/src/dashboard       — built in Phase 7.4B-1
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1

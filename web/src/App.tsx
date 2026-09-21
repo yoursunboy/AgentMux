@@ -14,6 +14,8 @@ import {
 } from './api/client'
 import type { Candidate, DiscoveryResult, Project } from './api/types'
 import { ErrorBanner } from './components/ErrorBanner'
+import { DashboardPage } from './dashboard/DashboardPage'
+import { isDashboardPath } from './dashboard/route'
 import { GlobalBar } from './components/GlobalBar'
 import { NewProjectDialog } from './components/NewProjectDialog'
 import { ProjectDetailsDialog } from './components/ProjectDetailsDialog'
@@ -39,20 +41,36 @@ import { useWorkspace } from './workspace/useWorkspace'
 type Dialog = 'none' | 'new' | 'register'
 
 /**
- * App is the whole UI: a global bar, a workspace of project panels, and the
+ * App decides which page this is.
+ *
+ * There are two, and the choice is a string comparison rather than a router: the
+ * console at `/dashboard`, and the workspace at everything else. The server
+ * already serves the single-page entry point for any unknown path, so a deep
+ * link works without a history abstraction or a route-matching language - see
+ * `dashboard/route.ts` for why that is the whole of the mechanism.
+ *
+ * The workspace is the default, and it has been since Phase 5. A deep link that
+ * this build does not recognise lands there, as it always has.
+ */
+export function App() {
+  if (isDashboardPath(window.location.pathname)) return <DashboardPage />
+  return <WorkspaceApp />
+}
+
+/**
+ * WorkspaceApp is the workspace: a global bar, a grid of project panels, and the
  * Project Manager in the last cell of every page.
  *
- * There is still no router and no dashboard. The workspace is one page of up to
- * five terminals plus the manager, and pages of them when there are more
- * projects open than fit; a route for "which panel is focused" would be a
- * router introduced to express a click.
+ * It is one page of up to five terminals plus the manager, and pages of them
+ * when there are more projects open than fit; a route for "which panel is
+ * focused" would be a router introduced to express a click.
  *
  * Everything the panels can do is decided here. A panel is handed callbacks and
  * knows nothing about the API, the workspace, or which display mode it is in -
  * which is what makes the grid, focus and full screen three boxes around one
  * component rather than three features.
  */
-export function App() {
+function WorkspaceApp() {
   const server = useServerInfo()
   const projects = useProjects()
   const reloadServer = server.reload

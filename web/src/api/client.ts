@@ -8,6 +8,8 @@
  */
 import type {
   AgentSession,
+  ControllerProjects,
+  Dashboard,
   CreateProjectInput,
   CreateTaskInput,
   DiscoveryResult,
@@ -151,6 +153,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 /** Server identity, health, capability flags, and configuration summary. */
 export async function fetchServerInfo(signal?: AbortSignal): Promise<ServerInfo> {
   return request<ServerInfo>('/server', { signal: signal ?? null })
+}
+
+/**
+ * The console, in one request.
+ *
+ * It is one call rather than seven on purpose: the server does the join, so
+ * this client does not call the runtime, agent, attention and action endpoints
+ * and stitch them together. `docs/CONTROLLER_API.md` is why.
+ */
+export async function fetchDashboard(signal?: AbortSignal): Promise<Dashboard> {
+  return request<Dashboard>('/controller', { signal: signal ?? null })
+}
+
+/** The console's project cards, without the server block. */
+export async function fetchControllerProjects(signal?: AbortSignal): Promise<ControllerProjects> {
+  return request<ControllerProjects>('/controller/projects', { signal: signal ?? null })
 }
 
 /** Registered projects. Archived projects are hidden unless asked for. */

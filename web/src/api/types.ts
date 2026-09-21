@@ -398,3 +398,24 @@ export interface ControllerProjects {
   projects: ProjectCard[]
   count: number
 }
+
+/**
+ * Which model a tool is currently bound to.
+ *
+ * **Nothing produces this yet.** The provider integration is Phase 8, and the
+ * dashboard response does not carry it: the controller's server block reports
+ * the build, whether a terminal can run here, and for how long the process has
+ * been up, and that is all. The type exists because the console reserves the
+ * space for it — a dashboard that grows a section when a later phase lands is a
+ * dashboard whose layout changes under the people using it.
+ *
+ * Until something fills it, the console shows `Unknown`. It does not show a
+ * guess: a model name that came from nowhere would be worse than an honest
+ * blank, because a person reading it would act on it.
+ */
+export interface ModelBinding {
+  /** The tool, for example `claude`. */
+  tool: string
+  /** The model it is bound to, for example the name a provider reports. */
+  model: string
+}

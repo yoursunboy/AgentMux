@@ -1,4 +1,5 @@
 import type { ServerInfo } from '../api/types'
+import { DASHBOARD_PATH } from '../dashboard/route'
 import { capitalise, describeHost, formatUptime } from '../lib/format'
 import type { ConnectionState, ConnectionStatus } from '../terminal/client'
 
@@ -145,6 +146,14 @@ export function GlobalBar({ info, loading, error, connection, onRetry }: GlobalB
           <option>Coming later</option>
         </select>
       </div>
+
+      {/* The console is a separate page, so this is a link and a page load
+          rather than a state change: leaving the workspace closes its terminal
+          socket, and the two pages share nothing that could be left out of
+          step. */}
+      <a className="global-bar__console" href={DASHBOARD_PATH}>
+        Console
+      </a>
 
       {error && (
         <button type="button" className="global-bar__retry" onClick={onRetry}>

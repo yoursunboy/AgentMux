@@ -207,7 +207,16 @@ async function waitForClaude(entry, timeoutMs) {
  * browser contexts at once, waits out a control grace and restarts the server
  * underneath its own fixture. Nothing after it would benefit from that.
  */
-const ALL_SUITES = ['transport', 'tasks', 'terminal', 'recovery', 'tablet', 'workspace', 'controller']
+const ALL_SUITES = [
+  'transport',
+  'tasks',
+  'terminal',
+  'recovery',
+  'tablet',
+  'workspace',
+  'dashboard',
+  'controller',
+]
 
 /**
  * The fixtures, and the role each one plays.

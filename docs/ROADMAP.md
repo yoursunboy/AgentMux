@@ -24,6 +24,7 @@ As of version 0.6.5:
 | Phase 7.3C-1 — Agent state projection | **Done** | `internal/agentstate` folds `agent_events` into what is true about an agent now, stored in a new `agent_states` table and read by two endpoints. Driven from inside the event service, so the projection can be deleted and rebuilt from the log at any moment. No UI, no write endpoint. See `docs/AGENT_STATE.md`. |
 | Phase 7.3C-2 — Attention and action queue | **Done** | `internal/attention` answers "what needs me": a level per attempt and a queue of pending actions, both projected from the same log, with three read endpoints and no way to answer an action. See `docs/AGENT_ATTENTION.md`. |
 | Phase 7.4A — Controller dashboard aggregation | **Done** | `internal/controller` joins the project, state, attention and action services into one response, with two GET routes and no writes. Four queries for any number of projects, no cache, no table. See `docs/CONTROLLER_API.md`. |
+| Phase 7.4B-1 — Controller web dashboard | **Done** | The first read-only screen: `/dashboard` renders the controller aggregation as a grid of project cards, with a server bar, status tones, and a layout from three columns to one. One request, a five-second poll, no terminal and no writes. See `docs/CONTROLLER_UI.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -706,9 +707,18 @@ table, two GET routes. `docs/CONTROLLER_API.md` is the long form, and the
 TypeScript types for the response are in `web/src/api/types.ts` with nothing
 reading them yet — the same position the task endpoints were in after Phase 7.2.
 
-**What remains in 7.4 is the console itself** — the screen, the sorting made
-visible, the badge and the queue panel. That is a UI phase, and the API it would
-render is now fixed.
+Sub-phase **7.4B-1, the console foundation, is done**: `/dashboard` renders the
+aggregation as a grid of project cards, sorted the way the server sorted them,
+with a server bar above and three columns down to one. It is read-only — no
+terminal, no input, no Claude control, no permission action, and a provider
+switch that is present and inert. `docs/CONTROLLER_UI.md` is the long form.
+
+**What remains in 7.4 is depth, not surface.** The queue is a count rather than
+a list, so nothing shows *which* actions are waiting; the console has no way to
+reach a project's terminal, which is what would make a card a door rather than a
+report; and the attention projection's known limits — a failed project staying at
+`WARNING` until something runs in it again, and an agent started without a task
+being invisible — are inherited here unchanged.
 
 ## Phase 8 — CC Switch integration
 

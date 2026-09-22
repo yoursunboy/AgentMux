@@ -1,6 +1,8 @@
 import type { ProjectCard as ProjectCardData } from '../api/types'
+import { pendingSentence } from '../actions/actionStyle'
 import { StatusBadge } from './StatusBadge'
 import { TerminalViewer } from './TerminalViewer'
+import { ACTIONS_PATH } from './route'
 import { absentStyle, agentStyle, attentionStyle, runtimeStyle, unavailableStyle } from './status'
 
 /**
@@ -105,20 +107,29 @@ export function ProjectPanel({ card }: ProjectPanelProps) {
         <dt className="project-card__term">Actions</dt>
         <dd className="project-card__value">
           {card.actions.available ? (
-            <span
-              className={
-                card.actions.pending > 0
-                  ? 'project-card__count project-card__count--pending'
-                  : 'project-card__count'
-              }
-              title={
-                card.actions.pending === 0
-                  ? 'Nothing is waiting in this project.'
-                  : `${card.actions.pending} ${card.actions.pending === 1 ? 'action is' : 'actions are'} waiting.`
-              }
-            >
-              {card.actions.pending}
-            </span>
+            card.actions.pending > 0 ? (
+              // §8 of the phase brief: a count that is a fact becomes a count
+              // that is a way in. It links to the queue rather than to one
+              // action because a card carries a number, not an id - and it is
+              // an `<a>`, so the destination is visible before it is clicked.
+              //
+              // It keeps the tone class the plain count had, so a card with
+              // something waiting is still the card that draws the eye.
+              <a
+                className="project-card__action-link"
+                href={ACTIONS_PATH}
+                title={`${pendingSentence(card.actions.pending)} The queue is at /actions; the answer is given at the terminal.`}
+              >
+                <span className="project-card__glyph" aria-hidden="true">
+                  {'⚠'}
+                </span>
+                {pendingSentence(card.actions.pending)}
+              </a>
+            ) : (
+              <span className="project-card__count" title="Nothing is waiting in this project.">
+                {card.actions.pending}
+              </span>
+            )
           ) : (
             <StatusBadge status={unavailableStyle('action queue')} />
           )}

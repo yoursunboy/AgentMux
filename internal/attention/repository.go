@@ -73,6 +73,30 @@ type Repository interface {
 	// newest first.
 	ListActionsByProject(ctx context.Context, projectID string, limit int) ([]Action, error)
 
+	// ListActions returns actions across every project, pending first and then
+	// newest first.
+	//
+	// The ordering is deliberately the one ListActionsByProject uses. Two
+	// orderings of one table is how a console and a project page come to
+	// disagree about which action is at the top of the queue.
+	ListActions(ctx context.Context, limit int) ([]Action, error)
+
+	// ActionByID returns one action.
+	//
+	// It returns an error carrying CodeNotFound when the queue holds no such
+	// action, so that a caller can tell "no such action" from "the read failed"
+	// without decoding a message.
+	ActionByID(ctx context.Context, id string) (Action, error)
+
+	// PendingActionCountsByType returns how many actions are waiting, grouped by
+	// type, across every project. A type with nothing pending is absent from the
+	// map, as it is from PendingActionCounts.
+	//
+	// It is grouped by type and not by level because this layer knows types;
+	// folding types into the two lists a console shows is a product decision and
+	// belongs to whoever builds that view.
+	PendingActionCountsByType(ctx context.Context) (map[ActionType]int, error)
+
 	// ResolveActions marks every pending action of the given types on one
 	// attempt as resolved at a time.
 	//

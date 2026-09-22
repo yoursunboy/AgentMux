@@ -497,3 +497,186 @@ func TestBatchReadsWithNoProjects(t *testing.T) {
 		t.Errorf("PendingActionCounts(nil) = %v; want an empty map", counts)
 	}
 }
+
+// TestListActionsSpansEveryProjectAndKeepsTheQueuesOrdering covers the read the
+// console's queue page is built on.
+//
+// The ordering is asserted against the same rule ListActionsByProject uses, and
+// that is the point of the test rather than an incidental: a console reading the
+// whole queue and a project page reading one project's slice must put the same
+// action in the same place, or the same action appears twice in two positions.
+func TestListActionsSpansEveryProjectAndKeepsTheQueuesOrdering(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	rows := []attention.Action{
+		actionRow(anActionID("c001"), "sess_c1", "p_c", attention.ActionViewCompletion, attentionAt(10)),
+		actionRow(anActionID("a001"), "sess_a1", "p_a", attention.ActionViewFailure, attentionAt(11)),
+		actionRow(anActionID("b001"), "sess_b1", "p_b", attention.ActionPermissionRequest, attentionAt(12)),
+		actionRow(anActionID("a002"), "sess_a2", "p_a", attention.ActionViewCompletion, attentionAt(13)),
+	}
+	for _, a := range rows {
+		if _, err := repo.RaiseAction(ctx, a); err != nil {
+			t.Fatalf("RaiseAction returned an error: %v", err)
+		}
+	}
+	// Settle the newest row of all, so the ordering has to sort on status
+	// before it sorts on time. Without this the pending rows happen to be the
+	// newest ones and a listing that ignored status entirely would still pass.
+	if _, err := repo.ResolveActions(ctx, "sess_a2", []attention.ActionType{attention.ActionViewCompletion}, attentionAt(20)); err != nil {
+		t.Fatalf("ResolveActions returned an error: %v", err)
+	}
+
+	list, err := repo.ListActions(ctx, attention.DefaultListLimit)
+	if err != nil {
+		t.Fatalf("ListActions returned an error: %v", err)
+	}
+	if len(list) != 4 {
+		t.Fatalf("ListActions returned %d rows; want 4 - every project's", len(list))
+	}
+
+	want := []string{
+		anActionID("b001"), // pending, 12:00:12
+		anActionID("a001"), // pending, 12:00:11
+		anActionID("c001"), // pending, 12:00:10
+		anActionID("a002"), // settled, 12:00:13 - the newest row, and still last
+	}
+	for i, id := range want {
+		if list[i].ID != id {
+			t.Errorf("row %d is %s; want %s - pending first, then newest first", i, list[i].ID, id)
+		}
+	}
+	if list[3].Status != attention.ActionResolved {
+		t.Errorf("the last row is %s; want the settled one", list[3].Status)
+	}
+
+	// And the limit truncates the listing without disturbing the order.
+	page, err := repo.ListActions(ctx, 2)
+	if err != nil {
+		t.Fatalf("ListActions with a limit returned an error: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("ListActions(2) returned %d rows; want 2", len(page))
+	}
+	if page[0].ID != want[0] || page[1].ID != want[1] {
+		t.Errorf("ListActions(2) = %s, %s; want the first two of the queue", page[0].ID, page[1].ID)
+	}
+
+	// And the whole queue puts one project's actions in the same relative order
+	// the project's own listing does. This is the claim the doc comment makes,
+	// checked rather than asserted: a console and a project page showing the
+	// same two actions in two orders is the disagreement this read exists to
+	// avoid.
+	perProject, err := repo.ListActionsByProject(ctx, "p_a", attention.DefaultListLimit)
+	if err != nil {
+		t.Fatalf("ListActionsByProject returned an error: %v", err)
+	}
+	var fromQueue []string
+	for _, a := range list {
+		if a.ProjectID == "p_a" {
+			fromQueue = append(fromQueue, a.ID)
+		}
+	}
+	var fromProject []string
+	for _, a := range perProject {
+		fromProject = append(fromProject, a.ID)
+	}
+	if len(fromQueue) != len(fromProject) {
+		t.Fatalf("the queue holds %d of p_a's actions; its own listing holds %d", len(fromQueue), len(fromProject))
+	}
+	for i := range fromProject {
+		if fromQueue[i] != fromProject[i] {
+			t.Errorf("p_a's actions are %v in the queue and %v in the project listing; want one order",
+				fromQueue, fromProject)
+			break
+		}
+	}
+}
+
+// TestActionByIDReadsOneAndReportsAMissingOne is the single-action read.
+//
+// The absence is the part that matters: a zero Action would render as an empty
+// card for an id that never existed, and a client could not tell that from an
+// action whose fields happened to be empty.
+func TestActionByIDReadsOneAndReportsAMissingOne(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	row := actionRow(anActionID("d001"), "sess_d1", "p_d", attention.ActionViewFailure, attentionAt(10))
+	row.Reason = "attempt failed"
+	if _, err := repo.RaiseAction(ctx, row); err != nil {
+		t.Fatalf("RaiseAction returned an error: %v", err)
+	}
+
+	got, err := repo.ActionByID(ctx, anActionID("d001"))
+	if err != nil {
+		t.Fatalf("ActionByID returned an error: %v", err)
+	}
+	if got.ProjectID != "p_d" || got.Type != attention.ActionViewFailure {
+		t.Errorf("ActionByID returned %+v; want the row that was raised", got)
+	}
+
+	_, err = repo.ActionByID(ctx, anActionID("nope"))
+	if !attention.IsCode(err, attention.CodeNotFound) {
+		t.Errorf("ActionByID of an unknown id returned %v; want %s", err, attention.CodeNotFound)
+	}
+}
+
+// TestPendingActionCountsByTypeCountsOnlyWhatIsWaiting is the read the console's
+// headline is built on.
+//
+// A settled action is history, and a headline that counted history would be a
+// number that never went down - which is the one thing a "needs you" count
+// cannot be.
+func TestPendingActionCountsByTypeCountsOnlyWhatIsWaiting(t *testing.T) {
+	repo := newAttentionStore(t)
+	ctx := context.Background()
+
+	rows := []attention.Action{
+		actionRow(anActionID("e001"), "sess_e1", "p_a", attention.ActionPermissionRequest, attentionAt(10)),
+		actionRow(anActionID("e002"), "sess_e2", "p_b", attention.ActionPermissionRequest, attentionAt(11)),
+		actionRow(anActionID("e003"), "sess_e3", "p_a", attention.ActionViewFailure, attentionAt(12)),
+		actionRow(anActionID("e004"), "sess_e4", "p_c", attention.ActionViewCompletion, attentionAt(13)),
+	}
+	for _, a := range rows {
+		if _, err := repo.RaiseAction(ctx, a); err != nil {
+			t.Fatalf("RaiseAction returned an error: %v", err)
+		}
+	}
+	if _, err := repo.ResolveActions(ctx, "sess_e1", []attention.ActionType{attention.ActionPermissionRequest}, attentionAt(20)); err != nil {
+		t.Fatalf("ResolveActions returned an error: %v", err)
+	}
+
+	counts, err := repo.PendingActionCountsByType(ctx)
+	if err != nil {
+		t.Fatalf("PendingActionCountsByType returned an error: %v", err)
+	}
+	if counts[attention.ActionPermissionRequest] != 1 {
+		t.Errorf("PERMISSION_REQUEST = %d; want 1 - the settled one is not waiting",
+			counts[attention.ActionPermissionRequest])
+	}
+	if counts[attention.ActionViewFailure] != 1 {
+		t.Errorf("VIEW_FAILURE = %d; want 1", counts[attention.ActionViewFailure])
+	}
+	if counts[attention.ActionViewCompletion] != 1 {
+		t.Errorf("VIEW_COMPLETION = %d; want 1", counts[attention.ActionViewCompletion])
+	}
+	if len(counts) != 3 {
+		t.Errorf("PendingActionCountsByType returned %d types; want 3", len(counts))
+	}
+}
+
+// TestPendingActionCountsByTypeWithNothingWaiting is the fresh-installation
+// answer, and it is an empty map rather than null so a caller ranges over one
+// shape.
+func TestPendingActionCountsByTypeWithNothingWaiting(t *testing.T) {
+	repo := newAttentionStore(t)
+
+	counts, err := repo.PendingActionCountsByType(context.Background())
+	if err != nil {
+		t.Fatalf("PendingActionCountsByType returned an error: %v", err)
+	}
+	if len(counts) != 0 {
+		t.Errorf("PendingActionCountsByType = %v; want an empty map", counts)
+	}
+}

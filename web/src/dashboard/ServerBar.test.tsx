@@ -1,7 +1,7 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import { makeControllerServer, makeModelBinding } from '../test/controller'
+import { makeControllerServer, makeModelBinding, makeQueueSummary } from '../test/controller'
 import { ServerBar } from './ServerBar'
 
 describe('ServerBar', () => {
@@ -61,5 +61,47 @@ describe('ServerBar', () => {
   it('offers a way back to the workspace', () => {
     render(<ServerBar server={makeControllerServer()} />)
     expect(screen.getByRole('link', { name: 'Workspace' })).toHaveAttribute('href', '/')
+  })
+
+  // §8 of the phase brief: the bar carries what is waiting, and a way to go and
+  // look at it. Both numbers come from the dashboard response, so the bar and
+  // the cards below it are one answer that can be wrong in one way.
+  it('says how much is waiting, and links to it', () => {
+    const { container } = render(
+      <ServerBar server={makeControllerServer()} queue={makeQueueSummary({ needsYou: 2, notices: 5 })} />,
+    )
+
+    const queue = screen.getByRole('link', { name: /Needs you/ })
+    expect(queue).toHaveAttribute('href', '/actions')
+    expect(queue).toHaveTextContent('Needs you: 2')
+    expect(queue).toHaveTextContent('Notices: 5')
+    expect(container.querySelector('.server-bar__queue-count--needs-you')).toHaveTextContent('2')
+  })
+
+  it('does not shout about a count of zero', () => {
+    const { container } = render(<ServerBar server={makeControllerServer()} queue={makeQueueSummary()} />)
+
+    expect(container.querySelector('.server-bar__queue-count--needs-you')).not.toBeInTheDocument()
+    expect(screen.getByRole('link', { name: /Needs you/ })).toHaveTextContent('Needs you: 0')
+  })
+
+  // A bar that could not read the queue says nothing rather than saying zero,
+  // because a zero is a claim and this bar is not in a position to make it.
+  it('says nothing about the queue when it has none', () => {
+    const { container } = render(<ServerBar server={makeControllerServer()} />)
+
+    expect(container.querySelector('.server-bar__queue')).not.toBeInTheDocument()
+  })
+
+  // The hazard this element was designed around, pinned rather than remembered:
+  // `web/e2e/suites/dashboard.mjs` clicks `.server-bar__link`, and Playwright's
+  // strict mode throws when one selector matches two elements. A second link
+  // sharing that class would break a suite about something else.
+  it('keeps the workspace link the only server-bar__link on the bar', () => {
+    const { container } = render(
+      <ServerBar server={makeControllerServer()} queue={makeQueueSummary({ needsYou: 1 })} />,
+    )
+
+    expect(container.querySelectorAll('.server-bar__link')).toHaveLength(1)
   })
 })

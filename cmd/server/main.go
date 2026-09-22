@@ -274,6 +274,7 @@ func run(args []string) error {
 		Projects:  projectService,
 		Agents:    stateService,
 		Attention: attentionService,
+		Actions:   attentionService,
 		Logger:    controllerLog,
 	})
 	if err != nil {

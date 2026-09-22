@@ -74,7 +74,7 @@ export function DashboardPage({ pollMs }: DashboardPageProps = {}) {
         </div>
       ) : (
         <>
-          <ServerBar server={data.server} />
+          <ServerBar server={data.server} queue={data.queue} />
 
           {error !== null && (
             <p className="dashboard__stale" role="status">

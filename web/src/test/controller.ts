@@ -9,7 +9,13 @@
  * agent is working - the ordinary case - so a test that is about a failure says
  * only what makes it one.
  */
-import type { ControllerServer, Dashboard, ModelBinding, ProjectCard } from '../api/types'
+import type {
+  ControllerServer,
+  Dashboard,
+  ModelBinding,
+  ProjectCard,
+  QueueSummary,
+} from '../api/types'
 
 /** A server that is up and can host a terminal. */
 export function makeControllerServer(overrides: Partial<ControllerServer> = {}): ControllerServer {
@@ -54,12 +60,24 @@ export function makeQuietProjectCard(overrides: Partial<ProjectCard> = {}): Proj
   })
 }
 
-/** A whole dashboard response. */
+/** How much is waiting, for the console's bar. */
+export function makeQueueSummary(overrides: Partial<QueueSummary> = {}): QueueSummary {
+  return { needsYou: 0, notices: 0, ...overrides }
+}
+
+/**
+ * A whole dashboard response.
+ *
+ * The default queue is empty, which is the ordinary case and the one a test that
+ * is about something else should not have to say. A test about the bar passes
+ * its own.
+ */
 export function makeDashboard(overrides: Partial<Dashboard> = {}): Dashboard {
   return {
     server: makeControllerServer(),
     projects: [makeProjectCard()],
     count: 1,
+    queue: makeQueueSummary(),
     ...overrides,
   }
 }

@@ -30,6 +30,55 @@ export function formatTimestamp(value: string | null | undefined): string {
 }
 
 /**
+ * formatRelativeTime renders a timestamp as how long ago it was.
+ *
+ * §7 of the phase brief asks for "10 minutes ago" rather than a date, and it is
+ * the right answer for an action: what a person needs to know about something
+ * waiting is whether it started waiting now or an hour ago, and a clock time
+ * makes them do the subtraction.
+ *
+ * `now` is a parameter so a test can pin it. A function that read the clock
+ * itself could only be tested by mocking one, and the rounding boundaries - the
+ * place this kind of function is actually wrong - are exactly what a fixed
+ * instant lets a test reach.
+ *
+ * A value this build cannot read is shown as it arrived rather than as a
+ * duration: "Unknown" for an empty one, and the raw string for one that is not a
+ * timestamp. A time that came from nowhere must not read as "just now".
+ */
+export function formatRelativeTime(
+  value: string | null | undefined,
+  now: Date = new Date(),
+): string {
+  if (!value) return 'Unknown'
+
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return value
+
+  const seconds = Math.floor((now.getTime() - parsed.getTime()) / 1000)
+
+  // A clock that is slightly behind the server's is ordinary, and "in 3 seconds"
+  // about something that has already happened would be a confusing thing to
+  // read. Anything within a minute either way is now.
+  if (seconds < 60) return 'just now'
+
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} ${minutes === 1 ? 'minute' : 'minutes'} ago`
+
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours} ${hours === 1 ? 'hour' : 'hours'} ago`
+
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days} ${days === 1 ? 'day' : 'days'} ago`
+
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months} ${months === 1 ? 'month' : 'months'} ago`
+
+  const years = Math.floor(months / 12)
+  return `${years} ${years === 1 ? 'year' : 'years'} ago`
+}
+
+/**
  * describeHost renders the Global Bar's host section, for example
  * "Windows / WSL" or "Linux".
  */

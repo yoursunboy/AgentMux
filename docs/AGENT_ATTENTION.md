@@ -270,8 +270,9 @@ short fixed phrase. Neither has a field for a prompt, a tool input, a transcript
 path, a credential or a token count, and their absence is the design.
 
 **`Reason` is a constant from this package's vocabulary**, never a quotation.
-The longest phrase is nineteen characters and the column is bounded at 64, which
-is what makes it impossible for a reason to become an event payload by accident.
+The longest phrase is twenty characters (`permission requested`) and the column is
+bounded at 64, which is what makes it impossible for a reason to become an event
+payload by accident.
 Nothing here names a tool, quotes a payload, or includes anything a person wrote.
 
 **`EXPIRED` and `RESOLVED` are not decisions.** `RESOLVED` is what the log shows,
@@ -283,6 +284,8 @@ and nothing consults it to decide anything.
 GET /api/sessions/{id}/attention    one attempt
 GET /api/projects/{id}/attention    a project's, most recently updated first
 GET /api/projects/{id}/actions      the queue: pending first, then newest
+GET /api/actions                    every project's queue, the same order
+GET /api/actions/{id}               one action, with its project named
 ```
 
 A client that wants "what needs me" reads the project's actions and takes the
@@ -291,10 +294,27 @@ the project's attention. Neither exists to be polled on a timer: the answers
 change when an event arrives, and a client already watching a runtime over the
 WebSocket knows when something happened.
 
-**What a UI would do with it, when one exists.** The actions list is a queue
-panel: the pending items, newest first, each one naming the attempt and what
-kind of thing it is. Selecting one opens that attempt's terminal — which is where
-the answer actually gets given, and which is why the action carries no button
-that answers anything. The attention list is a per-project badge: the worst level
-in the project, and a count of what is waiting. Neither needs anything the
-endpoints do not return today.
+The last two routes were added in Phase 7.4C and are the only ones here that are
+not scoped to a project. They are joined through `internal/controller` rather
+than answered here, because naming an action's project is a join and this package
+does not know project names — `internal/attention` gained a listing, a one-row
+read, a grouped count and `LevelOfAction`, and gained nothing else. This section
+predicted what a UI would do with a queue; `docs/ACTION_CENTER.md` is the one
+that got built, and the rest of this section is that prediction kept so the two
+can be compared.
+
+**What the UI did with it, and where it differed.** The prediction held on
+buttons — the action carries nothing that answers anything, and the detail page
+has no `button` element at all. It differed on selection: the prediction was that
+selecting an action opens *that attempt's terminal*, and what was built links to
+the workspace root instead, because the workspace has no URL-addressed project to
+open (`docs/ACTION_CENTER.md` §4 records it as a limit rather than a bug). It
+also held on the shape — the queue is a list of pending items newest first,
+each naming the attempt and the kind of thing it is — with one addition the
+prediction did not anticipate and could not have: because `settlePending` above
+resolves permission requests and nothing else, a queue read literally would lead
+with a number that only ever grows. The page splits it into **needs you** and
+**notices** instead, and `docs/ACTION_CENTER.md` §2 is why.
+
+The attention list did become a per-project badge, and the count of what is
+waiting is now on the project's card and totalled in the console's bar.

@@ -7,6 +7,8 @@
  * number or a message string.
  */
 import type {
+  ActionItem,
+  ActionQueue,
   AgentSession,
   ControllerProjects,
   Dashboard,
@@ -169,6 +171,37 @@ export async function fetchDashboard(signal?: AbortSignal): Promise<Dashboard> {
 /** The console's project cards, without the server block. */
 export async function fetchControllerProjects(signal?: AbortSignal): Promise<ControllerProjects> {
   return request<ControllerProjects>('/controller/projects', { signal: signal ?? null })
+}
+
+/**
+ * Every project's actions, pending first.
+ *
+ * # Why this is flat and not nested under a project
+ *
+ * The question it answers is "which agent needs me", which is not about one
+ * project and cannot be asked of a project-scoped route. The server does the
+ * join onto project names, so a client never has to look one up per action.
+ *
+ * # What it never carries
+ *
+ * An action is an identifier, an enumeration, a timestamp and a fixed phrase the
+ * server wrote. There is no prompt, no tool input, no transcript, no command and
+ * no credential anywhere in the response - `docs/ACTION_CENTER.md` §6 is the
+ * long form, and `internal/httpapi/actions_test.go` is the assertion.
+ */
+export async function fetchActions(signal?: AbortSignal): Promise<ActionQueue> {
+  return request<ActionQueue>('/actions', { signal: signal ?? null })
+}
+
+/**
+ * One action, by id.
+ *
+ * The id is encoded rather than interpolated: it comes from a response now, but
+ * it also arrives from the address bar, and a value from an address bar is one
+ * that has been typed by somebody.
+ */
+export async function fetchAction(id: string, signal?: AbortSignal): Promise<ActionItem> {
+  return request<ActionItem>(`/actions/${encodeURIComponent(id)}`, { signal: signal ?? null })
 }
 
 /** Registered projects. Archived projects are hidden unless asked for. */

@@ -18,6 +18,7 @@ type Service struct {
 	projects  ProjectLister
 	agents    StateReader
 	attention AttentionReader
+	actions   ActionReader
 	log       *slog.Logger
 }
 
@@ -62,6 +63,16 @@ type Options struct {
 	Agents    StateReader
 	Attention AttentionReader
 
+	// Actions is the action queue this package reads for the console's queue
+	// page and for the two counts on its bar.
+	//
+	// It is separate from Attention because it answers a different question -
+	// Attention says whether anybody needs to care about a project, and this
+	// says what is waiting in the queue - and a server may reasonably have the
+	// first without the second. It may be nil, with the same untyped-nil
+	// warning the two above carry.
+	Actions ActionReader
+
 	// Logger receives diagnostics. Nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -75,6 +86,7 @@ func NewService(o Options) (*Service, error) {
 		projects:  o.Projects,
 		agents:    o.Agents,
 		attention: o.Attention,
+		actions:   o.Actions,
 		log:       o.Logger,
 	}
 	if s.log == nil {
@@ -97,7 +109,12 @@ func (s *Service) Dashboard(ctx context.Context, server ServerSummary) (Dashboar
 	if err != nil {
 		return Dashboard{}, err
 	}
-	return Dashboard{Server: server, Projects: cards, Count: len(cards)}, nil
+	return Dashboard{
+		Server:   server,
+		Projects: cards,
+		Count:    len(cards),
+		Queue:    s.Queue(ctx),
+	}, nil
 }
 
 // Projects returns one card per project, most in need of attention first.

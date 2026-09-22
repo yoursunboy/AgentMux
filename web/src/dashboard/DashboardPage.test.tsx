@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { fetchDashboard } from '../api/client'
-import { makeDashboard, makeProjectCard, makeQuietProjectCard } from '../test/controller'
+import { makeDashboard, makeProjectCard, makeQueueSummary, makeQuietProjectCard } from '../test/controller'
 import { renderWithTerminal } from '../test/dashboard'
 import { setViewportWidth } from '../test/layout'
 import { DashboardPage } from './DashboardPage'
@@ -215,5 +215,49 @@ describe('DashboardPage', () => {
     expect(await screen.findByText(/Not current/)).toBeInTheDocument()
     // The card is still on screen, which is the point of the whole state.
     expect(screen.getAllByRole('article')).toHaveLength(1)
+  })
+
+  // §8 of the phase brief: the bar says which agent needs handling before any
+  // card is read, and the number is the server's rather than one counted here.
+  it('carries the queue on the server bar', async () => {
+    load.mockResolvedValue(makeDashboard({ queue: makeQueueSummary({ needsYou: 2, notices: 5 }) }))
+    renderWithTerminal(<DashboardPage />)
+    await screen.findByRole('article')
+
+    const queue = screen.getByRole('link', { name: /Needs you/ })
+    expect(queue).toHaveAttribute('href', '/actions')
+    expect(queue).toHaveTextContent('Needs you: 2')
+    expect(queue).toHaveTextContent('Notices: 5')
+  })
+
+  // §8: a count that is a fact becomes a way in. The card carries a count and
+  // not an id, so it links to the queue rather than to one action.
+  it('turns a pending count into a way into the queue', async () => {
+    load.mockResolvedValue(
+      makeDashboard({
+        projects: [makeProjectCard({ actions: { available: true, pending: 1 } })],
+        count: 1,
+      }),
+    )
+    renderWithTerminal(<DashboardPage />)
+
+    const card = await screen.findByRole('article')
+    const link = row(card, 'Actions').querySelector('.project-card__action-link')
+    expect(link).toHaveAttribute('href', '/actions')
+    expect(link).toHaveTextContent('1 action pending')
+  })
+
+  it('leaves a count of zero as a number with nowhere to go', async () => {
+    load.mockResolvedValue(
+      makeDashboard({
+        projects: [makeProjectCard({ actions: { available: true, pending: 0 } })],
+        count: 1,
+      }),
+    )
+    renderWithTerminal(<DashboardPage />)
+
+    const card = await screen.findByRole('article')
+    expect(row(card, 'Actions')).toHaveTextContent('0')
+    expect(row(card, 'Actions').querySelector('.project-card__action-link')).not.toBeInTheDocument()
   })
 })

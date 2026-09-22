@@ -221,6 +221,13 @@ async function waitForClaude(entry, timeoutMs) {
  * `controller` is last because it is the most expensive of them: it drives two
  * browser contexts at once, waits out a control grace and restarts the server
  * underneath its own fixture. Nothing after it would benefit from that.
+ *
+ * `action-center` is appended after it, and is the most expensive thing any
+ * suite here asks of the machine: it starts a runtime, makes a terminal busy,
+ * launches an agent into it, and then - when this host has room - starts a real
+ * Claude on top of the two the fixture already runs. It goes last for that
+ * reason and one more: half of it is gated on that Claude coming up, so a run
+ * that cannot finish it has already finished everything else.
  */
 const ALL_SUITES = [
   'transport',
@@ -233,6 +240,7 @@ const ALL_SUITES = [
   'dashboard-terminal',
   'controller-input',
   'controller',
+  'action-center',
 ]
 
 /**

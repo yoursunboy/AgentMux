@@ -32,7 +32,7 @@ would each write it again, and each would get the sorting subtly different.
 It is also **four requests per project**. A hundred projects is four hundred
 requests to draw one screen.
 
-The join belongs on the server, where it is four queries for any number of
+The join belongs on the server, where it is five queries for any number of
 projects.
 
 ### What it is not
@@ -90,9 +90,45 @@ an operator everything is still there for an operator.
       "updatedAt": "2026-09-21T09:00:12Z"
     }
   ],
+  "queue": { "needsYou": 1, "notices": 4 },
   "count": 1
 }
 ```
+
+### `queue`, and why it is on this response
+
+`queue` is how much is waiting **across every project**, split the way a console
+reads it: what stops work, and what can be read later.
+
+```text
+needsYou   pending, and ACTION_REQUIRED
+notices    pending, and anything else
+```
+
+It rides here rather than being a second request because a console's bar draws
+its own header, and a header that cost an endpoint of its own would be the
+console calling two things to render one screen — which is the whole of what §1
+above exists to prevent. It is deliberately **not** a sum of the cards' own
+`actions.pending` fields: the two are different questions (see §3), and a client
+adding up seven cards to draw a headline would be a client doing a join.
+
+**The split is a product decision taken here and nowhere else.** "Which of these
+stops work and which can be read later" is about a screen, and
+`internal/attention` is deliberately not told it: that package reads a *type*,
+`LevelOfAction` reads a type as a *level*, and folding levels into two lists is
+the controller's job. A type this build does not know counts as a notice — it is
+something to read, and it is not a claim that work has stopped.
+
+**A failure is not fatal and not visible.** A server without an action reader, or
+one whose count could not be read, sends `{"needsYou": 0, "notices": 0}` and logs
+a warning. A header that could not count what is waiting says nothing rather than
+taking the page down.
+
+**Why the counts and the list can disagree.** `GET /api/actions` answers the same
+two counts beside a limited page of rows. The counts are pending-only and exact;
+the page includes settled rows. A caller that asked for ten rows still gets the
+true totals, which is what lets a console show a headline that does not change
+when somebody scrolls.
 
 ### Three vocabularies, passed through
 
@@ -140,6 +176,7 @@ things that must not leave the machine.
 | `agent` | the agent state projection | one query for every project |
 | `attention` | the attention projection | one query for every project |
 | `actions.pending` | the attention projection's action counts | one grouped query |
+| `queue` | the attention projection's pending counts by type | one grouped query |
 
 The runtime status is the project service's own derived field, which it computes
 from the runtime manager's in-memory map. That is what makes reading a hundred
@@ -155,6 +192,13 @@ that is what "what is the agent doing" means — an agent is one process at a ti
 is a backlog, and a backlog is something a project has rather than something one
 attempt has. The two are different kinds of number and the asymmetry is
 deliberate.
+
+The last two rows of the table above are the same rows grouped two ways — by
+project for the cards, by type for the bar — and they are two queries rather than
+one because they answer two different questions. A later phase could read the
+type-grouped counts once and fold them per project, and has not: the card's
+number is a count of a project's pending actions *whatever they are*, and the
+bar's two numbers are the whole installation's split by what they demand.
 
 ## 4. Sorting
 
@@ -183,25 +227,28 @@ ones rather than flattening every card together.
 
 ## 5. Performance
 
-Four queries for any number of projects:
+Five queries for any number of projects:
 
 ```text
 projects.List                        one
 agents.StatesForProjects             one
 attention.AttentionForProjects       one
 attention.PendingCountsForProjects   one
+attention.PendingCountsByType        one     the bar's two counts
 ```
 
 The implementation this exists to avoid is a loop that asks each project four
 questions. That is the N+1 §13 of the phase brief forbids, and it is what a
 client would have written for itself.
 
-A console with no projects asks nothing at all: the three projection reads are
+A console with no projects asks almost nothing: the three projection reads are
 skipped rather than issued with an empty list, because a query for no rows is a
-query that cannot match anything.
+query that cannot match anything. The queue count is not skipped, because "how
+much is waiting anywhere" is a question about the installation rather than about
+its projects, and an empty project list is not the same as an empty queue.
 
 **There is no cache.** §14 allowed a short in-memory one and it is not here,
-because there is nothing yet to cache: the four reads are local and bounded, and
+because there is nothing yet to cache: the reads are local and bounded, and
 a cache would be a copy of the truth that could disagree with it. A cache is
 worth adding when a measurement says so, and the measurement to make is the
 dashboard's p99 on an installation with a hundred projects — which this phase
@@ -246,17 +293,25 @@ by this phase.
 6. **The server block is not cached**, so a dashboard request runs the same
    assembly `GET /api/server` does — which includes a dependency check and a
    tmux probe. Both are cached by the layers that do them, but a console polling
-   every second is doing more work than the four queries above suggest.
-7. **Nothing consumes it yet.** The endpoint exists, the types exist in
-   `web/src/api/types.ts`, and no screen reads either. This is the same position
-   the task and session endpoints were in after Phase 7.2, and for the same
-   reason: the API is built first so the UI has something true to render.
+   every second is doing more work than the five queries above suggest.
+7. **`queue` counts a backlog that only partly drains.** `needsYou` rises and
+   falls, because a permission request settles itself when the session moves on.
+   `notices` rises and does not fall, because a failure or a completion action is
+   never resolved — `docs/AGENT_ATTENTION.md` §3 is the lifecycle that makes that
+   true. A console showing both numbers is showing one that
+   a person can clear and one that records what has happened. Anyone tempted to
+   make the second one go down should read `docs/ACTION_CENTER.md` §2 first: the
+   fix is a resolution rule, which is a product decision rather than a bug.
 
 ## 8. Where this sits
 
 - `internal/controller/` — the aggregation, and the only package that reads
   three services to build one answer.
 - `internal/httpapi/controller.go` — the two routes.
+- `internal/controller/actions.go` — the queue the two `GET /api/actions` routes
+  read through, and the one place a type is folded into `needsYou` or `notices`.
 - `docs/AGENT_STATE.md` and `docs/AGENT_ATTENTION.md` — the two projections the
   cards are mostly made of.
+- `docs/ACTION_CENTER.md` — the screen that reads the queue, and why the two
+  counts above are shaped the way they are.
 - `docs/ARCHITECTURE.md` §3 — where the aggregation sits among the components.

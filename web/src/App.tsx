@@ -13,9 +13,10 @@ import {
   stopRuntime,
 } from './api/client'
 import type { Candidate, DiscoveryResult, Project } from './api/types'
+import { ActionsPage } from './actions/ActionsPage'
 import { ErrorBanner } from './components/ErrorBanner'
 import { DashboardPage } from './dashboard/DashboardPage'
-import { isDashboardPath } from './dashboard/route'
+import { pageFor } from './dashboard/route'
 import { GlobalBar } from './components/GlobalBar'
 import { NewProjectDialog } from './components/NewProjectDialog'
 import { ProjectDetailsDialog } from './components/ProjectDetailsDialog'
@@ -43,11 +44,12 @@ type Dialog = 'none' | 'new' | 'register'
 /**
  * App decides which page this is.
  *
- * There are two, and the choice is a string comparison rather than a router: the
- * console at `/dashboard`, and the workspace at everything else. The server
- * already serves the single-page entry point for any unknown path, so a deep
- * link works without a history abstraction or a route-matching language - see
- * `dashboard/route.ts` for why that is the whole of the mechanism.
+ * There are three, and the choice is a string comparison rather than a router:
+ * the console at `/dashboard`, the action centre at `/actions`, and the
+ * workspace at everything else. The server already serves the single-page entry
+ * point for any unknown path, so a deep link works without a history abstraction
+ * or a route-matching language - see `dashboard/route.ts` for why that is the
+ * whole of the mechanism.
  *
  * The workspace is the default, and it has been since Phase 5. A deep link that
  * this build does not recognise lands there, as it always has.
@@ -62,12 +64,19 @@ export function App() {
   // in them now, and a client created per page would be a second connection to
   // the same server from the same tab. The console's viewers and the workspace's
   // panel are the same browser, and the server should see it that way.
+  //
+  // The action centre has no terminal in it, and holding a client costs nothing
+  // for the reason above - which is why this stays one branch rather than three.
   const [terminalClient] = useState(() => createTerminalClient())
   useEffect(() => () => terminalClient.close(), [terminalClient])
 
+  const page = pageFor(window.location.pathname)
+
   return (
     <TerminalProvider client={terminalClient}>
-      {isDashboardPath(window.location.pathname) ? <DashboardPage /> : <WorkspaceApp />}
+      {page.name === 'dashboard' && <DashboardPage />}
+      {page.name === 'actions' && <ActionsPage actionId={page.actionId} />}
+      {page.name === 'workspace' && <WorkspaceApp />}
     </TerminalProvider>
   )
 }

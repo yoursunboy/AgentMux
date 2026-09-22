@@ -1,5 +1,5 @@
-import type { ControllerServer, ModelBinding } from '../api/types'
-import { WORKSPACE_PATH } from './route'
+import type { ControllerServer, ModelBinding, QueueSummary } from '../api/types'
+import { ACTIONS_PATH, WORKSPACE_PATH } from './route'
 
 /**
  * The console's own top bar.
@@ -28,9 +28,19 @@ export interface ServerBarProps {
    * model name that came from nowhere is a name somebody would act on.
    */
   model?: ModelBinding | null
+
+  /**
+   * How much is waiting, or null when this console cannot say.
+   *
+   * It arrives on the dashboard response rather than from a request of its own,
+   * so the bar's number and the cards below it come from one answer that can be
+   * wrong in one way. Null is a caller that has no queue block - not a server
+   * with nothing waiting, which is a zero.
+   */
+  queue?: QueueSummary | null
 }
 
-export function ServerBar({ server, model = null }: ServerBarProps) {
+export function ServerBar({ server, model = null, queue = null }: ServerBarProps) {
   const online = server.status === 'online'
 
   return (
@@ -101,6 +111,40 @@ export function ServerBar({ server, model = null }: ServerBarProps) {
       </span>
 
       <div className="server-bar__spacer" />
+
+      {/*
+        What is waiting, and a way to go and look at it.
+
+        §8 of the phase brief asks for the bar to carry this, and the two numbers
+        are the console's own split: what stops work, then what can be read
+        later. The counts come from the dashboard response, so a bar that could
+        not read the queue says nothing rather than saying zero - a zero is a
+        claim, and this bar is not in a position to make it.
+
+        The classes are this element's own. It is deliberately not
+        `server-bar__link`: the dashboard suite clicks that selector, and
+        Playwright's strict mode throws when one matches two elements - so a
+        second link sharing the class would break a suite about something else.
+      */}
+      {queue !== null && (
+        <a
+          className="server-bar__queue"
+          href={ACTIONS_PATH}
+          title="Everything waiting, across every project. The answer is given at the terminal."
+        >
+          Needs you:{' '}
+          <span
+            className={
+              queue.needsYou > 0
+                ? 'server-bar__queue-count server-bar__queue-count--needs-you'
+                : 'server-bar__queue-count'
+            }
+          >
+            {queue.needsYou}
+          </span>
+          {' · '}Notices: <span className="server-bar__queue-count">{queue.notices}</span>
+        </a>
+      )}
 
       <span className="server-bar__meta" title={`AgentMux ${server.version}`}>
         {server.version}

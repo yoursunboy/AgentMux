@@ -7,6 +7,7 @@ import {
   describeHost,
   describeProjectLocation,
   describeStatus,
+  formatRelativeTime,
   formatTimestamp,
   formatUptime,
   pluralise,
@@ -40,6 +41,52 @@ describe('formatTimestamp', () => {
 
   it('does not claim a date it could not parse', () => {
     expect(formatTimestamp('not a date')).toBe('Unknown')
+  })
+})
+
+describe('formatRelativeTime', () => {
+  // A fixed instant, because the boundaries - the place this kind of function is
+  // actually wrong - are exactly what a fixed clock lets a test reach.
+  const now = new Date('2026-09-21T12:00:00Z')
+  const ago = (ms: number) => new Date(now.getTime() - ms).toISOString()
+
+  it('names the absence of a value rather than showing an epoch', () => {
+    expect(formatRelativeTime(null, now)).toBe('Unknown')
+    expect(formatRelativeTime(undefined, now)).toBe('Unknown')
+    expect(formatRelativeTime('', now)).toBe('Unknown')
+  })
+
+  // A time that came from nowhere must not read as "just now".
+  it('does not claim a time it could not parse', () => {
+    expect(formatRelativeTime('not a date', now)).toBe('not a date')
+  })
+
+  it('calls anything within the minute just now', () => {
+    expect(formatRelativeTime(ago(0), now)).toBe('just now')
+    expect(formatRelativeTime(ago(59_000), now)).toBe('just now')
+  })
+
+  // A clock slightly behind the server's is ordinary, and "in 3 seconds" about
+  // something that has already happened would be a confusing thing to read.
+  it('calls a time slightly in the future just now too', () => {
+    expect(formatRelativeTime(new Date(now.getTime() + 3_000).toISOString(), now)).toBe('just now')
+  })
+
+  // §7 of the phase brief asks for this sentence, so it is the one asserted.
+  it('writes the units it was asked for, and gets the singular right', () => {
+    expect(formatRelativeTime(ago(60_000), now)).toBe('1 minute ago')
+    expect(formatRelativeTime(ago(10 * 60_000), now)).toBe('10 minutes ago')
+    expect(formatRelativeTime(ago(3 * 3_600_000), now)).toBe('3 hours ago')
+    expect(formatRelativeTime(ago(2 * 86_400_000), now)).toBe('2 days ago')
+    expect(formatRelativeTime(ago(90 * 86_400_000), now)).toBe('3 months ago')
+    expect(formatRelativeTime(ago(800 * 86_400_000), now)).toBe('2 years ago')
+  })
+
+  it('uses the largest unit that still says something', () => {
+    expect(formatRelativeTime(ago(59 * 60_000), now)).toBe('59 minutes ago')
+    expect(formatRelativeTime(ago(60 * 60_000), now)).toBe('1 hour ago')
+    expect(formatRelativeTime(ago(23 * 3_600_000), now)).toBe('23 hours ago')
+    expect(formatRelativeTime(ago(24 * 3_600_000), now)).toBe('1 day ago')
   })
 })
 

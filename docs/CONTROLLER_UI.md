@@ -21,39 +21,46 @@ question — *what needs me?* — and it answers it for every project at once.
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-It lives at `/dashboard`. Everything else is the workspace, as it has always
-been.
+The bar's right-hand end also carries `Needs you: 1 · Notices: 4`, linking to
+`/actions`. It is left out of the sketch above because the bar is one fixed-height
+line and the sketch is 70 columns wide.
+
+It lives at `/dashboard`. The queue behind that link is `/actions`, and
+`docs/ACTION_CENTER.md` is that page. Everything else is the workspace, as it has
+always been.
 
 ## 1. Layout
 
-Two pages, one document. `App` reads `window.location.pathname` and renders the
-console at `/dashboard` and the workspace everywhere else.
+Three pages, one document. `App` reads `window.location.pathname` and renders the
+console at `/dashboard`, the action centre at `/actions` and `/actions/{id}`, and
+the workspace everywhere else.
 
 **Why a path and not a router.** The application has no router and does not need
-one for two pages. The server already serves the single-page entry point for any
+one for three pages. The server already serves the single-page entry point for any
 unknown path — which is what makes a deep link work at all — so the mechanism is
 a string comparison. A router library would be a dependency, a history
 abstraction and a route-matching language to answer a question `route.ts` answers
-in four lines.
+in a few lines.
 
 **Why a full navigation and not a client-side swap.** A link is what a page load
-is, and it means the two pages share no React state that could get out of step.
-What they do share is the terminal client, which lives above both of them — so
-walking from the console to the workspace and back costs no socket at all: the
-first subscribe on the new page opens one if the old page's has closed, and it is
-the same client identity in either case (`docs/TERMINAL_VIEWER.md` §2).
+is, and it means the pages share no React state that could get out of step. What
+they do share is the terminal client, which lives above all of them — so walking
+from the console to the workspace and back costs no socket at all: the first
+subscribe on the new page opens one if the old page's has closed, and it is the
+same client identity in either case (`docs/TERMINAL_VIEWER.md` §2).
 
-**The two pages have two bars, and that is the design.** The workspace's bar
+**The pages have their own bars, and that is the design.** The workspace's bar
 reports the terminal — which host answered, which tmux is installed, whether the
-socket is up. The console's bar reports the machine and the build. One bar
-answering both would be a component that had to be told which page it was on.
+socket is up. The console's bar reports the machine, the build, and how much is
+waiting. One bar answering all of it would be a component that had to be told
+which page it was on.
 
 ## 2. Components
 
 ```text
 web/src/dashboard/
   DashboardPage.tsx        the page: the three states, and the fourth
-  ServerBar.tsx            server state, runtime availability, provider
+  ServerBar.tsx            server state, runtime availability, provider, queue
   ProjectGrid.tsx          the grid, and the empty case
   ProjectPanel.tsx         one project: its statuses, its screen, its queue
   TerminalViewer.tsx       one project's terminal, watched and never typed into
@@ -62,11 +69,25 @@ web/src/dashboard/
   useDashboard.ts          the read, and the polling
   useDashboardColumns.ts   how many columns fit
   route.ts                 which page this is
+
+web/src/actions/
+  ActionsPage.tsx          the queue, or one action, by id
+  ActionCenter.tsx         the queue: two live lists and a settled one
+  ActionCard.tsx           one action, as a link
+  ActionDetail.tsx         one action: seven rows and no button
+  ActionsBar.tsx           the queue page's own bar
+  actionStyle.ts           action → group, tone and sentence
+  useActions.ts            the read, and the polling
 ```
 
 Each one does one thing and the dependencies run one way:
 `DashboardPage → ServerBar | ProjectGrid → ProjectPanel → StatusBadge →
-status.ts`. Nothing below `DashboardPage` fetches anything.
+status.ts`, and `ActionsPage → ActionCenter | ActionDetail → ActionCard →
+actionStyle.ts`. Nothing below a page component fetches anything.
+
+`route.ts` stays in `dashboard/` although it answers for all three pages, because
+that is where routing has always lived and the workspace it already answered for
+had its files somewhere else too.
 
 ### `status.ts` — the mapping, not the colour
 
@@ -108,9 +129,9 @@ indistinguishable from a server that cannot say.
 
 ## 3. API usage
 
-**One request.** The console reads `GET /api/controller` and nothing else. Every
-runtime, agent, attention and action value arrives inside that one response,
-already joined and already sorted.
+**One request per page.** The console reads `GET /api/controller` and nothing
+else. Every runtime, agent, attention and action value arrives inside that one
+response, already joined and already sorted.
 
 §3 of the phase brief is explicit that the frontend must not call the runtime,
 agent, attention and action endpoints and combine them itself, and the reason is
@@ -118,8 +139,17 @@ the one `docs/CONTROLLER_API.md` §1 gives: that would be this page reimplementi
 a read model the server already exposes — once per client, and four requests per
 project.
 
-`client.ts` exposes `fetchDashboard` and `fetchControllerProjects`. Only the
-first is used today.
+**The action centre reads one route too, and for the same reason.** Its page
+calls `GET /api/actions` and its detail calls `GET /api/actions/{id}`; neither
+touches `GET /api/projects/{id}/actions`, which exists and is what a *per-project*
+view would read. The queue joins the project names on the server
+(`internal/controller/actions.go`) precisely so this page does not have to — a
+name resolved in the browser would be one request per row, over a listing that
+grows without bound. `docs/ACTION_CENTER.md` §7 is the long form.
+
+`client.ts` exposes `fetchDashboard`, `fetchControllerProjects`, `fetchActions`
+and `fetchAction`. Only the first is used by the console, and the last two only
+by the action centre.
 
 ### Polling
 
@@ -209,6 +239,14 @@ holds: by construction rather than by a filter somebody could forget.
 A test asserts the shape rather than trusting it: a card renders exactly four
 labelled rows, and the browser suite reads the same four off the painted page.
 
+**The action centre makes the same claim, and it is the harder one.** A card
+carries counts; an action row is the first thing in this client that names what
+an agent is doing, so it is the first place a prompt or a tool input could have
+arrived. It did not: `web/src/actions/` renders named fields only, its detail
+page has a fixed set of seven labels, and the test builder deliberately carries
+`prompt`, `tool_input`, `command` and `token` keys that must never reach the DOM.
+`docs/ACTION_CENTER.md` §6 is the argument.
+
 The only server-supplied text that reaches the DOM is a status word and a short
 fixed reason phrase from the attention projection — both of which are
 enumerations on the server side, and both of which React escapes.
@@ -221,7 +259,12 @@ rather than an omission:
 - **no permission action.** The permission badge says a question was asked and
   offers nothing that answers it — the answer is given in the workspace's
   terminal, and `docs/AGENT_ATTENTION.md` §6 is why. A console that can type at
-  the terminal is not a console that may answer for the person sitting at it;
+  the terminal is not a console that may answer for the person sitting at it.
+  **The page that shows the question in full is `/actions`**, added in Phase
+  7.4C, and it is the same position one step further in: it names the action, the
+  project and the type, and its detail page has no button at all —
+  `docs/ACTION_CENTER.md` §4 and §6. The bar's `Needs you` link and a card's
+  `⚠ n actions pending` row are the two ways there from here;
 - **no real CC Switch.** The provider section shows `Unknown` and a disabled
   button. It does not guess a model: a name that came from nowhere is a name
   somebody would act on;

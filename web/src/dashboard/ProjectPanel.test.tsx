@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { makeProjectCard, makeQuietProjectCard } from '../test/controller'
 import { renderWithTerminal } from '../test/dashboard'
 import { ProjectPanel } from './ProjectPanel'
+import { ACTIONS_PATH } from './route'
 // xterm is a third-party boundary with its own renderer, and running the real
 // one in jsdom would mean stubbing canvas and matchMedia so it can draw into a
 // document nobody looks at. The console's cards contain terminals now, so this
@@ -110,20 +111,35 @@ describe('ProjectPanel', () => {
     expect(row(degraded.container, 'Actions')).toHaveTextContent('unavailable')
   })
 
-  it('shows the pending count, and marks it only when there is one', () => {
+  // §8 of the phase brief: a count that is a fact becomes a way in. Zero stays a
+  // number, because there is nothing to go and look at.
+  it('shows the pending count, and turns it into a link only when there is one', () => {
     const idle = renderWithTerminal(
       <ProjectPanel card={makeProjectCard({ actions: { available: true, pending: 0 } })} />,
     )
     expect(row(idle.container, 'Actions')).toHaveTextContent('0')
-    expect(idle.container.querySelector('.project-card__count--pending')).not.toBeInTheDocument()
+    expect(idle.container.querySelector('.project-card__action-link')).not.toBeInTheDocument()
     idle.unmount()
 
     const busy = renderWithTerminal(
       <ProjectPanel card={makeProjectCard({ actions: { available: true, pending: 3 } })} />,
     )
-    // The number is the same number; only the tone class differs, which is what
-    // keeps the emphasis in the stylesheet rather than in the component.
-    expect(row(busy.container, 'Actions')).toHaveTextContent('3')
-    expect(busy.container.querySelector('.project-card__count--pending')).toBeInTheDocument()
+    expect(row(busy.container, 'Actions')).toHaveTextContent('3 actions pending')
+
+    // It is an anchor rather than a button with an onClick, so the destination
+    // is visible before it is clicked - and the destination is the queue, not
+    // one action: a card carries a count, not an id.
+    const link = busy.container.querySelector('.project-card__action-link')
+    expect(link).toBeInTheDocument()
+    expect(link).toHaveAttribute('href', ACTIONS_PATH)
+  })
+
+  // The sentence is shared with the queue page rather than written out twice, so
+  // the card and the page cannot come to disagree about the same number.
+  it('says the count in the singular when there is one', () => {
+    const one = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ actions: { available: true, pending: 1 } })} />,
+    )
+    expect(row(one.container, 'Actions')).toHaveTextContent('1 action pending')
   })
 })

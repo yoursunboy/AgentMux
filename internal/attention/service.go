@@ -393,6 +393,35 @@ func (s *Service) ListActionsByProject(ctx context.Context, projectID string, li
 	return s.repo.ListActionsByProject(ctx, id, LimitOr(limit))
 }
 
+// ListActions returns actions across every project, pending first and then
+// newest first.
+//
+// The ceiling is this package's, so the clamp is here rather than left to a
+// caller that would each have to remember it.
+func (s *Service) ListActions(ctx context.Context, limit int) ([]Action, error) {
+	return s.repo.ListActions(ctx, LimitOr(limit))
+}
+
+// Action returns one action by id.
+//
+// An id that no event raised comes back as CodeNotFound from the repository; an
+// id that is not shaped like one at all is refused here, so that a caller
+// cannot send this layer looking for a row that could not exist.
+func (s *Service) Action(ctx context.Context, id string) (Action, error) {
+	trimmed := strings.TrimSpace(id)
+	if trimmed == "" {
+		return Action{}, newError(CodeInvalidAction,
+			"an action must be asked for by id").withDetail("field", "id")
+	}
+	return s.repo.ActionByID(ctx, trimmed)
+}
+
+// PendingCountsByType returns how many actions are waiting, per type, across
+// every project.
+func (s *Service) PendingCountsByType(ctx context.Context) (map[ActionType]int, error) {
+	return s.repo.PendingActionCountsByType(ctx)
+}
+
 // RebuildReport says what a rebuild did.
 type RebuildReport struct {
 	// Projects is how many projects were visited.

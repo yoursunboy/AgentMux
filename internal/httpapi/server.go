@@ -253,13 +253,19 @@ func (s *Server) routes() http.Handler {
 	// the timelines would be one per panel.
 	mux.HandleFunc("GET /api/projects/{id}/agent-states", s.handleListAgentStates)
 
-	// Whether anybody needs to look, and what they might do about it. Three
+	// Whether anybody needs to look, and what they might do about it. Five
 	// reads and no writes: the actions these endpoints report are things a
 	// person looks at, and the thing they do about them is at the terminal.
 	// There is deliberately no endpoint that answers one - see
 	// internal/httpapi/attention.go.
+	//
+	// The last two are the console's rather than a project's: one queue across
+	// every project, and one action by id. They are flat because the question
+	// they answer - which agent needs me - is not about one project.
 	mux.HandleFunc("GET /api/projects/{id}/attention", s.handleListAttention)
 	mux.HandleFunc("GET /api/projects/{id}/actions", s.handleListActions)
+	mux.HandleFunc("GET /api/actions", s.handleListQueue)
+	mux.HandleFunc("GET /api/actions/{id}", s.handleGetAction)
 
 	// What a console needs, in one response rather than seven. It is a read
 	// model over the services above and owns nothing: two GETs, no writes, and

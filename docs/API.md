@@ -1240,6 +1240,97 @@ afterwards.
 `docs/AGENT_ATTENTION.md` is the long form: the four readings of one log, the action lifecycle, why an
 action's id is derived from its event, and why the loop closes at the terminal rather than here.
 
+### GET /api/actions
+
+The queue across **every** project, with each action's project named. The route is flat rather than
+nested under a project because the question it answers — *what is waiting anywhere* — is not about one
+project, and a console asking it would otherwise have to call the per-project route once per project.
+
+```json
+{
+  "actions": [
+    {
+      "id": "act_3c9b…",
+      "projectId": "p_6f1a…",
+      "projectName": "checkout-service",
+      "agentSessionId": "sess_9a27…",
+      "type": "PERMISSION_REQUEST",
+      "level": "ACTION_REQUIRED",
+      "status": "PENDING",
+      "reason": "permission requested",
+      "createdAt": "2026-09-21T09:00:12Z",
+      "resolvedAt": null
+    }
+  ],
+  "count": 1,
+  "needsYou": 1,
+  "notices": 0
+}
+```
+
+**Pending first, then newest first** — the same ordering `GET /api/projects/{id}/actions` uses, because
+two orderings of one table is how a console and a project page come to disagree about what is at the
+top of the queue.
+
+`level` is derived from `type` by the server rather than left for the client, so the correspondence
+between the two vocabularies lives in exactly one place. It is `ACTION_REQUIRED` for a
+`PERMISSION_REQUEST`, `WARNING` for a `VIEW_FAILURE`, `INFO` for a `VIEW_COMPLETION`, and empty for a
+type this build does not know.
+
+**The two counts are pending-only and exact, and they are not counts of the list.** A caller that asked
+for ten rows still gets the true totals, which is what lets a console show a headline it can trust
+without scrolling. `needsYou` counts the pending actions asserting `ACTION_REQUIRED`; `notices` counts
+the rest, including a level this build does not know.
+
+`resolvedAt` is present-and-null while an action is pending, so a client has one shape rather than two.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| `limit` is not a whole number, or is below 1 | 400 | `invalid_request` |
+| The queue could not be read | 500 | `controller_unavailable` |
+| The server was built without the aggregation | 503 | `internal_error` |
+
+A project name that cannot be resolved — an archived project, or a listing that failed — is sent as an
+empty string rather than dropping the action, and the client falls back to `projectId`.
+
+### GET /api/actions/{id}
+
+```json
+{
+  "id": "act_3c9b…",
+  "projectId": "p_6f1a…",
+  "projectName": "checkout-service",
+  "agentSessionId": "sess_9a27…",
+  "type": "PERMISSION_REQUEST",
+  "level": "ACTION_REQUIRED",
+  "status": "PENDING",
+  "reason": "permission requested",
+  "createdAt": "2026-09-21T09:00:12Z",
+  "resolvedAt": null
+}
+```
+
+One action, returned bare — it is the only thing the endpoint has to say. Read through the controller
+aggregation, so the project is named here too.
+
+| Situation | Status | Code |
+| --- | --- | --- |
+| The id is not one this server holds | 404 | `agent_attention_not_found` |
+| The server was built without the aggregation | 503 | `internal_error` |
+
+An absent id is a 404 rather than an empty object: an empty object is the one answer a client cannot
+tell from a real one. The code is the attention package's own — the same one
+`GET /api/sessions/{id}/attention` answers with — because it is the same absence, and giving it a
+second spelling would be one absence reported two ways.
+
+**Neither route can change anything, and `POST /api/actions/{id}` is not an endpoint.** A request that
+is not a GET is answered by the mux with 405, and `POST /api/actions/{id}/resolve` falls through to the
+unknown-endpoint handler as a 404. That is the boundary this phase stops at, and it is checked rather
+than asserted — see `docs/ACTION_CENTER.md` §6 and §8.
+
+`docs/ACTION_CENTER.md` is the long form: the two lists the page makes of this response, why the
+projection was not changed to produce it, and what the page is forbidden to render.
+
 ## The controller dashboard
 
 One response for a console, instead of the seven it would otherwise have to call and join itself. The
@@ -1275,9 +1366,15 @@ GET. `docs/CONTROLLER_API.md` is the long form.
       "updatedAt": "2026-09-21T09:00:12Z"
     }
   ],
+  "queue": { "needsYou": 1, "notices": 4 },
   "count": 1
 }
 ```
+
+`queue` is how much is waiting across every project, split the way a console reads it: what stops work
+versus what can be read later. It rides on this response rather than being a second request because the
+console's bar must not call an endpoint of its own to draw its own header — `docs/CONTROLLER_API.md` §1.
+It is the same split `GET /api/actions` reports, from the same query.
 
 Cards come back **most in need of attention first**: `ACTION_REQUIRED`, then `WARNING`, then what is
 running, then what has finished, then everything else. Within that, most recently changed first.
@@ -1473,9 +1570,12 @@ and action endpoints are the way to read what needs a person.
 
 What is still not implemented, and is not stubbed:
 
-- **No permission control.** `agent.permission_requested` is recorded and read by
-  nobody. Every response the hook receiver sends has an empty body, so AgentMux
-  cannot influence a decision Claude makes.
+- **No permission control.** `agent.permission_requested` is recorded, and since
+  Phase 7.3C-2 it is read — but as a *thing to look at* rather than as a question
+  anybody can answer here: the attention projection raises a `PERMISSION_REQUEST`
+  action, and since Phase 7.4C `/actions` shows it. There is still no endpoint
+  that decides one. Every response the hook receiver sends has an empty body, so
+  AgentMux cannot influence a decision Claude makes.
 - **No task status change.** A task's status is only ever moved by `PATCH
   /api/tasks/{id}`, by a person. An attempt ending is not the work ending, and
   nothing derives either from an event.
@@ -1486,9 +1586,11 @@ What is still not implemented, and is not stubbed:
   `docs/AGENT_RUNTIME_BINDING.md` §5.
 - **No binding that survives a server restart**, and no reconciliation of an
   attempt a restart left `RUNNING`. §6 of the same document.
-- **No notification, no dashboard, no Task UI.** The task and session endpoints
-  exist and the frontend has types and functions for them; no screen shows either,
-  and nothing pushes anything anywhere.
+- **No notification, and no Task UI.** The task and session endpoints exist and
+  the frontend has types and functions for them, and no screen shows either;
+  nothing pushes anything anywhere. The console at `/dashboard` and the action
+  centre at `/actions` read the project, agent, attention and action layers —
+  `docs/CONTROLLER_UI.md` and `docs/ACTION_CENTER.md` — and neither reads a task.
 
 The event timelines record what happened and nothing reads them to decide anything — in particular the
 task service does not, and a task's status is never derived from its events. There is no endpoint that

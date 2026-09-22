@@ -1407,6 +1407,33 @@ code {
   color: var(--accent);
 }
 
+/* What is waiting, and the way in to it. It sits with the server's own facts
+   rather than at the far end with the navigation, because it is a number about
+   the work rather than a link to another page - even though it is one. */
+.server-bar__queue {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.server-bar__queue:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.server-bar__queue-count {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+/* The one number on this bar that means nothing progresses without a person.
+   It is the same token the attention badge uses, deliberately: §8 of the phase
+   brief asks for one vocabulary of urgency and not two. */
+.server-bar__queue-count--needs-you {
+  color: var(--attention);
+  font-weight: 600;
+}
+
 /* --- the grid ------------------------------------------------------------ */
 
 .project-grid {
@@ -1481,9 +1508,26 @@ code {
   color: var(--text-muted);
 }
 
-.project-card__count--pending {
-  color: var(--attention);
+/* The count that is not zero, and is a way in rather than a number. It keeps
+   the tone the plain count had, so a card with something waiting is still the
+   card that draws the eye. */
+.project-card__action-link {
+  display: inline-flex;
+  gap: 4px;
+  align-items: baseline;
+  font-size: 12px;
   font-weight: 600;
+  color: var(--attention);
+  text-decoration: none;
+}
+
+.project-card__action-link:hover {
+  text-decoration: underline;
+}
+
+.project-card__glyph {
+  font-size: 11px;
+  line-height: 1;
 }
 
 /* --- a status badge ------------------------------------------------------ */
@@ -1707,4 +1751,375 @@ code {
   margin: 0;
   font-size: 11px;
   color: var(--warning);
+}
+
+/* ---------------------------------------------------------------------------
+ * The action centre
+ *
+ * A third page, and its own chrome. It shares the console's tokens and none of
+ * its geometry: this is a list of rows, not a grid of cards with terminals in
+ * them, and nothing here is sized by a viewport or stretched to fill one.
+ *
+ * There is no ordering rule in this section. Which row is at the top is decided
+ * by the queue and by the rules above, and a stylesheet that reordered anything
+ * would be a second answer to a question the server already answered.
+ * ------------------------------------------------------------------------- */
+
+.action-center {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.action-center__body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 22px;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: var(--gap) var(--gap) 40px;
+}
+
+/* Before there is anything to show. Centred for the reason the console's is:
+   there is nothing else on the page, and a left-aligned message would read as a
+   list that had failed to load. */
+.action-center__placeholder,
+.action-detail__placeholder {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: center;
+  justify-content: center;
+  min-height: 60vh;
+  padding: 32px;
+  text-align: center;
+}
+
+.action-center__message,
+.action-detail__message {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.action-center__message--failed,
+.action-detail__message--failed {
+  color: var(--danger);
+}
+
+.action-center__error,
+.action-detail__error {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+/* A poll that failed, over data that is still on screen. It is a strip rather
+   than a panel, for the reason the console's is: it must not push the thing a
+   person came to read off the screen. */
+.action-center__stale,
+.action-detail__stale {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin: 0;
+  padding: 6px var(--gap);
+  font-size: 13px;
+  color: var(--warning);
+  background: var(--bg-sunken);
+  border-bottom: 1px solid var(--border);
+}
+
+/* There is nothing waiting. It is a statement rather than an absence: a page
+   with three empty sections on it would make a person check whether it worked. */
+.action-center__empty {
+  margin: 0;
+  padding: 28px 0;
+  font-size: 15px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* --- a section of the queue ---------------------------------------------- */
+
+.action-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.action-section__heading {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* The server's own count, not the number of rows below it. A settled row sits
+   inside the section it belongs to, so a heading of 1 over two rows is the page
+   saying that one of them still wants you. */
+.action-section__count {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.action-section__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* History reads quieter than the two lists above it, without being hidden: the
+   queue is a record as well as a to-do list, and a record somebody cannot find
+   is not one. */
+.action-section--settled .action-section__heading,
+.action-section--settled .action-card__type {
+  font-weight: 400;
+  color: var(--text-faint);
+}
+
+/* --- one action ---------------------------------------------------------- */
+
+.action-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+}
+
+/* One rule per tone, and the tone is the only thing the component knows. */
+.action-card--attention {
+  border-left-color: var(--attention);
+}
+
+.action-card--warning {
+  border-left-color: var(--warning);
+}
+
+.action-card--info {
+  border-left-color: var(--accent);
+}
+
+.action-card--neutral {
+  border-left-color: var(--border-strong);
+}
+
+.action-card__link {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 14px;
+  color: inherit;
+  text-decoration: none;
+}
+
+.action-card__link:hover {
+  background: var(--bg-sunken);
+}
+
+.action-card__head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.action-card__glyph {
+  font-size: 12px;
+  line-height: 1;
+  color: var(--attention);
+}
+
+.action-card__type {
+  overflow: hidden;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The server's fixed phrase. It is the reason the action was raised, and it is
+   the whole of what this row says about what happened. */
+.action-card__reason {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.action-card__meta {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  min-width: 0;
+  margin-top: 2px;
+}
+
+.action-card__project {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- the queue's own bar -------------------------------------------------- */
+
+.actions-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  height: var(--bar-height);
+  padding: 0 var(--gap);
+  font-size: 13px;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+.actions-bar__title {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.actions-bar__divider {
+  color: var(--border-strong);
+}
+
+.actions-bar__item {
+  color: var(--text-muted);
+}
+
+.actions-bar__number {
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+
+.actions-bar__number--needs-you {
+  color: var(--attention);
+  font-weight: 600;
+}
+
+.actions-bar__spacer {
+  flex: 1;
+}
+
+.actions-bar__link {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.actions-bar__link:hover {
+  color: var(--accent);
+}
+
+/* --- one action, in full -------------------------------------------------- */
+
+.action-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 20px var(--gap) 40px;
+}
+
+.action-detail__back {
+  margin: 0;
+}
+
+.action-detail__link,
+.action-detail__project-link {
+  font-size: 13px;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+
+.action-detail__link:hover,
+.action-detail__project-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.action-detail__type {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* The seven labelled rows. Two columns, the same shape the cards use, so a
+   person reading a project card and an action reads the same layout. */
+.action-detail__fields {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 8px 16px;
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.action-detail__term {
+  font-size: 13px;
+  color: var(--text-faint);
+}
+
+.action-detail__value {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  color: var(--text);
+}
+
+/* What the page cannot do, said where somebody would look for the button. It is
+   a statement and not a disabled control: a greyed-out Allow would be a promise
+   this phase does not make. */
+.action-detail__note {
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text-muted);
+  background: var(--bg-sunken);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+}
+
+.action-detail__controls {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: center;
+}
+
+/* The only control on either page, and it is the one the console already has:
+   ask again. A queue somebody cannot retry is a queue that looks permanently
+   broken the first time a request times out. */
+.action-center__retry,
+.action-detail__retry {
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.action-center__retry:hover,
+.action-detail__retry:hover {
+  border-color: var(--accent);
 }

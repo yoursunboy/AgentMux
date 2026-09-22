@@ -328,6 +328,13 @@ export interface Dashboard {
   /** The cards, most in need of attention first. */
   projects: ProjectCard[]
   count: number
+  /**
+   * How much is waiting across every project, for the bar.
+   *
+   * It is a count and not the queue itself: a bar needs two numbers, and the
+   * list behind them is a page of its own at `/actions`.
+   */
+  queue: QueueSummary
 }
 
 /**
@@ -391,6 +398,100 @@ export interface AttentionSummary {
   level: string
   /** A short fixed phrase, never a quotation from a payload. */
   reason?: string
+}
+
+/**
+ * What kind of thing is waiting.
+ *
+ * The three are the whole vocabulary, and each corresponds to exactly one level:
+ * `PERMISSION_REQUEST` is `ACTION_REQUIRED`, `VIEW_FAILURE` is `WARNING`, and
+ * `VIEW_COMPLETION` is `INFO`. The correspondence is exact on the server - see
+ * `internal/attention/projection.go` - which is why a client can read a level
+ * off a type and never has to be told both.
+ */
+export type ActionType = 'PERMISSION_REQUEST' | 'VIEW_FAILURE' | 'VIEW_COMPLETION'
+
+/** How an action is doing. */
+export type ActionStatus = 'PENDING' | 'RESOLVED' | 'EXPIRED'
+
+/**
+ * How much a person needs to care.
+ *
+ * `ACTION_REQUIRED` is the only level that means nothing progresses without
+ * somebody. It is deliberately not a stronger `WARNING`: a warning can be read
+ * later, and calling the two the same would put a queue of things nobody can act
+ * on at the top of a page.
+ */
+export type AttentionLevel = 'NONE' | 'ACTION_REQUIRED' | 'WARNING' | 'INFO'
+
+/**
+ * One action, with the project it belongs to named.
+ *
+ * The fields are listed rather than inherited from the server's model, for the
+ * reason `ProjectCard` lists its own: what crosses to a client is a decision, and
+ * a type that grew silently when the server's model grew would be that decision
+ * being made by accident.
+ *
+ * **There is no field here for a prompt, a tool input, a transcript, a command or
+ * a credential, and the server's model has none either.** Every value below is an
+ * identifier, an enumeration, a timestamp or a fixed phrase the server wrote.
+ */
+export interface ActionItem {
+  id: string
+  projectId: string
+  /**
+   * The project's name, or empty when it could not be resolved.
+   *
+   * Empty is not "this action belongs to no project": the server omits the name
+   * when its project listing failed, or when the project has since been archived.
+   * A client falls back to `projectId` rather than showing a blank.
+   */
+  projectName: string
+  /** The attempt this action is about, which is what makes it findable. */
+  agentSessionId: string
+  type: ActionType | string
+  level: AttentionLevel | string
+  status: ActionStatus | string
+  /** A short fixed phrase the server wrote, never a quotation from a payload. */
+  reason: string
+  createdAt: string
+  /**
+   * When it was dealt with, or null.
+   *
+   * The server sends this field always, present and null rather than absent, so
+   * that a client has one shape to render. `null` means the action is still
+   * pending, which is the ordinary case.
+   */
+  resolvedAt: string | null
+}
+
+/**
+ * The body of GET /api/actions: every project's actions, pending first.
+ *
+ * `needsYou` and `notices` are counts of what is *pending* across the whole
+ * server, not counts of `actions` - a caller that asked for ten rows still gets
+ * the true totals. A headline that was a page length would change when somebody
+ * scrolled, and a number on a bar has to be one a person can trust without
+ * scrolling.
+ */
+export interface ActionQueue {
+  actions: ActionItem[]
+  count: number
+  /** Pending actions that nothing progresses without. */
+  needsYou: number
+  /** Pending actions that are worth reading and stop nothing. */
+  notices: number
+}
+
+/**
+ * How much is waiting, split the way a console reads it.
+ *
+ * It rides on the dashboard response rather than behind its own request, because
+ * the console's bar must not make a second request to draw its own header.
+ */
+export interface QueueSummary {
+  needsYou: number
+  notices: number
 }
 
 /** The body of GET /api/controller/projects - the cards without the server block. */

@@ -23,10 +23,11 @@ As of version 0.6.5:
 | Phase 7.3B-2 — Runtime binding | **Done** | `internal/agent` connects the adapter to the product: one call starts the runtime if needed, dictates Claude's session id, attaches a hook receiver, writes the settings document, launches, and binds the attempt. Fixed the silently-refused `session.created` / `session.status_changed` payloads on the way. No schema change, no UI. See `docs/AGENT_RUNTIME_BINDING.md`. |
 | Phase 7.3C-1 — Agent state projection | **Done** | `internal/agentstate` folds `agent_events` into what is true about an agent now, stored in a new `agent_states` table and read by two endpoints. Driven from inside the event service, so the projection can be deleted and rebuilt from the log at any moment. No UI, no write endpoint. See `docs/AGENT_STATE.md`. |
 | Phase 7.3C-2 — Attention and action queue | **Done** | `internal/attention` answers "what needs me": a level per attempt and a queue of pending actions, both projected from the same log, with three read endpoints and no way to answer an action. See `docs/AGENT_ATTENTION.md`. |
-| Phase 7.4A — Controller dashboard aggregation | **Done** | `internal/controller` joins the project, state, attention and action services into one response, with two GET routes and no writes. Four queries for any number of projects, no cache, no table. See `docs/CONTROLLER_API.md`. |
+| Phase 7.4A — Controller dashboard aggregation | **Done** | `internal/controller` joins the project, state, attention and action services into one response, with two GET routes and no writes. Five queries for any number of projects, no cache, no table. See `docs/CONTROLLER_API.md`. |
 | Phase 7.4B-1 — Controller web dashboard | **Done** | The first read-only screen: `/dashboard` renders the controller aggregation as a grid of project cards, with a server bar, status tones, and a layout from three columns to one. One request, a five-second poll, no terminal and no writes. See `docs/CONTROLLER_UI.md`. |
 | Phase 7.4B-2A — Terminal viewer | **Done** | The console stopped being a page of numbers: every card whose runtime is up carries the project's real terminal, drawn by the workspace's own xterm instance over the page's single existing WebSocket. Its read-only behaviour comes from the protocol's viewer position rather than from a flag, and no backend change was needed. See `docs/TERMINAL_VIEWER.md`. |
 | Phase 7.4B-2B — Controller lease and input | **Done** | A client can ask to own a terminal's input, be granted it, type at it, and give it back — one controller at a time, never preempted, expiring on its own when the holder goes away. The lease is in memory only and no keystroke is ever recorded. The console types and never reshapes the pty. See `docs/TERMINAL_CONTROLLER.md`. |
+| Phase 7.4C — Agent action centre | **Done** | `/actions` shows *which* action is waiting and `/actions/{id}` shows one, joined across projects by two new GET routes. Read-only by construction: no Allow, no Deny, no acknowledge, and a browser test asserting the detail page has no button. The attention projection is unchanged — still one writer, still no way to answer. Needs-you versus notices is a reading of the level, not a new state. See `docs/ACTION_CENTER.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -704,10 +705,10 @@ the list.
 person is told. Sub-phase **7.4A, the backend aggregation, is done**:
 `internal/controller` joins the project, state, attention and action services
 into one response so that a console reads one endpoint rather than seven and
-joins nothing itself. Four queries for any number of projects, no cache, no
+joins nothing itself. Five queries for any number of projects, no cache, no
 table, two GET routes. `docs/CONTROLLER_API.md` is the long form, and the
-TypeScript types for the response are in `web/src/api/types.ts` with nothing
-reading them yet — the same position the task endpoints were in after Phase 7.2.
+TypeScript types for the response are in `web/src/api/types.ts` with the console
+reading them since 7.4B-1.
 
 Sub-phase **7.4B-1, the console foundation, is done**: `/dashboard` renders the
 aggregation as a grid of project cards, sorted the way the server sorted them,
@@ -739,13 +740,33 @@ keeps only the first: **a console types and never reshapes the shared pty**.
 `docs/TERMINAL_CONTROLLER.md` is the long form, and `docs/TERMINAL_VIEWER.md` §3
 is what a client without the lease still cannot do.
 
-**What remains in 7.4 is depth, not surface.** The queue is a count rather than
-a list, so nothing shows *which* actions are waiting; the console can take a
+Sub-phase **7.4C, the action centre, is done**: `/actions` is the page that says
+*which* action is waiting rather than how many, and `/actions/{id}` is one of
+them. It is the first screen in the client that names an agent rather than a
+project, and it is a **read-only** phase — no Allow, no Deny, no acknowledge, no
+dismiss, and a browser test that asserts the detail page renders no `button` at
+all. The backend half is two new reads, `GET /api/actions` and
+`GET /api/actions/{id}`, both joined through `internal/controller` so that a
+project name is resolved on the server; **the attention projection was not
+touched**, so `attention.Service.Project` is still the only writer and an action
+is still raised by an event and resolved by an event. The one product decision
+this phase had to make is what the headline number counts: `settlePending`
+resolves permission requests and nothing else, so the page leads with **needs
+you** — pending and `ACTION_REQUIRED` — and lists failures and completions
+beneath as **notices**. The console's bar carries both numbers and links here.
+`docs/ACTION_CENTER.md` is the long form.
+
+**What remains in 7.4 is depth, not surface.** The console can take a
 terminal's keyboard but still cannot answer a permission prompt from it, nor
 start or stop a runtime, nor be told anything it is not currently looking at —
-those are later phases' subjects; and the attention projection's known limits — a
-failed project staying at `WARNING` until something runs in it again, and an
-agent started without a task being invisible — are inherited here unchanged.
+those are later phases' subjects. The action centre can show a permission
+request and still may not answer it, which is the deliberate one-step-short
+position of the whole phase rather than a gap. And the attention projection's
+known limits — a failed project staying at `WARNING` until something runs in it
+again, an agent started without a task being invisible, and a failure or
+completion action never leaving the queue — are inherited here unchanged; the
+first two also mean the notices list only ever grows, which
+`docs/ACTION_CENTER.md` §8 records as a limit rather than hiding.
 
 ## Phase 8 — CC Switch integration
 

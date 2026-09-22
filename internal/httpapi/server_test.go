@@ -394,10 +394,19 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	if !o.withoutAttention {
 		controllerAttention = attentionProjection
 	}
+	// The queue rides on the same service the attention reader does - it is one
+	// projection over two tables - so dropping that projection drops this with
+	// it, and the console's queue page reports itself unavailable rather than
+	// empty.
+	var controllerActions controller.ActionReader
+	if !o.withoutAttention {
+		controllerActions = attentionProjection
+	}
 	controllerService, err := controller.NewService(controller.Options{
 		Projects:  service,
 		Agents:    controllerAgents,
 		Attention: controllerAttention,
+		Actions:   controllerActions,
 		Logger:    discardLogger(),
 	})
 	if err != nil {

@@ -18,6 +18,7 @@ iPad / Phone / PC
 │ Workspace                   │   web/src/workspace       — built in Phase 5
 │ Console (read-only)         │   web/src/dashboard       — built in Phase 7.4B-1
 │ Terminal Viewer             │   web/src/dashboard       — built in Phase 7.4B-2A
+│ Action Centre               │   web/src/actions         — built in Phase 7.4C
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1
@@ -93,7 +94,7 @@ that decides it. `docs/AGENT_ATTENTION.md` §1 separates the layers, §3 is the 
 The Controller Aggregation, added in Phase 7.4A as `internal/controller`, is the one component that
 reads several of the others to build a single answer. It exists because a console would otherwise
 call seven endpoints and join them itself — once per client, and four times per project — and the join
-belongs where it can be four queries instead of four hundred. **It owns nothing**: no table, no cache,
+belongs where it can be five queries instead of four hundred. **It owns nothing**: no table, no cache,
 no state that survives a request, and every route it serves is a GET. Delete the package and nothing
 is lost but the convenience. `docs/CONTROLLER_API.md` §1 is the boundary, §4 the sort, and §7 what it
 does not cover.
@@ -121,6 +122,26 @@ client**, created in `App` above both the console and the workspace. Both pages 
 them now, and a client per page would be a second connection to the same server from the same tab —
 which is what §3 and §8 of the phase brief forbid when they forbid a second terminal websocket. Subscriptions
 are multiplexed on that socket and every frame carries its project, so seven cards are one connection.
+
+The Action Centre, added in Phase 7.4C as `web/src/actions`, is the screen the Attention and Action
+projection has been waiting for since 7.3C-2: the console says *how much* is waiting, and this page
+says **what** is. It is the first screen in the client that names an agent rather than a project, and
+it is the last arrow of the loop — `Event → Projection → Action → Action Centre → a person` — with the
+person's answer still given at the terminal.
+
+**It changed no projection, and that is the phase's load-bearing fact.** `attention.Service.Project`
+is still the only thing that raises or resolves an action and is still called only from inside
+`event.Service`; the two new routes are reads. The whole backend of the phase is two `GET`s routed
+through `internal/controller`, which is where a join belongs — `docs/CONTROLLER_API.md` §1 — because an
+action row carries a project id and no name. `internal/attention` gained a global listing, a one-row
+read, a grouped count and one pure function, `LevelOfAction`, and gained no knowledge of project names.
+
+The one thing the phase had to decide rather than read was what the headline number means, and it is a
+reading of the rows rather than a change to them: `settlePending` resolves permission requests and
+nothing else, so a `VIEW_FAILURE` or a `VIEW_COMPLETION` stays pending for the life of the project. The
+page therefore leads with **needs you** — pending and `ACTION_REQUIRED` — and lists everything else as
+**notices**. `docs/ACTION_CENTER.md` §2 is that argument, §4 is why the detail page has no button at
+all, and §6 is the one claim this page had to be built to keep: it names a type and never a payload.
 
 ## 2. Project vs Collection
 

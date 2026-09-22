@@ -138,6 +138,47 @@ func actionFor(eventType, sessionStatus string) (ActionType, string, bool) {
 	}
 }
 
+// LevelOfAction returns the attention level an action of this type asserts.
+//
+// # Why this is here
+//
+// The two vocabularies - a level, which is a judgement about urgency, and a
+// type, which is a thing a person might do - are deliberately separate, and
+// this file is the only place they are allowed to meet. actionFor above states
+// the correspondence for an arriving event; this states the same
+// correspondence read from the row that event produced.
+//
+// It is stated once, as a function, so that a queue can be told an action's
+// level without a join back to the event that raised it and without a second
+// column that could disagree with this table. The correspondence is exact and
+// total - every type actionFor can produce has exactly one level - so the
+// answer is recoverable from the row alone.
+//
+// # What it is not
+//
+// It is a *reading* of a type, not a decision made from one. It changes no
+// projection: no table, no resolution rule, no call to settles or actionFor or
+// attentionFor. Nothing in this build branches on its answer to decide whether
+// an action is raised or resolved; the one caller folds the queue into two
+// counts for a screen. A test pins it against actionFor so the two cannot
+// drift.
+//
+// The empty level means a type this build does not know, which is the honest
+// answer for a row a newer build wrote: not a demand, not a notice, but
+// something whose urgency this build cannot claim to judge.
+func LevelOfAction(t ActionType) Level {
+	switch t {
+	case ActionPermissionRequest:
+		return LevelActionRequired
+	case ActionViewFailure:
+		return LevelWarning
+	case ActionViewCompletion:
+		return LevelInfo
+	default:
+		return ""
+	}
+}
+
 // levelForSessionStatus maps an attempt's own status onto a level.
 //
 // It is deliberately not the same table as the agent state's: the state

@@ -2,6 +2,7 @@ import { render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { App } from './App'
+import { makeAction, makeActionQueue } from './test/actions'
 import { makeDashboard, makeProjectCard } from './test/controller'
 import { makeServerInfo } from './test/fixtures'
 
@@ -135,5 +136,40 @@ describe('App routing', () => {
       'href',
       '/dashboard',
     )
+  })
+
+  // The action centre is a third page, and the one thing only this file can
+  // check is that an address actually reaches it.
+  it('opens the action centre at /actions', async () => {
+    window.history.pushState({}, '', '/actions')
+    routeFetch({
+      '/api/actions': makeActionQueue([makeAction({ projectName: 'checkout-service' })]),
+      ...consoleAndWorkspace,
+    })
+
+    const { container } = render(<App />)
+
+    expect(await screen.findByRole('banner')).toHaveClass('actions-bar')
+    expect(screen.getByText('Claude is waiting for permission')).toBeInTheDocument()
+    // The console's own bar, not this page's.
+    expect(container.querySelector('.server-bar')).not.toBeInTheDocument()
+  })
+
+  // §7 of the phase brief: clicking a row opens the action. In a browser that is
+  // a page load, so what jsdom can check is the other half - that the address the
+  // row points at is the address that opens it.
+  it('opens one action from its own address', async () => {
+    window.history.pushState({}, '', '/actions/act_0123456789abcdef0123')
+    routeFetch({
+      '/api/actions/act_0123456789abcdef0123': makeAction(),
+      ...consoleAndWorkspace,
+    })
+
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { level: 1 })).toHaveTextContent(
+      'Claude is waiting for permission',
+    )
+    expect(screen.getByRole('link', { name: /All actions/ })).toHaveAttribute('href', '/actions')
   })
 })

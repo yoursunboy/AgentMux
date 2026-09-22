@@ -53,6 +53,15 @@ type Dashboard struct {
 
 	// Count is how many cards there are, so a client does not have to count.
 	Count int `json:"count"`
+
+	// Queue is how much is waiting across every project, split the way a
+	// console's bar reads it.
+	//
+	// It rides here rather than behind its own request for the reason §1 of
+	// docs/CONTROLLER_API.md gives: the console's header is drawn from one
+	// response, and a bar that made a second call to fill in two numbers would
+	// be a second call that can fail on its own.
+	Queue QueueSummary `json:"queue"`
 }
 
 // ServerSummary is the part of the server's own report a console header needs.
@@ -186,6 +195,96 @@ type ActionsSummary struct {
 	// It counts the whole project rather than its most recent attempt: an
 	// action is a backlog, and a backlog is something a project has.
 	Pending int `json:"pending"`
+}
+
+// ActionItem is one action, with the project it belongs to named.
+//
+// # Why the fields are listed rather than the action embedded
+//
+// For the reason ProjectCard lists its own: what crosses to a client is a
+// decision, and a struct that grew silently when attention.Action grew would be
+// that decision being made by accident.
+//
+// There is no field here for a prompt, a tool input, a transcript or a
+// credential, and attention.Action has none either. That is the point of the
+// type: an action is a thing a person looks at, and what Claude actually asked
+// carries paths, tokens and environment variables with it.
+type ActionItem struct {
+	// ID is the action's identity, derived from the event that raised it.
+	ID string `json:"id"`
+
+	// ProjectID is the project the attempt belongs to.
+	ProjectID string `json:"projectId"`
+
+	// ProjectName is the project's display name, or "" when the server could
+	// not resolve it.
+	//
+	// It is empty rather than absent when the project is archived, because the
+	// project listing excludes archived projects and this is not a reason to
+	// drop the action. A client falls back to the id.
+	ProjectName string `json:"projectName"`
+
+	// AgentSessionID is the attempt this is about.
+	AgentSessionID string `json:"agentSessionId"`
+
+	// Type is what a person might do.
+	Type string `json:"type"`
+
+	// Level is how much the type asserts, read from the type by
+	// attention.LevelOfAction.
+	//
+	// It is sent rather than left for the client to derive so that the
+	// correspondence lives in exactly one place. An empty level means a type
+	// this build does not know.
+	Level string `json:"level"`
+
+	// Status is where the action is in its life.
+	Status string `json:"status"`
+
+	// Reason is a short fixed phrase, never a quotation from a payload.
+	Reason string `json:"reason"`
+
+	// CreatedAt is when the event that raised it happened.
+	CreatedAt time.Time `json:"createdAt"`
+
+	// ResolvedAt is when it stopped being pending, or null.
+	//
+	// It is present and null rather than omitted, mirroring the task model's
+	// completedAt, so that a client has one shape to read whether or not the
+	// action settled.
+	ResolvedAt *time.Time `json:"resolvedAt"`
+}
+
+// ActionsView is the queue, with the two counts a console shows in its bar.
+type ActionsView struct {
+	// Actions is the requested page of the queue, pending first.
+	Actions []ActionItem
+
+	// Count is how many rows that page holds, so a client does not have to
+	// count.
+	Count int
+
+	// NeedsYou and Notices are how much is waiting across every project, split
+	// into the two lists a console reads.
+	//
+	// They count what is *pending*, and they are not counts of the page: a
+	// caller that asked for ten rows still gets the true totals. A headline
+	// that was a page length would be a headline that changed when somebody
+	// scrolled.
+	NeedsYou int
+	Notices  int
+}
+
+// QueueSummary is how much is waiting, split the way a console reads it: what
+// stops work versus what can be read later.
+type QueueSummary struct {
+	// NeedsYou is how many pending actions assert ACTION_REQUIRED - the ones
+	// nothing progresses without.
+	NeedsYou int `json:"needsYou"`
+
+	// Notices is how many pending actions assert anything else: things worth
+	// reading, which do not stop anything.
+	Notices int `json:"notices"`
 }
 
 // attentionRank orders the attention levels by how much they demand of a

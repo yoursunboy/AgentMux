@@ -236,6 +236,97 @@ func (r *AttentionStore) ListActionsByProject(ctx context.Context, projectID str
 	return scanActions(rows)
 }
 
+// ListActions returns actions across every project, pending first and then
+// newest first.
+//
+// The ordering clause is character for character the one ListActionsByProject
+// uses, and that is deliberate rather than incidental: a console reading the
+// whole queue and a project page reading one project's slice must agree about
+// which action is at the top, or the same action appears in two places in two
+// positions and a reader has to work out which page is lying.
+func (r *AttentionStore) ListActions(ctx context.Context, limit int) ([]attention.Action, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+actionColumns+` FROM agent_actions
+		ORDER BY CASE status WHEN 'PENDING' THEN 0 ELSE 1 END, created_at DESC, id DESC
+		LIMIT ?`,
+		limit)
+	if err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not list actions",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+	return scanActions(rows)
+}
+
+// ActionByID returns one action.
+//
+// No row is a CodeNotFound rather than a zero Action, for the reason Attention
+// gives: a caller that cannot tell "there is no such action" from "here is an
+// action with no fields" will render an empty card for an id that never
+// existed.
+func (r *AttentionStore) ActionByID(ctx context.Context, id string) (attention.Action, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT `+actionColumns+` FROM agent_actions WHERE id = ?`, id)
+
+	a, err := scanAction(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return attention.Action{}, &attention.Error{
+			Code:    attention.CodeNotFound,
+			Message: fmt.Sprintf("no event has raised the action %s", id),
+		}
+	}
+	return a, err
+}
+
+// PendingActionCountsByType returns how many actions are waiting, grouped by
+// type, across every project.
+//
+// It is one grouped count rather than a read per type, and it counts only what
+// is pending: a settled action is history, and a queue asking "how much is
+// waiting" is not asking about history. A type with nothing pending is absent
+// from the map, so a caller reads it the way it reads PendingActionCounts.
+func (r *AttentionStore) PendingActionCountsByType(ctx context.Context) (map[attention.ActionType]int, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT type, COUNT(*) FROM agent_actions
+		WHERE status = 'PENDING'
+		GROUP BY type`)
+	if err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not count pending actions by type",
+			Err:     err,
+		}
+	}
+	defer rows.Close()
+
+	out := make(map[attention.ActionType]int, len(attention.ActionTypes()))
+	for rows.Next() {
+		var (
+			actionType string
+			count      int
+		)
+		if err := rows.Scan(&actionType, &count); err != nil {
+			return nil, &attention.Error{
+				Code:    attention.CodeStorageFailure,
+				Message: "could not read a pending action count",
+				Err:     err,
+			}
+		}
+		out[attention.ActionType(actionType)] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, &attention.Error{
+			Code:    attention.CodeStorageFailure,
+			Message: "could not read pending action counts",
+			Err:     err,
+		}
+	}
+	return out, nil
+}
+
 // ResolveActions marks every pending action of the given types on one attempt
 // as resolved.
 func (r *AttentionStore) ResolveActions(ctx context.Context, agentSessionID string, types []attention.ActionType, at time.Time) (int, error) {

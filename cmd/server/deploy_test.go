@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kutonlagos/agentmux/internal/config"
 	"github.com/kutonlagos/agentmux/internal/host"
@@ -421,6 +422,21 @@ func hostAcceptsLinuxRoot() bool {
 	return filepath.IsAbs(linuxProjectsRoot)
 }
 
+// directoryInfo is an os.FileInfo that says "yes, a directory" and nothing else.
+//
+// It exists so TestTheExampleConfigLoads can answer the loader's accessibility
+// check without reading the host's filesystem. validate consults IsDir and no
+// other method; the rest are present because the interface asks for them, and
+// the zero values are honest - this stands for no file in particular.
+type directoryInfo struct{}
+
+func (directoryInfo) Name() string       { return "" }
+func (directoryInfo) Size() int64        { return 0 }
+func (directoryInfo) Mode() os.FileMode  { return os.ModeDir }
+func (directoryInfo) ModTime() time.Time { return time.Time{} }
+func (directoryInfo) IsDir() bool        { return true }
+func (directoryInfo) Sys() any           { return nil }
+
 // TestTheExampleConfigLoads is the one assertion about configuration that
 // matters to a deployment.
 //
@@ -437,6 +453,18 @@ func hostAcceptsLinuxRoot() bool {
 // operator there would have to do anyway - and the file's own spelling of it is
 // checked against the text instead. On Linux, which is the environment this file
 // is for, the file's own root is what loads.
+//
+// The loader's stat is supplied by the test rather than left as os.Stat, and
+// that is deliberate. validate asks one question of a projects root - is it a
+// directory - and warns when it is not, so with the real stat this test also
+// asserts that the machine running it happens to have the configured root on
+// disk. It does not: /srv/projects is absent on a developer's Windows machine
+// and on a fresh server until the installer has run, so the test passed here
+// only because D:\AI\Projects happens to exist and failed on the server for a
+// reason that has nothing to do with config/agentmux.example.yaml. This test is
+// about the file. The question of whether a root is reachable belongs to
+// discovery, which reports it per root at startup, and to the warning the
+// loader already emits - both of which are tested where they live.
 //
 // The values checked are the ones install.sh writes for a default installation,
 // so this also pins that the example and the written file agree about what a
@@ -462,6 +490,10 @@ func TestTheExampleConfigLoads(t *testing.T) {
 		// sets two of them, and what it sets is checked against the file it
 		// points at by TestTheUnitAndTheInstallerAgree above.
 		Environ: func(string) (string, bool) { return "", false },
+		// A projects root the loader can see, for the reason the doc comment
+		// above gives: validate's accessibility check is about this machine,
+		// and this test is about the file.
+		Stat: func(string) (os.FileInfo, error) { return directoryInfo{}, nil },
 	})
 	if err != nil {
 		t.Fatalf("the example configuration does not load: %v", err)

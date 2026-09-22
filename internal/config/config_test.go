@@ -825,8 +825,17 @@ func TestWriteDefaultFile(t *testing.T) {
 	}
 }
 
+// TestSplitRoots pins the two ways a list of roots may be written: the
+// platform's list separator, and a comma.
+//
+// The separator is taken from filepath.ListSeparator rather than spelled as a
+// literal ";" in the fixture. On Windows ";" separates and the fixture below
+// asks for three roots; on Unix it does not and the same fixture asks for two.
+// The test was written on Windows and had never run anywhere else, so it was
+// asserting a Windows-only reading of a portable function.
 func TestSplitRoots(t *testing.T) {
-	got := splitRoots(" /a , /b ;; /c ,, ")
+	sep := string(filepath.ListSeparator)
+	got := splitRoots(" /a , /b " + sep + sep + " /c ,, ")
 	want := []string{"/a", "/b", "/c"}
 	if len(got) != len(want) {
 		t.Fatalf("splitRoots returned %q, want %q", got, want)
@@ -838,6 +847,23 @@ func TestSplitRoots(t *testing.T) {
 	}
 	if len(splitRoots("")) != 0 {
 		t.Error("splitRoots(\"\") must return nothing")
+	}
+}
+
+// TestSplitRootsKeepsAPathThatIsNotASeparatorHere is the other half of the rule
+// above, stated rather than left to be inferred: only this platform's separator
+// and the comma split, so the character the other platform uses is ordinary
+// path content and a root containing one survives whole.
+func TestSplitRootsKeepsAPathThatIsNotASeparatorHere(t *testing.T) {
+	other := ";"
+	if filepath.ListSeparator == ';' {
+		other = ":"
+	}
+	root := "/a" + other + "b"
+	got := splitRoots(root)
+	if len(got) != 1 || got[0] != root {
+		t.Errorf("splitRoots(%q) = %q, want [%q]: %q does not separate on this platform",
+			root, got, root, other)
 	}
 }
 

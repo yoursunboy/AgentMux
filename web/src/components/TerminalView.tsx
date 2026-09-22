@@ -61,6 +61,19 @@ interface TerminalViewProps {
    * and not a bug.
    */
   fontSize: number
+  /**
+   * Whether to draw the touch keys.
+   *
+   * It is false only for a terminal nobody may type into - the console's
+   * viewer - and it is a separate prop from `interactive` because the two
+   * answer different questions. A workspace device that is watching rather
+   * than typing still benefits from seeing where the keys are, so it keeps
+   * them and finds them disabled. The console's viewer has no controls at all:
+   * there is nothing it could do with a key, so it is not shown one.
+   *
+   * Omitted means drawn, which is what the workspace does.
+   */
+  showKeys?: boolean
 }
 
 /**
@@ -142,7 +155,13 @@ function themeFromDocument(): Record<string, string> {
   }
 }
 
-export function TerminalView({ session, interactive, mayResize, fontSize }: TerminalViewProps) {
+export function TerminalView({
+  session,
+  interactive,
+  mayResize,
+  fontSize,
+  showKeys = true,
+}: TerminalViewProps) {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
   /** The fit addon, kept so a font change can re-measure against it. */
@@ -361,7 +380,6 @@ export function TerminalView({ session, interactive, mayResize, fontSize }: Term
       if (atBottom) setUnread(false)
     }
 
-    const onData = term.onData((data) => session.input(data))
     // xterm reports a resize for every resize call, including the ones this
     // component makes itself. The scheduler is what decides whether any of them
     // is worth telling the server about.
@@ -404,7 +422,6 @@ export function TerminalView({ session, interactive, mayResize, fontSize }: Term
       viewport?.removeEventListener('scroll', onViewportScroll)
       observer?.disconnect()
       scheduler.cancel()
-      onData.dispose()
       onResize.dispose()
       onScroll.dispose()
       detach()
@@ -431,6 +448,27 @@ export function TerminalView({ session, interactive, mayResize, fontSize }: Term
     // and never arrive.
     term.options.disableStdin = !interactive
   }, [interactive])
+
+  useEffect(() => {
+    const term = termRef.current
+    // The handler is registered only while this terminal may accept typing, and
+    // that is a stronger statement than disabling the keyboard above. A
+    // read-only viewer - the console's, which never asks for control - has no
+    // input handler bound to its terminal at all, so there is no path from a
+    // keystroke to a socket for it to travel down. Nothing else in this
+    // component calls session.input.
+    //
+    // It is an effect rather than a line in the mount effect because being
+    // given the keyboard is a change of condition, not a fact about the mount:
+    // a viewer that asks for control becomes the controller without a new
+    // terminal, and the handler has to appear with it.
+    if (!term || !interactive) return
+    const send = session.input
+    const onData = term.onData((data) => send(data))
+    return () => onData.dispose()
+    // session.input is a useCallback with no dependencies, so this registers
+    // once per transition rather than once per render.
+  }, [interactive, session.input])
 
   useEffect(() => {
     const wasResizing = mayResizeRef.current
@@ -483,26 +521,35 @@ export function TerminalView({ session, interactive, mayResize, fontSize }: Term
           </button>
         )}
       </div>
-      <div className="terminal__keys" role="group" aria-label="Terminal keys">
-        {TOUCH_KEYS.map((key) => (
-          <button
-            key={key.name}
-            type="button"
-            className="button button--small"
-            aria-label={key.name}
-            disabled={!interactive}
-            onClick={() => {
-              session.input(key.bytes)
-              // The button took the focus, and a tablet's keyboard follows the
-              // focus. Handing it back is what makes pressing one of these one
-              // keystroke rather than the end of typing.
-              termRef.current?.focus()
-            }}
-          >
-            {key.label}
-          </button>
-        ))}
-      </div>
+      {/* The touch keys are a second way to type - each one calls the session
+          directly - so a terminal that may not be typed into does not render
+          them. They are hidden rather than disabled for the console's viewer,
+          which has no controls at all: a row of buttons that can never do
+          anything is not a control, it is decoration made of controls. The
+          workspace keeps them disabled instead, because a device that is about
+          to ask for control benefits from seeing where the keys will be. */}
+      {showKeys && (
+        <div className="terminal__keys" role="group" aria-label="Terminal keys">
+          {TOUCH_KEYS.map((key) => (
+            <button
+              key={key.name}
+              type="button"
+              className="button button--small"
+              aria-label={key.name}
+              disabled={!interactive}
+              onClick={() => {
+                session.input(key.bytes)
+                // The button took the focus, and a tablet's keyboard follows the
+                // focus. Handing it back is what makes pressing one of these one
+                // keystroke rather than the end of typing.
+                termRef.current?.focus()
+              }}
+            >
+              {key.label}
+            </button>
+          ))}
+        </div>
+      )}
     </>
   )
 }

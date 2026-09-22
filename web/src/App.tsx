@@ -27,7 +27,7 @@ import { WorkspacePager } from './components/WorkspacePager'
 import { useProjects, useServerInfo } from './hooks/useProjects'
 import { describeError } from './lib/format'
 import { createTerminalClient } from './terminal/client'
-import { TerminalProvider, useConnectionStatus } from './terminal/useTerminal'
+import { TerminalProvider, useConnectionStatus, useTerminalClient } from './terminal/useTerminal'
 import {
   firstFreeSlot,
   members,
@@ -53,8 +53,23 @@ type Dialog = 'none' | 'new' | 'register'
  * this build does not recognise lands there, as it always has.
  */
 export function App() {
-  if (isDashboardPath(window.location.pathname)) return <DashboardPage />
-  return <WorkspaceApp />
+  // One terminal client for the page, whichever page it is. Creating one opens
+  // nothing: the socket is opened by the first subscribe and closed shortly
+  // after the last release, so a page with no terminal in it costs nothing by
+  // holding one.
+  //
+  // It is here rather than inside either page because both pages have terminals
+  // in them now, and a client created per page would be a second connection to
+  // the same server from the same tab. The console's viewers and the workspace's
+  // panel are the same browser, and the server should see it that way.
+  const [terminalClient] = useState(() => createTerminalClient())
+  useEffect(() => () => terminalClient.close(), [terminalClient])
+
+  return (
+    <TerminalProvider client={terminalClient}>
+      {isDashboardPath(window.location.pathname) ? <DashboardPage /> : <WorkspaceApp />}
+    </TerminalProvider>
+  )
 }
 
 /**
@@ -71,6 +86,7 @@ export function App() {
  * component rather than three features.
  */
 function WorkspaceApp() {
+  const terminalClient = useTerminalClient()
   const server = useServerInfo()
   const projects = useProjects()
   const reloadServer = server.reload
@@ -79,8 +95,6 @@ function WorkspaceApp() {
   // terminal is watched and closes it when the last one is released, so a page
   // with nothing on screen holds no connection. Every panel subscribes through
   // this, which is what keeps a workspace of five terminals to one WebSocket.
-  const [terminalClient] = useState(() => createTerminalClient())
-  useEffect(() => () => terminalClient.close(), [terminalClient])
   const connection = useConnectionStatus(terminalClient)
 
   const list = projects.data ?? []
@@ -313,131 +327,129 @@ function WorkspaceApp() {
   )
 
   return (
-    <TerminalProvider client={terminalClient}>
-      <div className="app">
-        <GlobalBar
-          info={server.data}
-          loading={server.loading}
-          error={server.error ? describeError(server.error) : null}
-          connection={connection}
+    <div className="app">
+      <GlobalBar
+        info={server.data}
+        loading={server.loading}
+        error={server.error ? describeError(server.error) : null}
+        connection={connection}
+        onRetry={retryEverything}
+      />
+
+      {server.error && (
+        <ErrorBanner
+          message={describeError(server.error)}
+          {...(server.error instanceof ApiError && server.error.status > 0
+            ? { detail: `${server.error.code} (HTTP ${server.error.status})` }
+            : {})}
           onRetry={retryEverything}
         />
+      )}
 
-        {server.error && (
-          <ErrorBanner
-            message={describeError(server.error)}
-            {...(server.error instanceof ApiError && server.error.status > 0
-              ? { detail: `${server.error.code} (HTTP ${server.error.status})` }
-              : {})}
-            onRetry={retryEverything}
+      {pageError && <ErrorBanner message={pageError} onDismiss={() => setPageError(null)} />}
+
+      {server.data && server.data.warnings.length > 0 && (
+        <div className="warnings">
+          {server.data.warnings.map((warning) => (
+            <span className="warnings__item" key={warning}>
+              {warning}
+            </span>
+          ))}
+        </div>
+      )}
+
+      <WorkspacePager
+        page={workspace.page}
+        pages={workspace.pages}
+        onPrevious={workspace.previousPage}
+        onNext={workspace.nextPage}
+      />
+
+      {workspace.focused ? (
+        <main className="workspace workspace--focus" aria-label="Focused project">
+          <ProjectPanel
+            key={workspace.focused.id}
+            project={workspace.focused}
+            terminalAvailable={server.data?.features.terminal === true}
+            terminalBlocker={server.data?.terminalBlocker ?? ''}
+            busy={busy}
+            position={workspacePosition(list, workspace.focused.id)}
+            actions={panelActions(workspace.focused)}
+            mode={fullscreen.active ? 'fullscreen' : 'focus'}
+            canFullscreen={fullscreen.supported}
           />
-        )}
-
-        {pageError && <ErrorBanner message={pageError} onDismiss={() => setPageError(null)} />}
-
-        {server.data && server.data.warnings.length > 0 && (
-          <div className="warnings">
-            {server.data.warnings.map((warning) => (
-              <span className="warnings__item" key={warning}>
-                {warning}
-              </span>
-            ))}
-          </div>
-        )}
-
-        <WorkspacePager
-          page={workspace.page}
-          pages={workspace.pages}
-          onPrevious={workspace.previousPage}
-          onNext={workspace.nextPage}
-        />
-
-        {workspace.focused ? (
-          <main className="workspace workspace--focus" aria-label="Focused project">
+        </main>
+      ) : (
+        <WorkspaceGrid
+          items={workspace.items}
+          columns={workspace.columns}
+          renderProject={(project) => (
             <ProjectPanel
-              key={workspace.focused.id}
-              project={workspace.focused}
+              project={project}
               terminalAvailable={server.data?.features.terminal === true}
               terminalBlocker={server.data?.terminalBlocker ?? ''}
               busy={busy}
-              position={workspacePosition(list, workspace.focused.id)}
-              actions={panelActions(workspace.focused)}
-              mode={fullscreen.active ? 'fullscreen' : 'focus'}
+              position={workspacePosition(list, project.id)}
+              actions={panelActions(project)}
+              mode="grid"
               canFullscreen={fullscreen.supported}
             />
-          </main>
-        ) : (
-          <WorkspaceGrid
-            items={workspace.items}
-            columns={workspace.columns}
-            renderProject={(project) => (
-              <ProjectPanel
-                project={project}
-                terminalAvailable={server.data?.features.terminal === true}
-                terminalBlocker={server.data?.terminalBlocker ?? ''}
-                busy={busy}
-                position={workspacePosition(list, project.id)}
-                actions={panelActions(project)}
-                mode="grid"
-                canFullscreen={fullscreen.supported}
-              />
-            )}
-            renderManager={() => (
-              <ProjectManagerPanel
-                projects={list}
-                projectsLoading={projects.loading}
-                projectsError={projects.error}
-                discovery={discovery}
-                discoveryLoading={discoveryLoading}
-                discoveryError={discoveryError}
-                busy={busy}
-                onOpenNew={() => {
-                  setActionError(null)
-                  setDialog('new')
-                }}
-                onOpenRegister={() => {
-                  setActionError(null)
-                  setDialog('register')
-                }}
-                onDiscover={() => void scan()}
-                onRegisterCandidate={onRegisterCandidate}
-                onRefresh={refreshProjects}
-                onOpenInWorkspace={openInWorkspace}
-                onRemoveFromWorkspace={removeFromWorkspace}
-                onMove={move}
-                onFocus={(project) => focus(project.id)}
-              />
-            )}
-          />
-        )}
+          )}
+          renderManager={() => (
+            <ProjectManagerPanel
+              projects={list}
+              projectsLoading={projects.loading}
+              projectsError={projects.error}
+              discovery={discovery}
+              discoveryLoading={discoveryLoading}
+              discoveryError={discoveryError}
+              busy={busy}
+              onOpenNew={() => {
+                setActionError(null)
+                setDialog('new')
+              }}
+              onOpenRegister={() => {
+                setActionError(null)
+                setDialog('register')
+              }}
+              onDiscover={() => void scan()}
+              onRegisterCandidate={onRegisterCandidate}
+              onRefresh={refreshProjects}
+              onOpenInWorkspace={openInWorkspace}
+              onRemoveFromWorkspace={removeFromWorkspace}
+              onMove={move}
+              onFocus={(project) => focus(project.id)}
+            />
+          )}
+        />
+      )}
 
-        {dialog === 'new' && (
-          <NewProjectDialog
-            roots={roots}
-            busy={busy}
-            error={actionError?.dialog === 'new' ? actionError.error : null}
-            onCancel={() => setDialog('none')}
-            onSubmit={(input) => void onCreate(input)}
-          />
-        )}
+      {dialog === 'new' && (
+        <NewProjectDialog
+          roots={roots}
+          busy={busy}
+          error={actionError?.dialog === 'new' ? actionError.error : null}
+          onCancel={() => setDialog('none')}
+          onSubmit={(input) => void onCreate(input)}
+        />
+      )}
 
-        {dialog === 'register' && (
-          <RegisterProjectDialog
-            discovery={discovery}
-            discoveryLoading={discoveryLoading}
-            discoveryError={discoveryError}
-            busy={busy}
-            error={actionError?.dialog === 'register' ? actionError.error : null}
-            onScan={() => void scan()}
-            onCancel={() => setDialog('none')}
-            onSubmit={(input) => void onRegister(input)}
-            onRegisterCandidate={onRegisterCandidate}
-          />
-        )}
+      {dialog === 'register' && (
+        <RegisterProjectDialog
+          discovery={discovery}
+          discoveryLoading={discoveryLoading}
+          discoveryError={discoveryError}
+          busy={busy}
+          error={actionError?.dialog === 'register' ? actionError.error : null}
+          onScan={() => void scan()}
+          onCancel={() => setDialog('none')}
+          onSubmit={(input) => void onRegister(input)}
+          onRegisterCandidate={onRegisterCandidate}
+        />
+      )}
 
-        {details && <ProjectDetailsDialog project={details} onClose={() => setDetailsId(null)} />}
-      </div>
-    </TerminalProvider>
+      {details && <ProjectDetailsDialog project={details} onClose={() => setDetailsId(null)} />}
+    </div>
   )
 }
 

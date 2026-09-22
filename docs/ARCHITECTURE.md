@@ -17,6 +17,7 @@ iPad / Phone / PC
 │ Terminal Transport          │   internal/terminal       — built in Phase 4
 │ Workspace                   │   web/src/workspace       — built in Phase 5
 │ Console (read-only)         │   web/src/dashboard       — built in Phase 7.4B-1
+│ Terminal Viewer             │   web/src/dashboard       — built in Phase 7.4B-2A
 │ Agent Manager               │   part of session.Manager — built in Phase 3
 │ Agent Launcher              │   internal/claude         — built in Phase 3
 │ Claude Adapter              │   internal/claude         — built in Phase 7.3B-1
@@ -96,6 +97,26 @@ belongs where it can be four queries instead of four hundred. **It owns nothing*
 no state that survives a request, and every route it serves is a GET. Delete the package and nothing
 is lost but the convenience. `docs/CONTROLLER_API.md` §1 is the boundary, §4 the sort, and §7 what it
 does not cover.
+
+The Terminal Viewer, added in Phase 7.4B-2A, is the console's terminal — and it is the workspace's,
+which is the whole of its design. It renders the same `components/TerminalView`, drives the same
+xterm.js instance and subscribes through the same client; what it does not do is render the input
+half. Its card passes `interactive={false}`, so no `onData` handler is bound to the terminal at all,
+and `showKeys={false}`, so the touch keys that call `session.input` directly are not drawn. A console
+is therefore a **viewer** in the sense `docs/MULTI_DEVICE.md` §5 already defined — the protocol's
+default position, not a restriction bolted onto a component — and the server refuses its input and
+its resize on the same paths it refuses any viewer's. **No backend change was needed for it**, and
+none was made: the transport, the protocol version, the snapshot/resync behaviour and the authority
+checks are Phase 4's and Phase 6's. `docs/TERMINAL_VIEWER.md` §3 lists the four independent things
+that would have to fail before a keystroke reached the pty, and §5 records the resize limitation in
+full — a viewer's window never moves the pty, and controller-driven geometry is a later phase's
+subject.
+
+One consequence belongs here rather than in the frontend document: **the page has one terminal
+client**, created in `App` above both the console and the workspace. Both pages have terminals in
+them now, and a client per page would be a second connection to the same server from the same tab —
+which is what §3 and §8 of the phase brief forbid when they forbid a second terminal websocket. Subscriptions
+are multiplexed on that socket and every frame carries its project, so seven cards are one connection.
 
 ## 2. Project vs Collection
 

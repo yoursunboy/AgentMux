@@ -25,6 +25,7 @@ As of version 0.6.5:
 | Phase 7.3C-2 — Attention and action queue | **Done** | `internal/attention` answers "what needs me": a level per attempt and a queue of pending actions, both projected from the same log, with three read endpoints and no way to answer an action. See `docs/AGENT_ATTENTION.md`. |
 | Phase 7.4A — Controller dashboard aggregation | **Done** | `internal/controller` joins the project, state, attention and action services into one response, with two GET routes and no writes. Four queries for any number of projects, no cache, no table. See `docs/CONTROLLER_API.md`. |
 | Phase 7.4B-1 — Controller web dashboard | **Done** | The first read-only screen: `/dashboard` renders the controller aggregation as a grid of project cards, with a server bar, status tones, and a layout from three columns to one. One request, a five-second poll, no terminal and no writes. See `docs/CONTROLLER_UI.md`. |
+| Phase 7.4B-2A — Terminal viewer | **Done** | The console stopped being a page of numbers: every card whose runtime is up carries the project's real terminal, drawn by the workspace's own xterm instance over the page's single existing WebSocket. Read-only by construction — no input handler is bound, no touch keys are drawn, no control is requested — and no backend change was needed. See `docs/TERMINAL_VIEWER.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -710,15 +711,27 @@ reading them yet — the same position the task endpoints were in after Phase 7.
 Sub-phase **7.4B-1, the console foundation, is done**: `/dashboard` renders the
 aggregation as a grid of project cards, sorted the way the server sorted them,
 with a server bar above and three columns down to one. It is read-only — no
-terminal, no input, no Claude control, no permission action, and a provider
-switch that is present and inert. `docs/CONTROLLER_UI.md` is the long form.
+input, no Claude control, no permission action, and a provider switch that is
+present and inert. `docs/CONTROLLER_UI.md` is the long form.
+
+Sub-phase **7.4B-2A, the terminal viewer, is done**. A card whose runtime is up
+now carries the project's actual terminal, live: the same `TerminalView`, the
+same xterm.js, the same `agentmux.terminal.v2` subscription over the page's one
+existing WebSocket. Nothing was added to the backend, because nothing needed to
+be — a console is a **viewer** in the protocol's existing sense, which is what
+makes it read-only by construction rather than by a flag: no input handler is
+bound to its terminal, no touch keys are drawn, no `control.request` is ever
+sent, and the server refuses a viewer's input and resize on the paths it already
+refused them. `docs/TERMINAL_VIEWER.md` is the long form, including §5's recorded
+limitation that a viewer's window never reshapes the pty.
 
 **What remains in 7.4 is depth, not surface.** The queue is a count rather than
-a list, so nothing shows *which* actions are waiting; the console has no way to
-reach a project's terminal, which is what would make a card a door rather than a
-report; and the attention projection's known limits — a failed project staying at
-`WARNING` until something runs in it again, and an agent started without a task
-being invisible — are inherited here unchanged.
+a list, so nothing shows *which* actions are waiting; nothing on the console can
+be operated — a card neither types into its terminal nor starts or stops a
+runtime, which is sub-phase 7.4B-2B's subject; and the attention projection's
+known limits — a failed project staying at `WARNING` until something runs in it
+again, and an agent started without a task being invisible — are inherited here
+unchanged.
 
 ## Phase 8 — CC Switch integration
 

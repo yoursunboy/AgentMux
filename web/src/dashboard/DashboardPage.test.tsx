@@ -1,11 +1,30 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { fetchDashboard } from '../api/client'
 import { makeDashboard, makeProjectCard, makeQuietProjectCard } from '../test/controller'
+import { renderWithTerminal } from '../test/dashboard'
 import { setViewportWidth } from '../test/layout'
 import { DashboardPage } from './DashboardPage'
+
+// The console's cards contain terminals, so this file needs the same three
+// xterm doubles `components/TerminalView.test.tsx` states. Running the real one
+// in jsdom would mean stubbing canvas and matchMedia so it can draw into a
+// document nobody looks at.
+vi.mock('@xterm/xterm', async () => {
+  const double = await import('../test/xterm')
+  return { Terminal: double.FakeTerminal }
+})
+vi.mock('@xterm/addon-fit', async () => {
+  const double = await import('../test/xterm')
+  return { FitAddon: double.FakeFitAddon }
+})
+vi.mock('@xterm/addon-unicode11', async () => {
+  const double = await import('../test/xterm')
+  return { Unicode11Addon: double.FakeUnicode11Addon }
+})
+
 
 // Only the read is replaced. Everything between it and the markup - the polling
 // hook, the column hook, the status mapping, the components - is the real thing,
@@ -39,7 +58,7 @@ describe('DashboardPage', () => {
 
   it('says it is loading before the first response arrives', () => {
     load.mockReturnValue(new Promise(() => {}))
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     expect(screen.getByRole('status')).toHaveTextContent('Loading controller…')
   })
@@ -51,7 +70,7 @@ describe('DashboardPage', () => {
     load.mockRejectedValueOnce(new Error('the network went away'))
     load.mockResolvedValue(makeDashboard({ projects: [], count: 0 }))
 
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Unable to load dashboard')
     expect(screen.getByText('the network went away')).toBeInTheDocument()
@@ -64,7 +83,7 @@ describe('DashboardPage', () => {
 
   it('offers a way back to the workspace when it cannot load', async () => {
     load.mockRejectedValue(new Error('nope'))
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     expect(await screen.findByRole('link', { name: 'Back to the workspace' })).toHaveAttribute(
       'href',
@@ -76,7 +95,7 @@ describe('DashboardPage', () => {
   // says so, with the server block still above it.
   it('says there are no projects when there are none', async () => {
     load.mockResolvedValue(makeDashboard({ projects: [], count: 0 }))
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     expect(await screen.findByText('No projects')).toBeInTheDocument()
     expect(screen.getByRole('banner')).toBeInTheDocument()
@@ -98,7 +117,7 @@ describe('DashboardPage', () => {
         count: 1,
       }),
     )
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     const card = await screen.findByRole('article')
     expect(within(card).getByRole('heading', { level: 3 })).toHaveTextContent('checkout-service')
@@ -110,7 +129,7 @@ describe('DashboardPage', () => {
 
   it('renders a project nothing has run in without inventing a status', async () => {
     load.mockResolvedValue(makeDashboard({ projects: [makeQuietProjectCard()], count: 1 }))
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     const card = await screen.findByRole('article')
     expect(row(card, 'Agent')).toHaveTextContent('none')
@@ -133,7 +152,7 @@ describe('DashboardPage', () => {
         ],
       }),
     )
-    const { container } = render(<DashboardPage />)
+    const { container } = renderWithTerminal(<DashboardPage />)
 
     await screen.findByRole('article')
     expect(container.querySelector('.status-badge--attention')).toBeInTheDocument()
@@ -153,7 +172,7 @@ describe('DashboardPage', () => {
         count: 3,
       }),
     )
-    render(<DashboardPage />)
+    renderWithTerminal(<DashboardPage />)
 
     const cards = await screen.findAllByRole('article')
     expect(cards).toHaveLength(3)
@@ -167,7 +186,7 @@ describe('DashboardPage', () => {
   // e2e asserts the painted layout in a real browser.
   it('lays out three columns on a desktop and one on a phone', async () => {
     load.mockResolvedValue(makeDashboard())
-    const { container } = render(<DashboardPage />)
+    const { container } = renderWithTerminal(<DashboardPage />)
     await screen.findByRole('article')
 
     const grid = container.querySelector('.project-grid')
@@ -190,7 +209,7 @@ describe('DashboardPage', () => {
     load.mockResolvedValueOnce(makeDashboard())
     load.mockRejectedValue(new Error('refresh failed'))
 
-    render(<DashboardPage pollMs={20} />)
+    renderWithTerminal(<DashboardPage pollMs={20} />)
     expect(await screen.findByRole('article')).toBeInTheDocument()
 
     expect(await screen.findByText(/Not current/)).toBeInTheDocument()

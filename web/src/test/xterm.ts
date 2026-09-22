@@ -73,7 +73,20 @@ export class FakeTerminal {
   /** The scroll state onScroll reports. A test moves it before firing onScroll. */
   readonly buffer = { active: { viewportY: 0, baseY: 0 } }
 
-  private readonly dataListeners: Array<(data: string) => void> = []
+  /**
+   * The handlers bound to the terminal's input.
+   *
+   * Named for what it holds rather than for the xterm method, because the count
+   * is what a test reads: a terminal that may not be typed into should have no
+   * handler bound at all, and asserting that is stronger than asserting that
+   * typing into it does nothing.
+   */
+  private readonly writers: Array<(data: string) => void> = []
+
+  /** How many input handlers are bound. A read-only viewer's terminal has none. */
+  get dataListenerCount(): number {
+    return this.writers.length
+  }
   private readonly resizeListeners: Array<() => void> = []
   private readonly scrollListeners: Array<() => void> = []
 
@@ -136,8 +149,8 @@ export class FakeTerminal {
   }
 
   onData(listener: (data: string) => void): FakeTerminalEvent {
-    this.dataListeners.push(listener)
-    return { dispose: () => this.remove(this.dataListeners, listener) }
+    this.writers.push(listener)
+    return { dispose: () => this.remove(this.writers, listener) }
   }
 
   onResize(listener: () => void): FakeTerminalEvent {
@@ -155,7 +168,7 @@ export class FakeTerminal {
 
   /** type delivers keystrokes, as xterm does once it has focus. */
   type(data: string): void {
-    for (const listener of this.dataListeners) listener(data)
+    for (const listener of this.writers) listener(data)
   }
 
   /** fireScroll delivers a scroll at whatever buffer state the test set up. */

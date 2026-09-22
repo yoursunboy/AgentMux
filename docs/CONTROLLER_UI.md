@@ -11,6 +11,10 @@ question — *what needs me?* — and it answers it for every project at once.
 │ │ checkout       │ │ studio         │ │ alpha          │             │
 │ │ Runtime running│ │ Runtime running│ │ Runtime running│             │
 │ │ Agent   running│ │ Agent   waiting│ │ Agent   running│             │
+│ │ ┌────────────┐ │ │ ┌────────────┐ │ │ ┌────────────┐ │             │
+│ │ │ ready> _   │ │ │ │ ● working  │ │ │ │ ready> _   │ │             │
+│ │ │            │ │ │ │            │ │ │ │            │ │             │
+│ │ └────────────┘ │ │ └────────────┘ │ │ └────────────┘ │             │
 │ │ Attention needs│ │ Attention none │ │ Attention none │             │
 │ │ Actions 1      │ │ Actions 0      │ │ Actions 0      │             │
 │ └────────────────┘ └────────────────┘ └────────────────┘             │
@@ -32,10 +36,12 @@ a string comparison. A router library would be a dependency, a history
 abstraction and a route-matching language to answer a question `route.ts` answers
 in four lines.
 
-**Why a full navigation and not a client-side swap.** The console has no terminal
-in it, so leaving the workspace costs a socket that is reopened on the way back.
-That is a page load, which is what a link does, and it means the two pages share
-no state that could get out of step.
+**Why a full navigation and not a client-side swap.** A link is what a page load
+is, and it means the two pages share no React state that could get out of step.
+What they do share is the terminal client, which lives above both of them — so
+walking from the console to the workspace and back costs no socket at all: the
+first subscribe on the new page opens one if the old page's has closed, and it is
+the same client identity in either case (`docs/TERMINAL_VIEWER.md` §2).
 
 **The two pages have two bars, and that is the design.** The workspace's bar
 reports the terminal — which host answered, which tmux is installed, whether the
@@ -49,7 +55,8 @@ web/src/dashboard/
   DashboardPage.tsx        the page: the three states, and the fourth
   ServerBar.tsx            server state, runtime availability, provider
   ProjectGrid.tsx          the grid, and the empty case
-  ProjectPanel.tsx         one project
+  ProjectPanel.tsx         one project: its statuses, its screen, its queue
+  TerminalViewer.tsx       one project's terminal, watched and never typed into
   StatusBadge.tsx          one status: a word and a dot
   status.ts                status → tone, and nothing about colour
   useDashboard.ts          the read, and the polling
@@ -154,10 +161,13 @@ and a count — a fraction of the width for the same usefulness — so three of 
 fit far earlier. §10's device list is what the numbers above are chosen to
 produce.
 
-**No fixed heights anywhere.** A card grows with its content and the grid grows
-downwards; the page scrolls. There is no pagination either: the workspace
-paginates because a page holds a fixed number of terminal panels and a grid
-without pages would show a terminal nobody can reach. A card is not a terminal.
+**No fixed heights anywhere.** A card is a flex column and the screen inside it is
+`flex: 1` over a `min-height` floor, so a card grows with its row and the
+terminal grows with the card; the grid grows downwards and the page scrolls.
+There is no pagination either: the workspace paginates because a page holds a
+fixed number of terminal panels and a grid without pages would show a terminal
+nobody can reach. A card is a report with a screen on it, and a hundred of them
+are a hundred things to scroll past.
 
 ### Why the column count is JavaScript at all
 
@@ -208,33 +218,36 @@ enumerations on the server side, and both of which React escapes.
 Everything §1 of the phase brief forbids, and each is a later phase's subject
 rather than an omission:
 
-- **no terminal**, no xterm.js and no WebSocket. The console has no terminal in
-  it, which is what makes it a second page rather than a mode of the first;
-- **no input**. Nothing on the console is typed into;
+- **no input**. Nothing on the console is typed into, including the terminal
+  §8 describes. A card's terminal has no input handler bound to it at all;
 - **no Claude control and no permission action.** The permission badge says a
   question was asked and offers nothing that answers it — the answer is given in
   the workspace's terminal, and `docs/AGENT_ATTENTION.md` §6 is why;
 - **no real CC Switch.** The provider section shows `Unknown` and a disabled
   button. It does not guess a model: a name that came from nowhere is a name
   somebody would act on;
+- **no runtime controls.** A card shows whether a runtime is up and cannot start
+  or stop one, which is what `docs/TERMINAL_VIEWER.md` §9 records;
 - **no mobile app.** The phone layout is the same page at a narrower width.
 
-## 8. Future terminal integration
+## 8. Terminal integration
 
-The plausible next step is opening a project's terminal from its card — selecting
-a card and getting the workspace's terminal for that project. What that would
-need is already here or already decided:
+Phase 7.4B-2A built it, and it is `docs/TERMINAL_VIEWER.md` in full. What that
+document had said was the plausible next step — opening a project's terminal from
+its card — turned out to be the smaller half of the answer: the console does not
+open a terminal, it *draws* one, on every card whose runtime is up.
 
-- **the address.** A card carries the project id, and the workspace already opens
-  a specific project by id.
-- **the layout.** A card is a grid cell with no fixed height, so a terminal
-  panel could replace one without the grid knowing.
-- **the data.** The console would need the terminal's own state — the socket, the
-  sequence numbers, the control lease — which is exactly what makes it a
-  *different* page rather than an addition to this one. The workspace already
-  holds all of it, and `docs/PROTOCOL.md` is the protocol.
+The three things this section predicted were needed were the three things that
+decided the shape:
 
-What it must not become is a second terminal implementation. The workspace's
-panel, its xterm instance, its resize rules and its controller lease are one
-system, and a console that grew its own would be two — which is why this phase
-stopped where it did.
+- **the address.** A card carries the project id, and it is what
+  `TerminalViewer` subscribes with.
+- **the layout.** A card is a grid cell with no fixed height, so the screen
+  became a flex child of a flex card — `flex: 1` with a `min-height` floor rather
+  than a height, so a card is as tall as its row and the terminal as tall as the
+  card.
+- **the data.** The socket, the sequence numbers and the control lease are the
+  workspace's, and the console reads them through the *same* client — one
+  WebSocket for the document, whether it is showing one page or the other. That
+  is what keeps this one terminal implementation rather than two, which is what
+  this section asked for.

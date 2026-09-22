@@ -116,6 +116,12 @@ export interface ClientDouble {
    * how one is read off the wire.
    */
   deliverControl(view: ControlView, message?: ControlMessage): void
+  /** Delivers output to the last subscription, as the client does for arriving bytes. */
+  deliverOutput(payload: Uint8Array): void
+  /** Hands the last subscription a fresh screen, as the server sends on subscribe. */
+  deliverSnapshot(payload: Uint8Array, cols?: number, rows?: number): void
+  /** Ends the last subscription, as the server does when a runtime goes away. */
+  deliverEnded(): void
 }
 
 /**
@@ -152,6 +158,15 @@ export function makeClient(overrides: Partial<TerminalClient> = {}): ClientDoubl
     current: () => last,
     deliverControl(view, message = { type: 'control.changed', projectId: watched, control: view }) {
       handlers?.control(view, message)
+    },
+    deliverOutput(payload) {
+      handlers?.draw(payload)
+    },
+    deliverSnapshot(payload, cols = 80, rows = 24) {
+      handlers?.show(payload, cols, rows)
+    },
+    deliverEnded() {
+      handlers?.ended()
     },
   }
 }

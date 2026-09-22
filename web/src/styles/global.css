@@ -1539,3 +1539,107 @@ code {
 .status-badge--danger .status-badge__label {
   color: var(--danger);
 }
+
+/* --- the card with a terminal in it -------------------------------------- */
+
+/* The card is a column: what the project is, then the screen, then what it
+   needs. The screen is the only part that grows, which is what makes a card as
+   tall as its row and the terminal inside it as tall as the card. */
+.project-card {
+  display: flex;
+  flex-direction: column;
+}
+
+/* A floor rather than a height. A terminal with no height draws nothing, and a
+   card in a row with no other card beside it has nothing to be stretched by;
+   everything above this is the grid. */
+.project-card__screen {
+  display: flex;
+  flex: 1;
+  min-height: 160px;
+  margin: 8px 0;
+  overflow: hidden;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* The rows above and below the screen keep their own spacing, so the gap the
+   screen sits in is the screen's margin rather than theirs. */
+.project-card__fields--head {
+  margin-bottom: 0;
+}
+
+.project-card__fields--foot {
+  margin-top: 0;
+}
+
+/* --- the viewer ---------------------------------------------------------- */
+
+.terminal-viewer {
+  position: relative;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The terminal fills the screen box. `TerminalView` brings its own `.terminal`
+   flex column with it, so this only has to stop it from overflowing. */
+.terminal-viewer .terminal {
+  min-height: 0;
+}
+
+.terminal-viewer__notice {
+  position: absolute;
+  right: 8px;
+  bottom: 6px;
+  margin: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.terminal-viewer__notice--warning {
+  color: var(--warning);
+}
+
+/* What the viewer shows instead of a terminal. It is centred, because there is
+   nothing else in the box, and it is deliberately not a terminal-shaped blank:
+   a card that showed an empty black rectangle would look like a terminal
+   displaying nothing rather than a project with no terminal. */
+.terminal-viewer__placeholder {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  text-align: center;
+}
+
+.terminal-viewer__title {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.terminal-viewer__placeholder--danger .terminal-viewer__title {
+  color: var(--danger);
+}
+
+.terminal-viewer__detail {
+  margin: 0;
+  max-width: 32ch;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.terminal-viewer__placeholder .button {
+  margin-top: 4px;
+}

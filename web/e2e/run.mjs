@@ -203,6 +203,11 @@ async function waitForClaude(entry, timeoutMs) {
  * suites that restart the server - a restart is worth surviving with real data
  * in the database.
  *
+ * `dashboard-terminal` follows `dashboard` because it is the same page with a
+ * terminal on it, and it is the more expensive of the two: it stops and starts a
+ * runtime, reloads the page and drives a second console. Both are before
+ * `controller`, which costs more than either.
+ *
  * `controller` is last because it is the most expensive of them: it drives two
  * browser contexts at once, waits out a control grace and restarts the server
  * underneath its own fixture. Nothing after it would benefit from that.
@@ -215,6 +220,7 @@ const ALL_SUITES = [
   'tablet',
   'workspace',
   'dashboard',
+  'dashboard-terminal',
   'controller',
 ]
 

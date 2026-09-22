@@ -341,6 +341,38 @@ describe('TerminalView', () => {
       expect(screen.getByRole('button', { name: 'Interrupt' })).toBeDisabled()
       expect(screen.getByRole('button', { name: 'Escape' })).toBeDisabled()
     })
+
+    it('draws those keys unless it is told not to, which is what a viewer says', () => {
+      // Two halves, and both are the point. The workspace passes no showKeys at
+      // all, so the default has to be the keys it has always drawn - a prop
+      // added for somebody else must not quietly change the page it was not
+      // added for.
+      //
+      // The other half is the console's: a viewer passes showKeys={false}
+      // (docs/TERMINAL_VIEWER.md §3). Disabling these keys would not do.
+      // Each one calls session.input directly rather than through onData, so a
+      // viewer's copy of them would be a second input path - one the missing
+      // onData handler does not intercept. Not drawing them is the only version
+      // of that which is structural.
+      const { session } = makeSession()
+
+      const shown = render(
+        <TerminalView session={session} interactive={false} mayResize={false} fontSize={11} />,
+      )
+      expect(screen.queryByRole('button', { name: 'Escape' })).not.toBeNull()
+      shown.unmount()
+
+      render(
+        <TerminalView
+          session={session}
+          interactive={false}
+          mayResize={false}
+          showKeys={false}
+          fontSize={11}
+        />,
+      )
+      expect(screen.queryByRole('button', { name: 'Escape' })).toBeNull()
+    })
   })
 
   describe('resize', () => {

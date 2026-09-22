@@ -18,10 +18,17 @@
  *
  * # What is deliberately not here
  *
- * Nothing in this suite opens a terminal, and nothing types. The console has no
- * terminal in it: that is what makes it a second page rather than a mode of the
- * first, and a suite that went looking for an xterm here would be asserting the
- * thing the phase said not to build.
+ * Nothing in this suite types, and nothing in it is about a terminal. The
+ * console's cards have terminals on them now — Phase 7.4B-2A put them there, and
+ * `dashboard-terminal.mjs` is the suite for those — so what that means here is
+ * that every claim below has to hold with a WebSocket open and seven xterm
+ * instances in the document. They do: the layout, the order, the four values on
+ * a card and the inertness of the provider switch are all read off the page, and
+ * none of them depends on what a terminal is drawing.
+ *
+ * A card drawing a terminal does not make the console a page you operate. It is
+ * still read rather than typed into, and a suite that went looking here for a
+ * *control* would be asserting what the next sub-phase has yet to build.
  */
 import { chromium } from 'playwright'
 

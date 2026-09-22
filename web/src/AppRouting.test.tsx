@@ -5,6 +5,31 @@ import { App } from './App'
 import { makeDashboard, makeProjectCard } from './test/controller'
 import { makeServerInfo } from './test/fixtures'
 
+// The console's cards contain terminals, so this file needs the same three
+// xterm doubles `components/TerminalView.test.tsx` states. Running the real one
+// in jsdom would mean stubbing canvas and matchMedia so it can draw into a
+// document nobody looks at.
+vi.mock('@xterm/xterm', async () => {
+  const double = await import('./test/xterm')
+  return { Terminal: double.FakeTerminal }
+})
+vi.mock('@xterm/addon-fit', async () => {
+  const double = await import('./test/xterm')
+  return { FitAddon: double.FakeFitAddon }
+})
+vi.mock('@xterm/addon-unicode11', async () => {
+  const double = await import('./test/xterm')
+  return { Unicode11Addon: double.FakeUnicode11Addon }
+})
+
+// The application owns the page's terminal client, which the console's cards
+// subscribe through. A test that let it build a real one would open a socket
+// from jsdom and spend the test reconnecting to a server that is not there.
+vi.mock('./terminal/client', async () => {
+  const double = await import('./test/terminal')
+  return { createTerminalClient: () => double.makeClient().client }
+})
+
 /**
  * Which page the application opens, at the level of the application.
  *

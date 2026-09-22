@@ -481,6 +481,8 @@ func (a *Authority) Request(projectID, clientID, connectionID, device string) (R
 		// likely coming back - that is what the grace period is for - and
 		// handing the terminal to the first asker would make the grace period
 		// mean nothing. The asker is told the truth: somebody has it.
+		a.log.Info("control denied", "projectId", projectID, "clientId", clientID,
+			"reason", ReasonControllerExists)
 		return RequestDenied, ReasonControllerExists
 	}
 
@@ -490,6 +492,8 @@ func (a *Authority) Request(projectID, clientID, connectionID, device string) (R
 	if len(state.pending) >= MaxPendingRequests {
 		// The queue is full. The request is not recorded, so the asker is not
 		// left believing it is waiting for an answer that will never come.
+		a.log.Info("control denied", "projectId", projectID, "clientId", clientID,
+			"reason", ReasonTooManyRequests)
 		return RequestDenied, ReasonTooManyRequests
 	}
 	state.pending[clientID] = PendingRequest{

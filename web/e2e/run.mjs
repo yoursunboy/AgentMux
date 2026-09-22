@@ -208,6 +208,16 @@ async function waitForClaude(entry, timeoutMs) {
  * runtime, reloads the page and drives a second console. Both are before
  * `controller`, which costs more than either.
  *
+ * `controller-input` follows `dashboard-terminal` for the same reason one step
+ * on - same page, one more thing done on it - and it sits before `controller`
+ * rather than after it because of what it leaves behind. It types into the same
+ * fixture project `controller` does, and it gives the keyboard back at the end
+ * so that project is nobody's when it finishes. A lease whose browser has closed
+ * is suspended for the grace period rather than released, so a suite that ended
+ * holding one would hand `controller` a project it cannot take for eight
+ * seconds. Ending with nothing held is not a courtesy; it is what makes the
+ * order safe.
+ *
  * `controller` is last because it is the most expensive of them: it drives two
  * browser contexts at once, waits out a control grace and restarts the server
  * underneath its own fixture. Nothing after it would benefit from that.
@@ -221,6 +231,7 @@ const ALL_SUITES = [
   'workspace',
   'dashboard',
   'dashboard-terminal',
+  'controller-input',
   'controller',
 ]
 

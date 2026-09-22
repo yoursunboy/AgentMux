@@ -83,7 +83,7 @@ export class FakeTerminal {
    */
   private readonly writers: Array<(data: string) => void> = []
 
-  /** How many input handlers are bound. A read-only viewer's terminal has none. */
+  /** How many input handlers are bound. A viewer's terminal has none. */
   get dataListenerCount(): number {
     return this.writers.length
   }

@@ -218,16 +218,17 @@ enumerations on the server side, and both of which React escapes.
 Everything §1 of the phase brief forbids, and each is a later phase's subject
 rather than an omission:
 
-- **no input**. Nothing on the console is typed into, including the terminal
-  §8 describes. A card's terminal has no input handler bound to it at all;
-- **no Claude control and no permission action.** The permission badge says a
-  question was asked and offers nothing that answers it — the answer is given in
-  the workspace's terminal, and `docs/AGENT_ATTENTION.md` §6 is why;
+- **no permission action.** The permission badge says a question was asked and
+  offers nothing that answers it — the answer is given in the workspace's
+  terminal, and `docs/AGENT_ATTENTION.md` §6 is why. A console that can type at
+  the terminal is not a console that may answer for the person sitting at it;
 - **no real CC Switch.** The provider section shows `Unknown` and a disabled
   button. It does not guess a model: a name that came from nowhere is a name
   somebody would act on;
 - **no runtime controls.** A card shows whether a runtime is up and cannot start
   or stop one, which is what `docs/TERMINAL_VIEWER.md` §9 records;
+- **no notification.** A card does not tell anybody anything; it is read when it
+  is looked at;
 - **no mobile app.** The phone layout is the same page at a narrower width.
 
 ## 8. Terminal integration
@@ -251,3 +252,27 @@ decided the shape:
   WebSocket for the document, whether it is showing one page or the other. That
   is what keeps this one terminal implementation rather than two, which is what
   this section asked for.
+
+Phase 7.4B-2B added the input half, and the prediction above is why it cost so
+little: because the console drives the workspace's client, the lease it asks for
+is the same lease the workspace asks for, on the same socket, with the same
+`control.request` and `control.release` frames. **No endpoint was added** — not
+`/api/runtime/{id}/controller` nor its request and release siblings — because the
+console is never a different *kind* of client, only a different page. The three
+pieces that are the console's own are:
+
+- `dashboard/TerminalControl.tsx`, the card's control bar: the badge, the
+  Request/Release button, and the pending requests a holder can accept or refuse.
+  It is drawn from the vocabulary in `components/ProjectTerminal.tsx` —
+  `describeControl`, `controlTone`, `controlButton`, `describeRefusal` — so the
+  two pages cannot say different things about the same lease;
+- the card's own two derived props (`interactive`, `showKeys`, both following the
+  lease) and the one that is not (`mayResize={false}`, always);
+- the third notice, so a refused message is a sentence in the corner rather than
+  the whole card replaced by an error.
+
+`docs/TERMINAL_CONTROLLER.md` is the design in full. What belongs here is the
+seam this document has been describing since §1: a card that can take the
+keyboard is still a card, and taking it changes nothing about the card's four
+rows, its polling, or what it renders. The lease is a property of the connection
+the page already had.

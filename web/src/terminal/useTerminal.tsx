@@ -145,6 +145,26 @@ export function useConnectionStatus(client: TerminalClient): ConnectionStatus {
 }
 
 /**
+ * What a session may do with the lease once it has it.
+ *
+ * `mayResize` is the one thing a caller can withhold, and it is named after the
+ * prop `TerminalView` takes because it is the same fact one layer down. Holding
+ * the lease makes a client the one whose keystrokes the server accepts; it does
+ * not have to make it the one whose window the pty takes its shape from, and the
+ * console's cards are the case where those two come apart. A card is a few
+ * hundred pixels in a grid and its box has nothing to do with the terminal
+ * everybody is working in, so a client that took control from one would reflow
+ * the pane of whoever is typing - which is a change nobody asked for, made by
+ * somebody who was only looking.
+ *
+ * The default is the workspace's answer, which is that they are the same thing.
+ */
+export interface TerminalSessionOptions {
+  /** Whether holding the lease also lets this client's shape reach the pty. */
+  mayResize?: boolean
+}
+
+/**
  * useTerminalSession watches one project's terminal while it is on screen.
  *
  * `active` is what a caller uses to say "there is a terminal to watch". A
@@ -155,9 +175,24 @@ export function useConnectionStatus(client: TerminalClient): ConnectionStatus {
 export function useTerminalSession(
   projectId: string | null,
   active: boolean,
+  options: TerminalSessionOptions = {},
 ): TerminalSession {
   const client = useTerminalClient()
   const status = useConnectionStatus(client)
+  const mayResize = options.mayResize ?? true
+  /**
+   * The option as the newest render sees it, for the callbacks that are not
+   * handlers.
+   *
+   * The handlers below are memoised on the client alone, so that a subscription
+   * is not torn down and rebuilt every time a component renders - which means
+   * they cannot close over this render's value. Writing it during the render is
+   * what React's own docs call the escape hatch for exactly this: the value is
+   * read from a callback, never rendered, so there is nothing for a concurrent
+   * render to disagree with.
+   */
+  const mayResizeRef = useRef(mayResize)
+  mayResizeRef.current = mayResize
 
   const [error, setError] = useState<ErrorMessage | null>(null)
   const [ended, setEnded] = useState(false)
@@ -208,7 +243,7 @@ export function useTerminalSession(
           waiting: isWaiting(view, id),
           reason: 'reason' in message ? message.reason : '',
         }
-        if (next.held && !controlRef.current.held) {
+        if (mayResizeRef.current && next.held && !controlRef.current.held) {
           // Taking control is when this browser's shape starts to matter. Until
           // now the pty has been shaped by whoever was typing, and this client
           // has been drawing at a size it had no right to ask for - so the size
@@ -237,7 +272,21 @@ export function useTerminalSession(
     // wrong device as the controller for as long as the new one takes to arrive.
     controlRef.current = NO_CONTROL
     setControl(NO_CONTROL)
-    const subscription = client.subscribe(projectId, sizeRef.current, handlers)
+    // A size is offered only by a client that may reshape. The subscribe is the
+    // one place a size can reach the pty *without* being a resize at all: the
+    // server applies the size a subscribe carries when the client holds the
+    // lease (conn.go's handleSubscribe), so a card paging in on a connection
+    // that already holds one would reshape the pane from its own box - and a
+    // reconnect re-subscribes with the size this registration remembers, which
+    // is why it is withheld here rather than filtered later. A null size is the
+    // protocol's own way of saying "no size from me": the field is left off the
+    // frame entirely (client.ts), and the snapshot that comes back is the shape
+    // this client draws at.
+    const subscription = client.subscribe(
+      projectId,
+      mayResizeRef.current ? sizeRef.current : null,
+      handlers,
+    )
     subscriptionRef.current = subscription
     return () => {
       subscriptionRef.current = null
@@ -259,6 +308,10 @@ export function useTerminalSession(
     // itself rather than a person asking for anything, so a phone that rotated
     // would otherwise be answered with a refusal it did nothing to deserve.
     if (!controlRef.current.held) return
+    // And a controller that may not reshape does not send one either, which is
+    // the stronger half: this client holds the lease, so nothing below would
+    // refuse it. The console's cards take the keyboard and never the shape.
+    if (!mayResizeRef.current) return
     subscriptionRef.current?.resize(cols, rows)
   }, [])
   const requestControl = useCallback(() => subscriptionRef.current?.requestControl(), [])

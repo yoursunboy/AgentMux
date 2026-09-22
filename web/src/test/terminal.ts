@@ -120,6 +120,16 @@ export interface ClientDouble {
   deliverOutput(payload: Uint8Array): void
   /** Hands the last subscription a fresh screen, as the server sends on subscribe. */
   deliverSnapshot(payload: Uint8Array, cols?: number, rows?: number): void
+  /**
+   * deliverError reports a refusal about the last subscription, as the client
+   * does for an error frame that names a project.
+   *
+   * The distinction it exists to let a test draw is the one the server draws:
+   * an error frame is a refusal of one message, and the connection behind it is
+   * still open. A surface that cannot tell those apart cannot be tested for
+   * telling them apart.
+   */
+  deliverError(message: ErrorMessage): void
   /** Ends the last subscription, as the server does when a runtime goes away. */
   deliverEnded(): void
 }
@@ -164,6 +174,9 @@ export function makeClient(overrides: Partial<TerminalClient> = {}): ClientDoubl
     },
     deliverSnapshot(payload, cols = 80, rows = 24) {
       handlers?.show(payload, cols, rows)
+    },
+    deliverError(message) {
+      handlers?.report(message)
     },
     deliverEnded() {
       handlers?.ended()

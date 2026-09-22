@@ -1320,8 +1320,8 @@ than its wire format:
 | | |
 | --- | --- |
 | URL | `GET /api/ws`, optionally `?v=<protocol>` |
-| Subprotocol | `agentmux.terminal.v1` |
-| A client names | a `projectId` it is subscribing to, and nothing else |
+| Subprotocol | `agentmux.terminal.v2` |
+| A client names | a `projectId` it is subscribing to, and which client it is — and nothing else |
 | A client cannot name | a filesystem path, a session name, a socket, or a command |
 | Origin | checked against the request's own host and `server.allowedOrigins`; a missing `Origin` is allowed, because a browser always sends one |
 
@@ -1336,6 +1336,33 @@ keystrokes to a terminal it has already subscribed to, and they go to whatever i
 exactly as typing would; there is no message that runs a program. And **nothing here can create or
 destroy a runtime.** Subscribing to a project that is not running is refused; starting one is
 `POST /api/projects/{id}/runtime/start` above.
+
+### Who may type: the controller lease
+
+Phase 7.4B-2B added the one piece of authority the terminal needed and the REST API has no shape for:
+**which client may send input to a project's terminal.** It is deliberately not an endpoint. There is
+no `GET /api/runtime/{id}/controller`, no `POST .../controller/request` and no
+`POST .../controller/release`, because a lease is a property of a live connection rather than of a
+resource — it names a *connected client*, expires when that client goes away, and is meaningless to
+anybody who is not holding the socket it was granted on. Serving it over HTTP would mean inventing a
+second identity for a browser that already has one.
+
+So a client asks on the socket it is already holding, with `control.request` and `control.release`,
+and the server answers with `control.changed` broadcasts and `control.denied` refusals. Three
+properties of it belong in this document:
+
+- **one controller at a time, and never preempted.** A request for a terminal somebody else holds is
+  refused, not queued behind a takeover. The refusal names the holder by the device label the server
+  derived from User-Agent, so the person asking is told who has it rather than that they may not;
+- **identity comes from the connection, not the frame.** The server never reads a client id out of a
+  message body; the lease is granted to the client that owns the socket the request arrived on;
+- **input is refused without it.** A client without the lease that sends an `input` frame, or a
+  `resize`, is refused with an error naming the message it was about — and the connection stays open.
+  A refusal is not a fault: the terminal is still there and still being drawn.
+
+The lease lives in memory only. There is no table, no row, and no record of what was typed —
+`docs/TERMINAL_CONTROLLER.md` §5 is the reasoning, and the log lines carry a project id and a client
+id and never a keystroke.
 
 ## The diagnostic endpoints are gone
 

@@ -65,8 +65,15 @@ export function describeControl(control: ControlState): string {
   return `Viewer · ${view.controller.device} has control`
 }
 
-/** The tone the control badge is drawn in. */
-function controlTone(control: ControlState): string {
+/**
+ * controlTone is the tone the control badge is drawn in.
+ *
+ * It is exported alongside the three functions above because the console draws
+ * the same badge at a different size (dashboard/TerminalControl.tsx), and a
+ * second copy of this mapping would be a second place for "waiting" to be a
+ * different colour than it is here.
+ */
+export function controlTone(control: ControlState): string {
   if (control.held) return 'mine'
   if (control.waiting) return 'waiting'
   if (control.view?.suspended) return 'away'
@@ -182,8 +189,12 @@ export function promptBarBlockedReason(session: TerminalSession): string {
  * granted, or handed over shows up as the roster changing; a request refused
  * because somebody else is typing leaves the project exactly as it was, and
  * without this the button would appear to have done nothing at all.
+ *
+ * Exported for the same reason as the others: the console's card says this in
+ * its own words only if it is allowed to say them differently, and nothing here
+ * should be said twice in two tenses.
  */
-function describeRefusal(control: ControlState): string {
+export function describeRefusal(control: ControlState): string {
   if (control.held || control.waiting) return ''
   switch (control.reason) {
     case ControlReason.controllerExists:

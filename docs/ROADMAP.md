@@ -25,7 +25,8 @@ As of version 0.6.5:
 | Phase 7.3C-2 — Attention and action queue | **Done** | `internal/attention` answers "what needs me": a level per attempt and a queue of pending actions, both projected from the same log, with three read endpoints and no way to answer an action. See `docs/AGENT_ATTENTION.md`. |
 | Phase 7.4A — Controller dashboard aggregation | **Done** | `internal/controller` joins the project, state, attention and action services into one response, with two GET routes and no writes. Four queries for any number of projects, no cache, no table. See `docs/CONTROLLER_API.md`. |
 | Phase 7.4B-1 — Controller web dashboard | **Done** | The first read-only screen: `/dashboard` renders the controller aggregation as a grid of project cards, with a server bar, status tones, and a layout from three columns to one. One request, a five-second poll, no terminal and no writes. See `docs/CONTROLLER_UI.md`. |
-| Phase 7.4B-2A — Terminal viewer | **Done** | The console stopped being a page of numbers: every card whose runtime is up carries the project's real terminal, drawn by the workspace's own xterm instance over the page's single existing WebSocket. Read-only by construction — no input handler is bound, no touch keys are drawn, no control is requested — and no backend change was needed. See `docs/TERMINAL_VIEWER.md`. |
+| Phase 7.4B-2A — Terminal viewer | **Done** | The console stopped being a page of numbers: every card whose runtime is up carries the project's real terminal, drawn by the workspace's own xterm instance over the page's single existing WebSocket. Its read-only behaviour comes from the protocol's viewer position rather than from a flag, and no backend change was needed. See `docs/TERMINAL_VIEWER.md`. |
+| Phase 7.4B-2B — Controller lease and input | **Done** | A client can ask to own a terminal's input, be granted it, type at it, and give it back — one controller at a time, never preempted, expiring on its own when the holder goes away. The lease is in memory only and no keystroke is ever recorded. The console types and never reshapes the pty. See `docs/TERMINAL_CONTROLLER.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -720,18 +721,31 @@ same xterm.js, the same `agentmux.terminal.v2` subscription over the page's one
 existing WebSocket. Nothing was added to the backend, because nothing needed to
 be — a console is a **viewer** in the protocol's existing sense, which is what
 makes it read-only by construction rather than by a flag: no input handler is
-bound to its terminal, no touch keys are drawn, no `control.request` is ever
-sent, and the server refuses a viewer's input and resize on the paths it already
-refused them. `docs/TERMINAL_VIEWER.md` is the long form, including §5's recorded
-limitation that a viewer's window never reshapes the pty.
+bound to its terminal, no touch keys are drawn, and the server refuses a viewer's
+input and resize on the paths it already refused them.
+`docs/TERMINAL_VIEWER.md` is the long form.
+
+Sub-phase **7.4B-2B, the controller lease, is done**, and it is the piece that
+makes "viewer" a state a client can leave. A **lease** records which client
+currently owns a project's terminal input: it is asked for with
+`control.request` on the socket the client already holds, granted to whoever asks
+first when the terminal is free, and never taken from a client that has it. A
+request that loses is refused with the holder's device name, not queued behind a
+takeover. The lease lives in memory — no table, no row, and no keystroke ever
+written anywhere — is keyed on the `sessionStorage` identity that survives a
+reload, and is released when the holder says so or expires when the holder's
+connection goes away. Input and resize are separate authorities and the console
+keeps only the first: **a console types and never reshapes the shared pty**.
+`docs/TERMINAL_CONTROLLER.md` is the long form, and `docs/TERMINAL_VIEWER.md` §3
+is what a client without the lease still cannot do.
 
 **What remains in 7.4 is depth, not surface.** The queue is a count rather than
-a list, so nothing shows *which* actions are waiting; nothing on the console can
-be operated — a card neither types into its terminal nor starts or stops a
-runtime, which is sub-phase 7.4B-2B's subject; and the attention projection's
-known limits — a failed project staying at `WARNING` until something runs in it
-again, and an agent started without a task being invisible — are inherited here
-unchanged.
+a list, so nothing shows *which* actions are waiting; the console can take a
+terminal's keyboard but still cannot answer a permission prompt from it, nor
+start or stop a runtime, nor be told anything it is not currently looking at —
+those are later phases' subjects; and the attention projection's known limits — a
+failed project staying at `WARNING` until something runs in it again, and an
+agent started without a task being invisible — are inherited here unchanged.
 
 ## Phase 8 — CC Switch integration
 

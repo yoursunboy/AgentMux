@@ -95,6 +95,31 @@ describe('TerminalView', () => {
     expect(sinks).toHaveLength(1)
   })
 
+  // The session's size is what this client states when it is given the keyboard
+  // (`useTerminal`'s control handler), and the two below are where a client that
+  // never fits learns it. Without them a viewer records the 80x24 xterm is born
+  // with and keeps it while the pane is something else entirely - so the moment
+  // it asks for control it states a size the terminal is not, and the pty
+  // everybody is watching is reshaped to match a browser that was only looking.
+  it('records the size the server says the terminal is, not the one xterm starts at', () => {
+    const { session, current } = renderView(false, 11, false)
+
+    act(() => current()!.show(encoder.encode('ready'), 120, 30))
+
+    expect(session.setSize).toHaveBeenCalledWith({ cols: 120, rows: 30 })
+  })
+
+  it('and the size the server applied when somebody else reshaped the pane', () => {
+    // Every watcher is told the size that was applied, not only the client that
+    // asked for it (`conn.go`'s applySize broadcasts it), which is how a client
+    // that is not typing learns the terminal has changed shape underneath it.
+    const { session, current } = renderView(false, 11, false)
+
+    act(() => current()!.resize(100, 40))
+
+    expect(session.setSize).toHaveBeenCalledWith({ cols: 100, rows: 40 })
+  })
+
   describe('drawing', () => {
     it('appends output', () => {
       const { current } = renderView()
@@ -348,8 +373,9 @@ describe('TerminalView', () => {
       // added for somebody else must not quietly change the page it was not
       // added for.
       //
-      // The other half is the console's: a viewer passes showKeys={false}
-      // (docs/TERMINAL_VIEWER.md §3). Disabling these keys would not do.
+      // The other half is the console's: a card passes showKeys={held}, so a
+      // client without the lease passes showKeys={false} (docs/TERMINAL_VIEWER.md
+      // §3). Disabling these keys would not do.
       // Each one calls session.input directly rather than through onData, so a
       // viewer's copy of them would be a second input path - one the missing
       // onData handler does not intercept. Not drawing them is the only version

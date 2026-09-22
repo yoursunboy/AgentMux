@@ -552,9 +552,32 @@ export function panels(page) {
   return page.locator('.panel--project')
 }
 
+/**
+ * projectScope is the box one project's terminal is drawn in, on either page.
+ *
+ * The workspace puts a project in a panel (`.panel--project`, addressed by the
+ * project's id) and the console puts it on a card (`.project-card`, addressed
+ * by its name, which is what that page has to hand). Two markups for one thing
+ * - a project with a terminal in it - and everything below is about the thing
+ * rather than about either markup: a project has one pty, one lease and one
+ * badge wherever it happens to be watched from.
+ *
+ * Matching both in one selector is what lets `takeControl` be called by a suite
+ * about the workspace and a suite about the console without either of them
+ * having to say which page it is on. `panelOf` above stays as it was, because
+ * a suite that asks for a panel is asking about the workspace specifically -
+ * that is where the Prompt Bar and the touch keys live, and neither exists on a
+ * card.
+ */
+export function projectScope(page, entry) {
+  return page.locator(
+    `.panel--project[data-project-id="${entry.id}"], .project-card[aria-label="${entry.name}"]`,
+  )
+}
+
 /** The badge that says who is in charge of a project's terminal. */
 export function controlBadge(page, entry) {
-  return panelOf(page, entry).locator('[data-testid="terminal-control"]')
+  return projectScope(page, entry).locator('[data-testid="terminal-control"]')
 }
 
 /**
@@ -571,6 +594,10 @@ export function controlBadge(page, entry) {
  * the client, so what it proves is that the button works. The viewer case, and
  * the handover between two devices, is what `controller.mjs` is for; this
  * helper is the one line that keeps the rest of the suites about terminals.
+ *
+ * It is scoped through `projectScope`, so it works on the console as well as in
+ * the workspace - which is what `controller-input.mjs` needs, because the
+ * console is the page where a card is typed into.
  */
 export async function takeControl(page, entry) {
   const badge = controlBadge(page, entry)
@@ -582,7 +609,7 @@ export async function takeControl(page, entry) {
   await waitFor(async () => (await badge.count()) > 0, 10_000)
   if (await mine()) return true
 
-  const button = panelOf(page, entry).getByRole('button', { name: 'Request control' })
+  const button = projectScope(page, entry).getByRole('button', { name: 'Request control' })
   if ((await button.count()) === 0) return false
   await button.first().click()
 
@@ -605,7 +632,7 @@ export async function releaseControl(page, entry) {
   const mine = async () => ((await badge.textContent().catch(() => '')) ?? '').startsWith('You control')
 
   if (!(await mine())) return true
-  const button = panelOf(page, entry).getByRole('button', { name: 'Release control' })
+  const button = projectScope(page, entry).getByRole('button', { name: 'Release control' })
   if ((await button.count()) === 0) return false
   await button.first().click()
 

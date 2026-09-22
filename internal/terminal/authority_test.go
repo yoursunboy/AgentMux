@@ -1,6 +1,9 @@
 package terminal
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,13 +22,24 @@ import (
 // testAuthority builds an authority whose clock the test drives.
 func testAuthority(t *testing.T, grace time.Duration) (*Authority, *testClock, *expiries) {
 	t.Helper()
+	return testAuthorityLogging(t, grace, discardLogger())
+}
+
+// testAuthorityLogging is testAuthority for a test that reads what was logged.
+//
+// What the authority writes down is part of what it is responsible for: §12 of
+// the phase brief names the events to record and forbids the one thing that must
+// never be recorded. A log nobody can read is a log nobody can assert, so the
+// logger is a parameter rather than a constant.
+func testAuthorityLogging(t *testing.T, grace time.Duration, logger *slog.Logger) (*Authority, *testClock, *expiries) {
+	t.Helper()
 
 	clock := &testClock{at: time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)}
 	expired := &expiries{}
 	a := NewAuthority(AuthorityOptions{
 		Grace:   grace,
 		Now:     clock.read,
-		Logger:  discardLogger(),
+		Logger:  logger,
 		Expired: expired.record,
 	})
 	t.Cleanup(a.Close)
@@ -196,6 +210,50 @@ func TestARequestIsQueuedOnlyOnce(t *testing.T) {
 	}
 	if got := len(a.Lease(testProject).Pending); got != 1 {
 		t.Errorf("there are %d pending requests from one client, want 1", got)
+	}
+}
+
+// TestADeniedRequestIsRecorded is §12's third event.
+//
+// A grant and a release both leave a trace in the roster, which is why they are
+// the two that are easy to remember. A refusal leaves none: the project is
+// exactly as it was, and the only evidence that somebody asked and was turned
+// away is this line. That is also what makes it the interesting one to get
+// right - an audit that records who has the terminal and never who was kept
+// from it answers the wrong question after an incident.
+//
+// What is recorded is the project, the client and the reason. Nothing here has
+// ever seen a keystroke: `Request` takes no bytes, and the terminal's input path
+// (conn.go's handleInput) never calls into this package with any.
+func TestADeniedRequestIsRecorded(t *testing.T) {
+	var logged bytes.Buffer
+	a, _, _ := testAuthorityLogging(t, time.Minute, slog.New(slog.NewTextHandler(&logged, nil)))
+
+	mustRequest(t, a, testProject, "c_aaaa", "ws_1")
+	// Suspended rather than merely held, because that is the refusal the roster
+	// cannot explain: a client asking against a live controller is queued, and
+	// the queue is in the roster. "Somebody has it and is away" is the answer
+	// that leaves the project exactly as it was and the asker with nothing to
+	// read.
+	a.Detach("c_aaaa", "ws_1")
+	logged.Reset()
+
+	outcome, reason := a.Request(testProject, "c_bbbb", "ws_2", "Safari on iPad")
+	if outcome != RequestDenied || reason != ReasonControllerExists {
+		t.Fatalf("the request was answered %v/%q, want a refusal", outcome, reason)
+	}
+
+	line := logged.String()
+	if !strings.Contains(line, "control denied") {
+		t.Errorf("a refused request was not recorded: %q", line)
+	}
+	// The reason, not only the fact: "somebody has it" and "the queue is full"
+	// are different problems for whoever reads this later.
+	if !strings.Contains(line, ReasonControllerExists) {
+		t.Errorf("the record does not say why the request was refused: %q", line)
+	}
+	if !strings.Contains(line, "c_bbbb") {
+		t.Errorf("the record does not name the client that was refused: %q", line)
 	}
 }
 

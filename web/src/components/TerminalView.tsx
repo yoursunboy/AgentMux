@@ -286,6 +286,15 @@ export function TerminalView({
           // stops the resize below being measured as news and sent as a resize
           // the server would refuse.
           scheduler.adopt({ cols, rows })
+          // And the session is told, because the session is what states this
+          // client's size when it is given the keyboard. `setSize` used to be
+          // written only by this component's own measurement, which meant a
+          // client that does not fit - a viewer - recorded the size xterm starts
+          // at and never the size the terminal actually is. A viewer that then
+          // asked for control would state that stale size and reshape the pty
+          // everybody is looking at. Measured: the console's card subscribed to
+          // a 120x30 pane, took the lease, and asked for 80x24.
+          session.setSize({ cols, rows })
           if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows)
         }
         term.write(payload)
@@ -327,6 +336,17 @@ export function TerminalView({
         // have clamped it. Recording it as sent is what keeps our own
         // acknowledgement from being echoed back as another resize.
         scheduler.adopt({ cols, rows })
+        // The session is told for the same reason `show` tells it, and before
+        // the early return below rather than after: the case the early return
+        // catches - the terminal is already this size - is exactly the case
+        // where the session's recorded size is the one that has to be right.
+        //
+        // Every watcher is sent this, not only the client that asked
+        // (conn.go's `applySize` broadcasts the size it applied), so this is how
+        // a client that is not typing learns that somebody else reshaped the
+        // pane. Without it, taking the lease would state a size the pty no
+        // longer has.
+        session.setSize({ cols, rows })
         if (term.cols === cols && term.rows === rows) return
 
         // Read before resizing: xterm reports the scroll the resize causes, and
@@ -452,11 +472,11 @@ export function TerminalView({
   useEffect(() => {
     const term = termRef.current
     // The handler is registered only while this terminal may accept typing, and
-    // that is a stronger statement than disabling the keyboard above. A
-    // read-only viewer - the console's, which never asks for control - has no
-    // input handler bound to its terminal at all, so there is no path from a
-    // keystroke to a socket for it to travel down. Nothing else in this
-    // component calls session.input.
+    // that is a stronger statement than disabling the keyboard above. A client
+    // that has not been given the keyboard - a viewer, which is where every
+    // client starts - has no input handler bound to its terminal at all, so
+    // there is no path from a keystroke to a socket for it to travel down.
+    // Nothing else in this component calls session.input.
     //
     // It is an effect rather than a line in the mount effect because being
     // given the keyboard is a change of condition, not a fact about the mount:

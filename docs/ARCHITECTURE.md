@@ -100,17 +100,21 @@ does not cover.
 
 The Terminal Viewer, added in Phase 7.4B-2A, is the console's terminal — and it is the workspace's,
 which is the whole of its design. It renders the same `components/TerminalView`, drives the same
-xterm.js instance and subscribes through the same client; what it does not do is render the input
-half. Its card passes `interactive={false}`, so no `onData` handler is bound to the terminal at all,
-and `showKeys={false}`, so the touch keys that call `session.input` directly are not drawn. A console
-is therefore a **viewer** in the sense `docs/MULTI_DEVICE.md` §5 already defined — the protocol's
-default position, not a restriction bolted onto a component — and the server refuses its input and
-its resize on the same paths it refuses any viewer's. **No backend change was needed for it**, and
-none was made: the transport, the protocol version, the snapshot/resync behaviour and the authority
-checks are Phase 4's and Phase 6's. `docs/TERMINAL_VIEWER.md` §3 lists the four independent things
-that would have to fail before a keystroke reached the pty, and §5 records the resize limitation in
-full — a viewer's window never moves the pty, and controller-driven geometry is a later phase's
-subject.
+xterm.js instance and subscribes through the same client. Phase 7.4B-2B gave it the input half, and
+gave the whole product the concept that decides who may use it: a **lease** over a terminal, held by
+one client at a time, granted on request and never preempted. `internal/terminal/authority.go` keeps
+it in memory — no table, no row, no serialised input — keyed on the client identity the browser
+stores in `sessionStorage`, so a reload is the same client reconnecting rather than a new claimant.
+A card that holds no lease is a **viewer** in the sense `docs/MULTI_DEVICE.md` §5 already defined:
+the protocol's default position, not a restriction bolted onto a component. It passes
+`interactive={held}`, so no `onData` handler is bound to the terminal at all; `showKeys={held}`, so
+the touch keys that call `session.input` directly are not drawn; and `mayResize={false}`, always and
+regardless of the lease — **the console types and never reshapes the shared pty**. The server refuses
+input and resize on the same paths it refuses any viewer's, judged against the connection's own
+identity rather than against anything a frame claims, and it keeps the connection when it refuses.
+`docs/TERMINAL_VIEWER.md` §3 lists the four independent things that would have to fail before a
+keystroke reached the pty, and `docs/TERMINAL_CONTROLLER.md` is the whole of the lease design — the
+states, the request flow, the refusal rules, the expiry of a controller that has gone away.
 
 One consequence belongs here rather than in the frontend document: **the page has one terminal
 client**, created in `App` above both the console and the workspace. Both pages have terminals in

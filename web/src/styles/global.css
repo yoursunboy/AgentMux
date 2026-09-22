@@ -1643,3 +1643,68 @@ code {
 .terminal-viewer__placeholder .button {
   margin-top: 4px;
 }
+
+/* Who is typing into this card's terminal, and the way to become them. It sits
+   above the screen, where the workspace's bar also is, so the two pages put the
+   same sentence in the same place. The badge inside it is the panel's own
+   `.terminal__control` class - the tone mapping is shared, so the colours are
+   too, and neither page can be recoloured without the other. */
+.viewer-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding-bottom: 4px;
+}
+
+.viewer-control__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The badge gives way before the button does: a truncated sentence still says
+   something, and a half-drawn button says nothing a person can press. */
+.viewer-control__row .terminal__control {
+  min-width: 0;
+}
+
+.viewer-control__row .button {
+  flex: 0 0 auto;
+}
+
+/* The same queue the workspace shows its controller, at card size. It wraps
+   rather than scrolling: a request that could be scrolled out of sight in a
+   card three hundred pixels tall is a request nobody ever answers. */
+.viewer-control__requests {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  font-size: 11px;
+}
+
+.viewer-control__request {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+}
+
+.viewer-control__request > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.viewer-control__refusal {
+  margin: 0;
+  font-size: 11px;
+  color: var(--warning);
+}

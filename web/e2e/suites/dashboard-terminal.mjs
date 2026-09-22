@@ -34,11 +34,19 @@
  *
  * # What is deliberately not here
  *
- * Nothing types into a terminal through the browser and expects it to land. A
- * console viewer has no input path by construction, and the section that proves
- * it proves it by absence - the pty never sees the marker, and no `input` frame
- * is ever sent - which is why it is here rather than in jsdom: the frames are
- * the browser's, and jsdom has none.
+ * Whether the console can type. It can, from Phase 7.4B-2B on, and that is a
+ * suite of its own - `controller-input` - with two browsers in it, because
+ * "this client has the keyboard and that one does not" is not a question one
+ * browser can be asked about itself.
+ *
+ * What is here is the half that is about a single page: a console that has
+ * taken nothing is a viewer, and that is proved by absence - the pty never sees
+ * the marker and no `input` frame is ever sent - which is why it is here rather
+ * than in jsdom, where there are no frames to count. It is a weaker claim than
+ * it was, and deliberately so: the point is no longer that there is no way to
+ * ask, it is that opening a card does not ask. A console that claimed every
+ * running project as it loaded would take the keyboard from whoever is working,
+ * once per project, which is the failure this section is the guard against.
  */
 import { chromium } from 'playwright'
 
@@ -263,7 +271,7 @@ async function main() {
     )
 
     // =======================================================================
-    // B. A viewer has no way to type (§7, §15)
+    // B. A console that has taken nothing is a viewer (§7, §15)
     // =======================================================================
 
     // Clicked before it is typed at, deliberately: a terminal that refuses the
@@ -287,13 +295,19 @@ async function main() {
       sent(frames.slice(framesBefore), 'input').length === 0,
       `${sent(frames.slice(framesBefore), 'input').length} input message(s) sent`,
     )
+    // The card offers the button - it has to, or nobody could ever take the
+    // keyboard from a console - and this is the check that it is offered and
+    // not taken. Six other projects' cards are open on this page at this moment,
+    // and a version of this component that requested control as it mounted would
+    // send one frame per card the instant the page loaded.
     report.check(
-      'and the page never asks who is in control, because it does not want it',
+      'and opening a card is not claiming it: no control.request is sent',
       sent(frames, 'control.request').length === 0,
-      `${sent(frames, 'control.request').length} control.request message(s) sent`,
+      `${sent(frames, 'control.request').length} control.request message(s) sent, ` +
+        `over ${cards} card(s) opened`,
     )
     report.check(
-      'a terminal nobody may type into draws no touch keys either',
+      'a terminal nobody has claimed draws no touch keys either',
       (await viewer(page).locator('.terminal__keys').count()) === 0,
       '',
     )
@@ -334,6 +348,11 @@ async function main() {
     // D. A viewer's own shape does not move the pty (§11)
     // =======================================================================
 
+    // And this card has not taken the lease, so nothing measures on its behalf
+    // either. A console that *has* taken it is the case below this one's
+    // opposite number: `controller-input` checks that the pty does not move for
+    // that client either, which is a stronger claim and needs a second browser
+    // to state.
     const ptyBefore = paneSize(ALPHA)
     const boxBefore = await cardBox(page)
     await page.setViewportSize({ width: 980, height: 760 })

@@ -12,7 +12,12 @@
 import { act, renderHook } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 
-import { TerminalProvider, useTerminalSession, type TerminalSession } from './useTerminal'
+import {
+  TerminalProvider,
+  useTerminalSession,
+  type TerminalSession,
+  type TerminalSessionOptions,
+} from './useTerminal'
 import { ControlReason } from './protocol'
 import {
   CLIENT_ID,
@@ -30,8 +35,8 @@ const theirs = () => makeControlView({ controller: { clientId: OTHER, device: 'S
 const ours = () =>
   makeControlView({ controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' } })
 
-function render(terminal: ClientDouble, active = true) {
-  return renderHook(() => useTerminalSession(PROJECT, active), {
+function render(terminal: ClientDouble, active = true, options?: TerminalSessionOptions) {
+  return renderHook(() => useTerminalSession(PROJECT, active, options), {
     wrapper: ({ children }) => (
       <TerminalProvider client={terminal.client}>{children}</TerminalProvider>
     ),
@@ -205,5 +210,50 @@ describe('a panel that changes project', () => {
 
     expect(result.current.control.view).toBeNull()
     expect(result.current.control.held).toBe(false)
+  })
+})
+
+/**
+ * A client that takes the keyboard and never the shape.
+ *
+ * `mayResize: false` is the one thing a caller can withhold, and it exists
+ * because "may type here" and "decides how wide here is" come apart on the
+ * console: a card is a few hundred pixels in a grid, and reflowing the terminal
+ * somebody is working in is a change nobody asked for, made by somebody who was
+ * only looking.
+ *
+ * The two cases below are the two places a size could still leave this client.
+ * The test above them - `states the size it has been drawing at, the moment it
+ * is given the keyboard` - is the workspace's answer to the first, and it is
+ * kept as the contrast rather than replaced.
+ */
+describe('a controller that may not reshape', () => {
+  const consoleSession: TerminalSessionOptions = { mayResize: false }
+
+  it('does not state its size when it is given the keyboard', () => {
+    const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+    const { result } = render(terminal, true, consoleSession)
+    act(() => terminal.deliverControl(theirs()))
+    act(() => result.current.setSize({ cols: 44, rows: 22 }))
+
+    act(() => terminal.deliverControl(ours()))
+
+    // It is the controller, and that is the point: the size is withheld by the
+    // option and not by the lease, because holding the lease is exactly what a
+    // card about to reshape a shared pty would have.
+    expect(result.current.control.held).toBe(true)
+    expect(terminal.current()?.resize).not.toHaveBeenCalled()
+  })
+
+  it('sends no resize on a call that the lease alone would allow', () => {
+    const terminal = makeClient({ status: makeStatus({ state: 'open' }) })
+    const { result } = render(terminal, true, consoleSession)
+    act(() => terminal.deliverControl(ours()))
+
+    act(() => result.current.resize(120, 30))
+
+    // The lease check above this one would pass. This is a second gate, and it
+    // has to be separate precisely because the console holds the lease.
+    expect(terminal.current()?.resize).not.toHaveBeenCalled()
   })
 })

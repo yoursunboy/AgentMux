@@ -25,6 +25,20 @@ const (
 	// WSL2, used as the default when AgentMux itself runs on Linux under WSL.
 	DefaultWSLProjectsRoot = "/mnt/d/AI/Projects"
 
+	// DefaultLinuxProjectsRoot is the Projects Root a Linux server deployment
+	// uses.
+	//
+	// It is what `deploy/linux/install.sh --root` defaults to, what the
+	// installer writes into the configuration file it generates, and what
+	// docs/DEPLOYMENT.md and deploy/linux/README.md document. It is a
+	// convention rather than a requirement: the root a running server uses
+	// comes from projects.roots in the configuration file, and nothing in this
+	// package creates the directory. It appears here for the one case the
+	// configuration does not cover - a binary started by hand with no config
+	// file at all - where the documented convention is a better fallback than
+	// a guess at the home directory.
+	DefaultLinuxProjectsRoot = "/srv/projects"
+
 	// wslDistroTimeout bounds the one-off WSL distribution probe.
 	wslDistroTimeout = 3 * time.Second
 )
@@ -96,6 +110,15 @@ func New(o Options) (Adapter, error) {
 func DefaultProjectsRoots() []string {
 	if currentKind() == KindWindows {
 		return []string{DefaultWindowsProjectsRoot}
+	}
+	// A Linux server that is not WSL, and that has the deployment's directory:
+	// that is the root this machine is for. The existence check is what keeps
+	// this an answer rather than an invention - on a Linux machine that has
+	// never had AgentMux deployed to it, the search continues below.
+	if !isWSLKernel() {
+		if info, err := os.Stat(DefaultLinuxProjectsRoot); err == nil && info.IsDir() {
+			return []string{DefaultLinuxProjectsRoot}
+		}
 	}
 	if info, err := os.Stat(DefaultWSLProjectsRoot); err == nil && info.IsDir() {
 		return []string{DefaultWSLProjectsRoot}

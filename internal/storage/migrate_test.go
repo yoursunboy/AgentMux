@@ -146,7 +146,7 @@ func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 	want := []string{
 		"agent_actions", "agent_attention", "agent_events", "agent_sessions",
 		"agent_states", "project_runtime", "projects", "schema_migrations",
-		"settings", "tasks",
+		"settings", "tasks", "usage_events",
 	}
 	if strings.Join(tables, ",") != strings.Join(want, ",") {
 		t.Errorf("tables = %v, want %v", tables, want)
@@ -323,7 +323,7 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
-	want := []string{"0007_agent_attention", "0008_agent_actions"}
+	want := []string{"0008_agent_actions", "0009_usage_events"}
 	if len(result.Applied) != len(want) {
 		t.Fatalf("Migrate applied %v; want %v", result.Applied, want)
 	}

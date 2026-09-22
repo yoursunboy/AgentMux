@@ -128,6 +128,7 @@ for value in "$PREFIX" "$DATA_DIR" "$CONFIG_DIR"; do
 done
 
 HEALTH_URL="http://127.0.0.1:${PORT}/health"
+API_HEALTH_URL="http://127.0.0.1:${PORT}/api/health"
 
 # ---------------------------------------------------------------------------
 # Preconditions
@@ -430,6 +431,15 @@ logging:
 projects:
   roots:
     - ${PROJECTS_ROOT}
+
+# Beta usage metrics. Off by default and left off here: the installer writes a
+# working deployment, not one that collects. Turning it on records five events —
+# a page opened, a terminal connected, a keyboard taken, a keyboard given back,
+# one action read — as a row of {event type, timestamp} and nothing else. No
+# terminal output, no input, no prompt, no project or session name, and no
+# identifier that could tell two people apart. See docs/BETA_TEST.md.
+beta:
+  enabled: false
 EOF
     chmod 0640 "$config_file"
     chown root:"$SERVICE_GROUP" "$config_file"
@@ -507,6 +517,13 @@ EOF
 # and a host to probe before it answers, and it reports the unit's own state
 # when it gives up — a health check that failed and a service that failed to
 # start are the same thing to a reader and different things to a fixer.
+#
+# It asks /api/health as well, once the first has answered. The two routes are
+# one expression in the server and both are expected to be there, so an install
+# where one is missing is an install whose binary is not the one this script
+# documents — which is worth catching here, at the terminal where somebody is
+# still watching, rather than from a client that quietly reports the deployment
+# as down.
 verify_health() {
   step "Verifying"
 
@@ -528,6 +545,16 @@ verify_health() {
           warn "the server is up but cannot host a terminal here."
           note "Run 'journalctl -u ${UNIT_NAME} -n 30' — the reason is in the startup lines." ;;
       esac
+
+      # The API's own health route. It is not retried: the server that answered
+      # the line above is the server that serves this one.
+      if [ -n "$(fetch_health "$API_HEALTH_URL" /api/health || true)" ]; then
+        info "$API_HEALTH_URL answered"
+      else
+        warn "${API_HEALTH_URL} did not answer."
+        note "The server is running, so this build predates that route. Clients that"
+        note "check it will report the deployment as down; upgrade the binary."
+      fi
       return 0
     fi
     sleep 1
@@ -541,11 +568,18 @@ verify_health() {
   return 1
 }
 
-# fetch_health asks the health endpoint, using whatever HTTP client is here.
+# fetch_health asks a health endpoint, using whatever HTTP client is here.
+#
+# The URL defaults to the liveness route and the path to /health, so the
+# ordinary call is argument-free; the caller that needs the API's route passes
+# both, because the /dev/tcp fallback below has to write the path into a
+# request by hand and cannot take it apart from the URL.
 #
 # curl and wget are both common and neither is guaranteed on a minimal server,
 # so the fallback is bash's own /dev/tcp rather than a dependency.
 fetch_health() {
+  local url=${1:-$HEALTH_URL} path=${2:-/health}
+
   # stderr is discarded rather than passed through. This is called in a retry
   # loop while the service is binding its port, so the first few attempts
   # failing is the normal case - and curl's own `-S` prints "Failed to connect"
@@ -554,12 +588,12 @@ fetch_health() {
   # an empty answer as "not up yet", and if it never comes up the failure path
   # prints the unit status and the journal, which say more than curl does.
   if have curl; then
-    curl -fsS --max-time 5 "$HEALTH_URL" 2>/dev/null
+    curl -fsS --max-time 5 "$url" 2>/dev/null
   elif have wget; then
-    wget -qO- --timeout=5 "$HEALTH_URL" 2>/dev/null
+    wget -qO- --timeout=5 "$url" 2>/dev/null
   else
     exec 3<>"/dev/tcp/127.0.0.1/${PORT}" || return 1
-    printf 'GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3
+    printf 'GET %s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' "$path" >&3
     local line
     while IFS= read -r line <&3; do
       case "$line" in

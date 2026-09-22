@@ -35,6 +35,7 @@ import (
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/internal/terminal"
+	"github.com/kutonlagos/agentmux/internal/usage"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -67,6 +68,7 @@ type Server struct {
 	attention   *attention.Service
 	controller  *controller.Service
 	terminal    *terminal.Hub
+	usage       usage.Recorder
 	log         *slog.Logger
 
 	startedAt time.Time
@@ -159,6 +161,17 @@ type Options struct {
 	// than a panic.
 	Terminal *terminal.Hub
 
+	// Usage records the five beta usage events. It is optional, and being
+	// absent is the ordinary case: a server that is not running a beta passes
+	// nothing here and records nothing.
+	//
+	// It is the interface rather than *usage.Service on purpose. A nil
+	// *usage.Service stored in this field would not be a nil interface, so the
+	// server's own nil check would pass and the call would panic - the trap
+	// server_test.go already writes down for the projections. Every caller
+	// checks this field for nil before using it.
+	Usage usage.Recorder
+
 	// Logger receives request and error records. Nil means slog.Default.
 	Logger *slog.Logger
 
@@ -202,6 +215,7 @@ func New(o Options) (*Server, error) {
 		attention:   o.Attention,
 		controller:  o.Controller,
 		terminal:    o.Terminal,
+		usage:       o.Usage,
 		log:         o.Logger,
 		startedAt:   o.StartedAt,
 		webDir:      o.WebDir,
@@ -234,6 +248,23 @@ func (s *Server) routes() http.Handler {
 	// it is not versioned with it, and a monitor should not have to track the
 	// protocol version to ask whether the process is alive.
 	mux.HandleFunc("GET /health", s.handleHealth)
+
+	// The same question under the API's prefix, for the API's clients: the
+	// beta's own browser page and anything that stamps a deployment. It is a
+	// second path rather than a second answer - both call runtimeAvailable -
+	// and internal/httpapi/handlers.go says why there are two.
+	mux.HandleFunc("GET /api/health", s.handleAPIHealth)
+
+	// The one diagnostic endpoint, and it exists only when debug is on. The
+	// check is here rather than inside the handler so that an ordinary
+	// installation has no route at all: a handler that decided to refuse would
+	// still be a handler, and the deletion this replaces was made permanent for
+	// that reason. internal/httpapi/debug.go is the argument for the one that
+	// comes back.
+	if s.cfg.Server.Debug {
+		mux.HandleFunc("GET /api/debug/runtime", s.handleDebugRuntime)
+	}
+
 	mux.HandleFunc("GET /api/projects", s.handleListProjects)
 	mux.HandleFunc("GET /api/projects/discover", s.handleDiscoverProjects)
 	mux.HandleFunc("POST /api/projects", s.handleCreateProject)
@@ -597,6 +628,18 @@ func (s *Server) staticHandler() http.Handler {
 		if err != nil {
 			http.NotFound(w, r)
 			return
+		}
+		// This branch is the only place in the server that means "a page was
+		// opened": every other path here is a file, an API route or a 404. It
+		// is where the beta's two page events are recorded, and the recorder
+		// decides for itself whether a path names one - see usage.go.
+		//
+		// GET only. HEAD reaches this handler and is not a person opening
+		// anything; a crawler and a link preview both send one.
+		if r.Method == http.MethodGet {
+			if eventType, ok := usageEventForPath(r.URL.Path); ok {
+				s.noteUsage(r.Context(), eventType)
+			}
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")

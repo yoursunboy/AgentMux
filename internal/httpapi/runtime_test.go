@@ -1580,6 +1580,14 @@ func TestTheDiagnosticSurfaceIsGone(t *testing.T) {
 		"/api/debug/projects/" + id + "/runtime/input",
 		"/api/debug/projects/" + id + "/runtime/resize",
 		"/api/debug/projects/" + id + "/terminal",
+
+		// The one /api/debug path Phase 7.5 puts back, and it belongs in this
+		// list rather than beside it. The route is registered only when
+		// server.debug is on - and this harness is built with it off, which is
+		// the ordinary installation - so on this server it is absent for the
+		// reason every path above is. TestTheDebugEndpointReportsCounts is where
+		// the other branch is checked.
+		"/api/debug/runtime",
 	}
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		for _, path := range paths {

@@ -1,6 +1,10 @@
 package terminal
 
-import "time"
+import (
+	"time"
+
+	"github.com/kutonlagos/agentmux/internal/usage"
+)
 
 // This file is the browser-facing half of the control plane.
 //
@@ -226,6 +230,19 @@ func (c *Conn) handleControlRequest(msg clientMessage) bool {
 		return true
 	}
 
+	// Recorded before the authority is asked rather than after it answered, so
+	// that a request which was refused is counted too: the beta is measuring
+	// how many people reach for a keyboard, and a lease somebody else holds is
+	// still somebody reaching. Every answer below is a different outcome of one
+	// event.
+	//
+	// The three refusals above this line are not recorded and are not the same
+	// thing: a malformed project id, a message with extra fields and a request
+	// to control a terminal the client is not watching are all a broken client
+	// rather than a person, and counting them would make the number mean
+	// "messages received".
+	c.hub.noteUsage(c.ctx, usage.EventControllerRequest)
+
 	outcome, reason := c.hub.authority.Request(msg.ProjectID, c.clientID, c.id, c.device)
 	switch outcome {
 	case RequestGranted:
@@ -279,6 +296,12 @@ func (c *Conn) handleControlRelease(msg clientMessage) bool {
 			"you are not controlling this project", msg.ProjectID, MsgControlRelease)
 		return true
 	}
+	// Recorded only where a lease actually changed hands. Unlike a request, a
+	// release that was refused is not an event worth counting: it says a client
+	// sent a message about a keyboard it never had, and the count it would join
+	// is "keyboards given back".
+	c.hub.noteUsage(c.ctx, usage.EventControllerRelease)
+
 	c.sendControl(c.hub.controlMessage(MsgControlRevoked, msg.ProjectID, ReasonReleased, c))
 	c.hub.broadcastControl(msg.ProjectID, MsgControlChanged)
 	return true

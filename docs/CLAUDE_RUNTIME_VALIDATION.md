@@ -291,6 +291,14 @@ recorded anywhere. `docs/serverinfo.md` names interactive authentication as the
 expected path for this machine and instructs that a non-interactive environment
 stop and report rather than store a credential; that is what happened.
 
+**This paragraph is about what this phase did, and it is still true.** It is not
+a statement about the note file's contents, and read that way it would be wrong:
+`docs/serverinfo.md` held a plaintext password in one row for this same host and
+account. It was never committed — `git check-ignore` reports `.gitignore:34` — so
+the sentence above stands on the strict question of what this phase recorded.
+`docs/SECURITY.md` §5.1 has the finding, what was and was not exposed, and the two
+things an operator has to do about it: rotate the password and delete the row.
+
 **What would close this column:** an interactive PuTTY session to the host, or an
 authorized key for `dbroot@128.1.128.21` placed in the user's own SSH
 configuration. Either makes the Linux column measurable in one pass of the same

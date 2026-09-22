@@ -22,9 +22,14 @@
 // comments, which is what lets the checked-in example in config/ explain
 // itself.
 //
-// The file is located from -config, then AGENTMUX_CONFIG, then
-// <data-dir>/config.json. The last of those is written on first run so that a
-// fresh installation has something to edit.
+// The file is located from -config, then AGENTMUX_CONFIG, and failing both of
+// those it is looked for in the data directory under the names in
+// DefaultConfigFileNames: config.yaml first, then config.yml, then config.json.
+// That order reads YAML first because YAML is what the documentation and the
+// checked-in example are written in, and keeps JSON last so that an installation
+// that already has a config.json keeps loading without being touched. The last
+// name is the one a first run writes, so a fresh installation has something to
+// edit.
 //
 // # What is not configurable here
 //
@@ -62,6 +67,7 @@ const (
 	EnvHost          = EnvPrefix + "HOST"
 	EnvPort          = EnvPrefix + "PORT"
 	EnvDebug         = EnvPrefix + "DEBUG"
+	EnvBeta          = EnvPrefix + "BETA"
 	EnvProjectsRoots = EnvPrefix + "PROJECTS_ROOTS"
 	EnvLogLevel      = EnvPrefix + "LOG_LEVEL"
 	EnvLogFormat     = EnvPrefix + "LOG_FORMAT"
@@ -96,8 +102,26 @@ const (
 	DefaultWSLMountRoot   = "/mnt"
 	DefaultWebDir         = "web/dist"
 	DefaultSQLiteFileName = "agentmux.db"
+
+	// DefaultConfigFileName is the file a first run writes, and the last name
+	// probed for the implicit configuration file. See DefaultConfigFileNames.
 	DefaultConfigFileName = "config.json"
 )
+
+// DefaultConfigFileNames are probed, in order, for the implicit configuration
+// file under the data directory.
+//
+// YAML is first because it is the format the documentation, the checked-in
+// example in config/ and the file install.sh writes are all in - a person who
+// drops a config.yaml into the data directory expects the server to read it.
+// JSON is last so that every installation that exists today keeps loading
+// exactly as it did, without a flag and without being migrated.
+//
+// The list only ever applies to the implicit lookup. A caller that names a file
+// with -config or AGENTMUX_CONFIG gets that file or an error, and the probe
+// never runs: a person who says which file they mean is not asking for a
+// guess.
+var DefaultConfigFileNames = []string{"config.yaml", "config.yml", DefaultConfigFileName}
 
 // Config is the fully resolved AgentMux server configuration.
 type Config struct {
@@ -108,6 +132,7 @@ type Config struct {
 	Terminal TerminalConfig `json:"terminal"`
 	Logging  LoggingConfig  `json:"logging"`
 	Web      WebConfig      `json:"web"`
+	Beta     BetaConfig     `json:"beta"`
 
 	// DataDir is where AgentMux keeps its own state (database, config file).
 	// AgentMux never writes runtime state into a managed project repository.
@@ -308,6 +333,32 @@ type WebConfig struct {
 	Dir string `json:"dir"`
 }
 
+// BetaConfig configures the beta instrumentation.
+//
+// One field, and the shortness is the point. Phase 7.5 permits exactly one kind
+// of usage record - an event type drawn from a closed vocabulary of five, with
+// no payload - and this section is deliberately unable to widen that. There is
+// no "label" here, no "cohort", no "notes": a free-text field in this struct is
+// the shape that turns a metadata table into a place a prompt leaks into, and
+// the way to forbid that shape is to not write it down rather than to ask
+// people not to use it. See internal/usage and docs/ARCHITECTURE.md.
+type BetaConfig struct {
+	// Enabled turns on the recording of beta usage events.
+	//
+	// Off by default, and that is the honest default: a server that is not part
+	// of the beta collects nothing at all, and a deployment nobody asked to
+	// instrument writes no rows. With it off no usage_events row is ever
+	// written; the table exists - the migration is unconditional, like every
+	// other - and stays empty.
+	//
+	// It is separate from server.debug on purpose. server.debug widens what an
+	// endpoint *reports* about this machine; this decides whether the server
+	// *records* what was done to it. Turning on a diagnostic must not start
+	// collecting telemetry, and joining a beta must not publish a filesystem
+	// layout.
+	Enabled bool `json:"enabled"`
+}
+
 // Defaults are host-derived values injected by the caller.
 type Defaults struct {
 	ProjectsRoots []string
@@ -339,6 +390,10 @@ type Overrides struct {
 	// true value is meaningful: the default is off, and there is no flag syntax
 	// for "off" that would differ from not passing the flag.
 	Debug bool
+
+	// Beta turns on the recording of beta usage events. Only the true value is
+	// meaningful, for the same reason Debug's is: the default is off.
+	Beta bool
 
 	// TmuxSocket is the deprecated shared socket name. It is accepted and
 	// warned about rather than rejected, so that an existing invocation keeps
@@ -402,7 +457,8 @@ func Load(o LoadOptions) (*Config, error) {
 	}
 	cfg.DataDir = filepath.Clean(dataDir)
 
-	// 2. Config file: flag, then environment, then <dataDir>/config.json.
+	// 2. Config file: flag, then environment, then <dataDir>/config.yaml or,
+	//    failing that, one of the other names in DefaultConfigFileNames.
 	path := strings.TrimSpace(o.Overrides.ConfigPath)
 	if path == "" {
 		if v, ok := env(EnvConfigPath); ok {
@@ -410,8 +466,9 @@ func Load(o LoadOptions) (*Config, error) {
 		}
 	}
 	explicit := path != ""
+	var shadowed []string
 	if path == "" {
-		path = filepath.Join(cfg.DataDir, DefaultConfigFileName)
+		path, shadowed = findDefaultConfigFile(cfg.DataDir, readFile)
 	}
 	if abs, err := filepath.Abs(path); err == nil {
 		path = filepath.Clean(abs)
@@ -431,6 +488,11 @@ func Load(o LoadOptions) (*Config, error) {
 			cfg.DataDir = dataDirBefore
 		}
 		cfg.SourceFile = path
+		for _, other := range shadowed {
+			cfg.addWarning(fmt.Sprintf(
+				"two config files exist in the data directory: %s is read and %s is ignored",
+				path, other))
+		}
 	case errors.Is(err, os.ErrNotExist) && !explicit:
 		// First run: no config file yet, defaults apply.
 	case errors.Is(err, os.ErrNotExist):
@@ -486,6 +548,52 @@ func decodeConfigFile(path string, data []byte, cfg *Config) error {
 	return json.Unmarshal(encoded, cfg)
 }
 
+// findDefaultConfigFile returns the implicit configuration file to read from
+// the data directory, and the names that exist but were not chosen.
+//
+// The order is DefaultConfigFileNames. An installation made by hand, or by an
+// earlier phase of AgentMux, has config.json and keeps loading it; one made by
+// a person following the documentation has config.yaml and is found first,
+// which is the whole of why YAML leads the list.
+//
+// It reports the shadowed names rather than choosing in silence, because two
+// configuration files in one directory is the failure that presents as a
+// setting being ignored: the person edits the file that is not read and nothing
+// happens, with no error to explain it. Load turns each name into a warning.
+//
+// When nothing exists it names the first candidate. That is not a claim that
+// the file is there - the read that follows still fails with os.ErrNotExist -
+// only the name the caller would have used, and Load treats a missing implicit
+// file as a first run whatever it is called.
+func findDefaultConfigFile(dataDir string, readFile func(string) ([]byte, error)) (path string, shadowed []string) {
+	for _, name := range DefaultConfigFileNames {
+		candidate := filepath.Join(dataDir, name)
+		_, err := readFile(candidate)
+		switch {
+		case err == nil:
+			if path == "" {
+				path = candidate
+			} else {
+				shadowed = append(shadowed, candidate)
+			}
+		case errors.Is(err, os.ErrNotExist):
+			// Not this one. Look at the next.
+		default:
+			// It exists but could not be read - a permission problem, or a
+			// directory where a file should be. It is still the file the
+			// configuration would have come from, so it is chosen and the
+			// error is raised by the read Load does properly.
+			if path == "" {
+				path = candidate
+			}
+		}
+	}
+	if path == "" {
+		path = filepath.Join(dataDir, DefaultConfigFileNames[0])
+	}
+	return path, shadowed
+}
+
 // isYAMLPath reports whether a configuration file's name asks for the YAML
 // reader.
 func isYAMLPath(path string) bool {
@@ -526,6 +634,7 @@ func defaultsFrom(d Defaults) *Config {
 		Terminal: TerminalConfig{Shell: strings.TrimSpace(d.TerminalShell)},
 		Logging:  LoggingConfig{Level: DefaultLogLevel, Format: DefaultLogFormat},
 		Web:      WebConfig{Dir: DefaultWebDir},
+		Beta:     BetaConfig{Enabled: false},
 		DataDir:  d.DataDir,
 	}
 }
@@ -540,6 +649,11 @@ func applyEnv(cfg *Config, env func(string) (string, bool)) {
 	if v, ok := env(EnvDebug); ok {
 		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
 			cfg.Server.Debug = b
+		}
+	}
+	if v, ok := env(EnvBeta); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			cfg.Beta.Enabled = b
 		}
 	}
 	if v, ok := env(EnvProjectsRoots); ok {
@@ -600,6 +714,12 @@ func applyOverrides(cfg *Config, o Overrides) {
 	// that is a poor trade.
 	if o.Debug {
 		cfg.Server.Debug = true
+	}
+	// Beta is a boolean for the same reason Debug is, and it carries the same
+	// rule: the flag turns it on and there is no flag that turns it off. See the
+	// comment above.
+	if o.Beta {
+		cfg.Beta.Enabled = true
 	}
 	if len(o.ProjectsRoots) > 0 {
 		cfg.Projects.Roots = append([]string(nil), o.ProjectsRoots...)

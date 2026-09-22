@@ -43,8 +43,21 @@ import (
 	"github.com/kutonlagos/agentmux/internal/storage"
 	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/internal/terminal"
+	"github.com/kutonlagos/agentmux/internal/usage"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
+
+// processStartedAt is when this process began, taken as the first thing that
+// happens in it.
+//
+// It is a package-level value rather than a call inside run because it has to
+// be earlier than everything the server builds: uptime is measured from here,
+// and a start time taken when the HTTP server happened to be constructed would
+// report a server that has been up for nought seconds after it has been
+// serving for the length of the wiring. The difference is invisible on a fast
+// machine and is the whole reading on a slow one - which is exactly the machine
+// somebody is checking uptime on.
+var processStartedAt = time.Now()
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
@@ -79,6 +92,7 @@ func run(args []string) error {
 		"runtimeMode", cfg.Runtime.Mode,
 		"logLevel", cfg.Logging.Level,
 		"debug", cfg.Server.Debug,
+		"beta", cfg.Beta.Enabled,
 	)
 	for _, warning := range cfg.Warnings {
 		serverLog.Warn("configuration warning", "detail", warning)
@@ -133,6 +147,38 @@ func run(args []string) error {
 	// value that is stable across every request from a machine.
 	if _, err := store.Settings().GetOrCreate(ctx, storage.SettingInstallID, newInstallID); err != nil {
 		return err
+	}
+
+	// The beta's usage recorder.
+	//
+	// It is built only when the deployment turned it on, and the variable it
+	// lands in stays a true nil interface otherwise - which is what makes every
+	// consumer's nil check meaningful. Assigning a *usage.Service to a
+	// usage.Recorder field unconditionally would produce a non-nil interface
+	// holding a nil pointer, and every "if recorder == nil" below would be
+	// false against a recorder that panics when used.
+	//
+	// Nothing else in this build has a switch like it: every other service is
+	// built whether or not it will be used, because each of them is the whole
+	// point of the program. This one is the only thing here that exists solely
+	// to observe the program, and a deployment that did not ask to be observed
+	// should not be paying a write per page load for it.
+	usageLog := logging.Component(logger, logging.ComponentUsage)
+	var usageRecorder usage.Recorder
+	if cfg.Beta.Enabled {
+		recorder, err := usage.NewService(usage.Options{
+			Repository: store.Usage(),
+			Logger:     usageLog,
+		})
+		if err != nil {
+			return err
+		}
+		usageRecorder = recorder
+		usageLog.Info("beta usage recording enabled",
+			"events", len(usage.EventTypes),
+			"note", "five event types; no content is recorded, see internal/usage")
+	} else {
+		usageLog.Debug("beta usage recording is off")
 	}
 
 	adapter, err := host.New(host.Options{
@@ -419,7 +465,10 @@ func run(args []string) error {
 	// process's: it has to be closed before the runtime manager is, so that
 	// every browser sees an ordinary close instead of a connection that dies
 	// when the process does.
-	hubOptions := terminal.HubOptions{Logger: logging.Component(logger, logging.ComponentTerminal)}
+	hubOptions := terminal.HubOptions{
+		Logger: logging.Component(logger, logging.ComponentTerminal),
+		Usage:  usageRecorder,
+	}
 	// Zero is left as zero: the terminal package has its own default for how
 	// long a disconnected controller keeps its lease, and restating the number
 	// here would be a second place for it to be wrong.
@@ -445,8 +494,10 @@ func run(args []string) error {
 		Attention:   attentionService,
 		Controller:  controllerService,
 		Terminal:    terminalHub,
+		Usage:       usageRecorder,
 		Logger:      logging.Component(logger, logging.ComponentAPI),
 		WebDir:      webDir,
+		StartedAt:   processStartedAt,
 	})
 	if err != nil {
 		return err
@@ -527,6 +578,7 @@ func loadConfig(args []string) (*config.Config, error) {
 		hostFlag      = flags.String("host", "", "HTTP listen address (default "+config.DefaultServerHost+")")
 		port          = flags.Int("port", 0, "HTTP listen port (default 8787)")
 		debug         = flags.Bool("debug", false, "include this machine's filesystem layout in GET /api/server; see docs/SECURITY.md")
+		beta          = flags.Bool("beta", false, "record the five beta usage events; see docs/BETA_TEST.md")
 		logLevel      = flags.String("log-level", "", "log level: debug, info, warn, error")
 		logFormat     = flags.String("log-format", "", "log format: text or json")
 		runtimeMode   = flags.String("runtime-mode", "", "runtime mode: auto, native, wsl")
@@ -572,6 +624,7 @@ func loadConfig(args []string) (*config.Config, error) {
 			Host:          *hostFlag,
 			Port:          *port,
 			Debug:         *debug,
+			Beta:          *beta,
 			ProjectsRoots: projectsRoots,
 			LogLevel:      *logLevel,
 			LogFormat:     *logFormat,

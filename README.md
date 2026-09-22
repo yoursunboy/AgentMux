@@ -6,13 +6,21 @@ AgentMux is a self-hosted remote coding workstation for managing multiple persis
 
 ## Status
 
-This repository is at **version 0.6.5, end of Phase 7.2**. The project model, the server foundation,
+This repository is at **version 0.7.5, end of Phase 7.5**. The project model, the server foundation,
 the persistent session runtime, the real Claude Code runtime, the web terminal, and the multi-project
 workspace all exist and work — and Phase 6.5 added what a deployment needs: a systemd unit, an
 installer, a configuration file, a health endpoint, and a documented answer to what happens when the
 server restarts. Phase 7 added the records the product will eventually be about: an append-only event
 log (7.1), and the tasks somebody wants done together with the attempts made at them (7.2). Neither
 is visible in the interface, and that is what a foundation is for.
+
+Phase 7.5 added no product capability. It prepared this build to be deployed on a Linux server and
+handed to beta users: the configuration now has a documented example file
+(`config/agentmux.example.yaml`) the installer is checked against, `/api/health` answers the liveness
+question under the API's own prefix for clients that only speak `/api`, `/api/debug/runtime` reports
+counts when debug is on, and an off-by-default `beta.enabled` records five event types into a
+`usage_events` table. What it records is an event name and a timestamp and nothing else — no terminal
+output, nothing typed, no prompt, no project name. `docs/BETA_TEST.md` is how to run the beta.
 
 | Works today | Does not exist yet |
 | --- | --- |
@@ -36,10 +44,12 @@ is visible in the interface, and that is what a foundation is for.
 | **A systemd service with `Restart=always`, so a server that died comes back by itself** | |
 | **Runtimes that survive a service restart, and reconciliation that reports what it found** | |
 | **`GET /health` for a supervisor, and `GET /api/server` with version, backend and uptime** | |
+| **`GET /api/health`, the same liveness answer for a client that only speaks `/api`** | |
 | **An installer, a configuration file, and YAML as well as JSON — with one decoder, so they cannot drift** | |
 | **Logs with a component on every record, and nothing a terminal printed ever written to one** | |
 | **A task model and an agent session model: what somebody wants done, and each attempt at it — API only, no screen** | |
 | **An append-only event log, written by one path, with two read-only timeline endpoints — API only, no screen** | |
+| **An off-by-default beta recorder: five event types, a timestamp, and no column for anything else** | |
 
 The product is not described here as if it were finished. A project's runtime hosts the real Claude
 Code CLI, and its terminal is in the browser: the bytes are the terminal's own, the keystrokes are the
@@ -177,6 +187,7 @@ no Windows-native tmux and there will be no Windows-native service.
 | --- | --- |
 | [`deploy/linux/README.md`](deploy/linux/README.md) | The operational guide: install, the unit, recovery, upgrade, WSL2, uninstall, troubleshooting |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | The reference behind it: every setting, the log rules, the health contract, the performance baseline |
+| [`docs/BETA_TEST.md`](docs/BETA_TEST.md) | Running a beta on that server: the five scenarios, what gets recorded, what to report |
 | [`docs/BACKUP.md`](docs/BACKUP.md) | Backing up and restoring the database, and what a restore does not get you |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | What the absent authentication means, and the checklist before exposing the port |
 
@@ -200,6 +211,13 @@ there is exactly one decoder behind both: a YAML document is converted to JSON a
 unmarshaler, so the two formats cannot drift apart in key names, types or error behaviour.
 `config/agentmux.example.yaml` documents every key with its default.
 
+When nothing names a file, the data directory is probed as `config.yaml`, then `config.yml`, then
+`config.json`, and the first that exists is read. YAML comes first because that is what the docs, the
+example and the file `install.sh` writes are all in; JSON stays last so that every installation that
+exists today keeps loading, without a flag and without being migrated. The file a first run *writes*
+is still JSON — the writer is the encoder the rest of the program already uses, and a second writer
+could disagree with the reader.
+
 The flags worth knowing:
 
 | Flag | Meaning |
@@ -215,7 +233,8 @@ The flags worth knowing:
 | `-tmux-socket <name>` | **Deprecated, no effect.** Accepted and warned about, never silently reinterpreted. See below. |
 | `-config <file>` | Use a specific configuration file. YAML or JSON, chosen by extension. |
 | `-web-dir <dir>` | Serve the built frontend from this directory. |
-| `-debug` | Include this machine's filesystem layout in `GET /api/server`. Off by default; see `docs/SECURITY.md` §7. |
+| `-debug` | Include this machine's filesystem layout in `GET /api/server`, and route `GET /api/debug/runtime`. Off by default; see `docs/SECURITY.md` §7. |
+| `-beta` | Record the five beta usage events into `<data-dir>/agentmux.db`. Off by default; see `docs/BETA_TEST.md`. |
 | `-log-level`, `-log-format` | `debug`/`info`/`warn`/`error`, and `text`/`json`. |
 | `-version` | Print the version, the git commit it was built from and the phase, then exit. |
 
@@ -250,20 +269,34 @@ Logs carry a timestamp, a level, a component and an event, and never contain ter
 a user typed, a prompt, an API key, a token, a secret or a credential. `docs/DEPLOYMENT.md` §Logs has
 the rule and the rotation, which under systemd is the journal's job and not AgentMux's.
 
+Two switches are off by default and are deliberately independent of each other. `server.debug`
+widens what an endpoint **reports** about this machine. `beta.enabled` decides whether the server
+**records** what was done to it. Turning up log verbosity is neither of those, and turning on a
+diagnostic must not start collecting. `config/agentmux.example.yaml` documents both; `docs/SECURITY.md`
+§7 is the rule for the first and `docs/BETA_TEST.md` §10 for the second.
+
 ## Health and server information
 
-Two endpoints answer "is it up", and they answer different questions.
+Three endpoints answer "is it up", and they answer different questions.
 
 `GET /health` is the one a supervisor, a load balancer or a person with `curl` asks. It always returns
 200, because a monitor should not have to parse a body to learn the process is alive:
 
 ```json
-{"status":"ok","version":"0.6.5","commit":"31e0f208a3aa","runtime":"available"}
+{"status":"ok","version":"0.7.5","commit":"31e0f208a3aa","runtime":"available"}
 ```
 
 `status` is liveness; `runtime` is readiness, and reads `unavailable` on a host with no tmux — which
 is a working server that cannot host a terminal. It carries no credential, no filesystem detail and
 no secret, and it sits deliberately outside `/api`, so a monitor need not track the protocol version.
+
+`GET /api/health` is the same answer under the API's own prefix, for a client that already speaks
+`/api` and should not have to know about a route outside it. `{"status":"ok","version":"0.7.5",
+"uptime":"3h12m","runtimeAvailable":true}` is the whole of it. The two cannot come to different
+conclusions about the same host, and that is structural rather than careful: both call one function,
+`runtimeAvailable` in `internal/httpapi`, which is the wrapper over the single expression of the rule,
+`terminalCanRun`. It exposes no filesystem path at all; that question is `GET /api/server`'s, and the
+answer there depends on debug.
 
 `GET /api/server` is the richer one: version, operating system, runtime backend, whether tmux is
 available, and uptime, alongside the projects roots and the dependency probes. It reports the machine's
@@ -274,6 +307,19 @@ directory is the one path published in every mode, because it is what an orphane
 from. Turning on debug is a separate decision from turning up log verbosity, and `docs/SECURITY.md` §7
 says exactly what appears and why.
 
+**Debug affects exactly two reads, and both of them are reads.** One is that `GET /api/server`
+response. The other is `GET /api/debug/runtime`, which is not routed at all on an ordinary build —
+it answers `404 not_found` like any unknown path — and on a debug build returns five counts and
+booleans:
+
+```json
+{"runtimeCount":2,"tmuxAvailable":true,"activeSessions":2,"websocketConnections":1,"subscriptions":1}
+```
+
+It accepts no input and holds no state. Every field is a number or a boolean produced by this
+process; there is no string in it, and so nothing a user typed, ran or received can reach it. It is a
+diagnostic and not a control — nothing under `/api/debug` changes anything.
+
 Requests that change something are checked against their `Origin`: a page from another site cannot
 create a project, start a runtime or open a terminal, and a request from a program — `curl`, a script —
 is unaffected because it sends no `Origin` at all. `docs/SECURITY.md` §4 is the rule and the reasoning.
@@ -283,7 +329,7 @@ is unaffected because it sends no `Origin` at all. `docs/SECURITY.md` §4 is the
 | What | Where |
 | --- | --- |
 | SQLite database | `<data-dir>/agentmux.db` |
-| Configuration file | `<data-dir>/config.json`, or `/etc/agentmux/agentmux.yaml` under `deploy/linux` |
+| Configuration file | `<data-dir>/config.yaml` — or `.yml`, or `.json`; the first that exists is read. `/etc/agentmux/agentmux.yaml` under `deploy/linux` |
 | tmux sockets, one per project | `<data-dir>/tmux/<projectId>.sock` |
 | Logs | stderr, which is the journal under systemd |
 
@@ -292,7 +338,13 @@ The default data directory is `%AppData%\AgentMux` on Windows and `$XDG_CONFIG_H
 is written into your project folders: AgentMux reads them and records their paths, and the only write
 it ever performs is the directory you explicitly ask it to create.
 
-The schema is `projects`, `settings`, `project_runtime`, and `schema_migrations`.
+The schema is `projects`, `settings`, `project_runtime`, `agent_events`, `tasks`, `agent_sessions`,
+`usage_events` and `schema_migrations`.
+
+`usage_events` exists only when the beta is switched on, and it holds three things: an id, one of five
+event names, and when the server recorded it. There is no column for a project, a session, a device,
+a client or a payload — the reason no terminal output, prompt or keystroke is ever recorded is that
+there is nowhere in the table to put one. `docs/BETA_TEST.md` §10 is how to read it.
 
 `project_runtime` holds only what has to survive a restart: which backend, which session name, the
 last known state, the canonical terminal size, and when it changed. It is not a log and not a buffer.
@@ -464,6 +516,16 @@ sudo ./deploy/linux/recovery-test.sh   # the three recovery cases, against the r
 python3 deploy/linux/loadtest.py       # the performance baseline
 ```
 
+There is one deployment test that *is* a unit test, and it exists because the class of mistake it
+guards against cannot be caught by running the thing. `cmd/server/deploy_test.go` holds the systemd
+unit, `deploy/linux/install.sh` and `config/agentmux.example.yaml` to the program they deploy: that
+every `sed` expression the installer applies to the unit still matches a line in it (a pattern that
+stops matching substitutes nothing and exits **0**, so a renamed default silently produces a unit
+pointing at a directory nothing installed into), that the values the two files agree on are still the
+same values, that `KillMode=process` is still set, and that the example loads through the real
+`config.Load` without a warning. It needs no Linux, starts no server and touches no network, so it
+runs in `go test ./...` like everything else. `docs/BETA_TEST.md` §3 is where it is explained.
+
 ## Documentation reading order
 
 1. `docs/PRODUCT_REQUIREMENTS.md`
@@ -479,13 +541,14 @@ python3 deploy/linux/loadtest.py       # the performance baseline
 11. `docs/WORKSPACE.md` — the grid, its slots, its pages, and its multi-device limit
 12. `docs/MULTI_DEVICE.md` — control, the lease, and its transfer handshake
 13. `docs/DEPLOYMENT.md` — putting it on a server, and what a restart does and does not bring back
-14. `docs/BACKUP.md` — what to back up, what not to, and how to restore
-15. `docs/SECURITY.md` — start here before the port is reachable from anywhere but this machine
-16. `docs/AGENT_EVENTS.md` — what happened, as opposed to what is true now
-17. `docs/TASK_MODEL.md` — what is wanted, why a task is not a runtime, and what this layer does not do
-18. `deploy/linux/README.md` — the operator's guide to the two above
-19. `CLAUDE.md`
-20. `.claude/rules/`
+14. `docs/BETA_TEST.md` — running a beta on that server: the five scenarios, and what gets recorded
+15. `docs/BACKUP.md` — what to back up, what not to, and how to restore
+16. `docs/SECURITY.md` — start here before the port is reachable from anywhere but this machine
+17. `docs/AGENT_EVENTS.md` — what happened, as opposed to what is true now
+18. `docs/TASK_MODEL.md` — what is wanted, why a task is not a runtime, and what this layer does not do
+19. `deploy/linux/README.md` — the operator's guide to the two above
+20. `CLAUDE.md`
+21. `.claude/rules/`
 
 ## Development principle
 
@@ -548,3 +611,14 @@ present-tense answer that changes while you look at it. "Was this work finished?
 every process involved has exited. Phase 7.2 therefore adds no endpoint that starts anything —
 creating a task records that somebody wants something done, and starts no runtime, launches no agent
 and writes no prompt. `docs/TASK_MODEL.md` is the whole of it.
+
+Phase 7.5 added no product capability either, and it is the first phase whose subject is the
+deployment rather than the product. It wrote down what a Linux server needs and then made the code
+say the same thing: `config/agentmux.example.yaml` names every key once, `deploy/linux/` installs a
+unit that sets exactly the two values the file is not allowed to carry, and a Go test in `cmd/server`
+holds the two files to each other — including parsing the installer's actual `sed` expressions and
+checking each one still matches a line of the unit, because a substitution that stops matching does
+not fail, it silently changes nothing. It also added the two endpoints a beta needed, the one
+security question a beta deployment has to answer, and a recorder that is off unless somebody turns
+it on. `docs/BETA_TEST.md` is the beta, `docs/DEPLOYMENT.md` is the deployment, and neither is a
+feature.

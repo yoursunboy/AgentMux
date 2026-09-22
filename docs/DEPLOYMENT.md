@@ -448,7 +448,8 @@ with itself.
 | `server.shutdownGraceSeconds` | — | — | `10` | How long a shutdown waits for in-flight requests before the process exits. It is why `TimeoutStopSec` is 30 and not 90. |
 | `server.controlGraceSeconds` | — | — | `30` | How long a browser that holds a project's terminal keeps it after its connection drops. A grace period rather than a timeout: the usual reason a controller's socket closes is a network that will come back, and releasing on the disconnect would hand the terminal to whoever asks first during the gap. Unset means the terminal package's own default, which is thirty seconds. |
 | `server.allowedOrigins` | — | — | `[]` | Extra browser origins permitted by CORS, by the WebSocket upgrade's Origin check, and by the check on requests that change something, on top of the loopback origins that are always allowed. Needed only when the UI is served from somewhere other than this server. `docs/SECURITY.md` §4 is the rule. |
-| `server.debug` | `AGENTMUX_DEBUG` | `-debug` | `false` | Widens what `GET /api/server` reports about this machine. §9. |
+| `server.debug` | `AGENTMUX_DEBUG` | `-debug` | `false` | Widens what `GET /api/server` reports about this machine, and registers `GET /api/debug/runtime`. §9. |
+| `beta.enabled` | `AGENTMUX_BETA` | `-beta` | `false` | Records the five beta usage events into a `usage_events` table. Off by default, and off means the table is never written to and no recorder is constructed at all. §5.6. |
 | `storage.sqlitePath` | — | — | `agentmux.db` | The metadata database. A relative path is resolved against the data directory, so the default is `<data-dir>/agentmux.db`. It holds projects, their workspace slots and one row per runtime; it holds no terminal output, no prompts and no conversation content. |
 | `projects.roots` | `AGENTMUX_PROJECTS_ROOTS` | `-projects-root` (repeatable) | `/srv/projects`; otherwise the platform's own root | The directories scanned for projects, in order. The first is the default target for a new project. Absolute paths only. A root that does not exist is a warning rather than a failure, because the drive may not be mounted yet. |
 | `projects.discoveryDepth` | — | — | `3` | How deep below a root discovery walks. Depth 2 reaches `Root/Collection/Project`; 3 leaves a level of margin. Valid range 1–8. |
@@ -513,6 +514,40 @@ accessible or is not a directory, a `dataDir` key in the file, and the
 deprecated `terminal.socket`. A missing root is a warning because refusing to
 start would mean the whole server is down because one volume is not mounted.
 
+### 5.6 `beta.enabled`, and what turning it on collects
+
+```yaml
+beta:
+  enabled: true
+```
+
+Off by default. Turning it on records five events into a `usage_events` table in
+the same SQLite file: `dashboard.open`, `terminal.connect`, `controller.request`,
+`controller.release` and `action.view`.
+
+**It is a count of use and not of people.** A row is an event type and a
+timestamp (`id`, `event_type`, `created_at`) and nothing else. There is no path,
+no query string, no project, no session, no client identifier and no
+deduplication, so a page opened three times is three rows and there is no way to
+tell whether that was one person or three. The absence is the design rather than
+a gap: an identifier that could answer "how many people" is an identifier, and a
+beta instrument that collects one has stopped being something an operator can
+enable without thinking about it.
+
+**What it can never write is the point.** No terminal output, no input, no
+prompt, no Claude output, no project or session name. The table has no column
+for any of them, and `internal/usage/service_test.go` asserts the set of event
+types as literal strings rather than reading the vocabulary, so a later change
+that widened it fails the build.
+
+A deployment that did not set this field is byte-for-byte the deployment it was
+before: the recorder is not constructed, the hub and the server hold a nil
+recorder, and nothing is written. That is checked rather than assumed
+(`TestRecordingIsOffUnlessTheDeploymentAskedForIt`).
+
+There is **no endpoint** that reads these rows. `docs/BETA_TEST.md` §Reading the
+events has the query.
+
 ## 6. Secrets
 
 There are none, and there is nowhere in the configuration to put one.
@@ -533,14 +568,20 @@ What that leaves as the deployment's access control is the bind address. There
 is no authentication in this build, so who can reach the port is the whole of
 it. `docs/SECURITY.md` is the full statement — §1 on what the unprivileged
 account and the loopback bind do and do not protect, §2 on the absent
-credentials, §4 on what the API deliberately does not report, and §7 on exactly
-what debug mode adds.
+credentials, §7 on what the API deliberately does not report, and the same §7 on
+exactly what debug mode adds.
 
 The same holds for the repository and for the machine you deploy from: nothing
 in this tree stores a credential, and the one local note that names a machine —
 `docs/serverinfo.md`, the runtime test host — carries a host, an account and the
 statement that authentication is interactive, and is in `.gitignore` besides.
-`docs/SECURITY.md` §5.1 is the full statement.
+
+**That paragraph is about what is committed, and Phase 7.5 found the difference
+matters.** The note file was being kept out of git correctly, and it also held a
+plaintext password in one row. It never reached a commit and it was still
+exposed: a working-tree file is a file that gets backed up and a file a later
+`git add -f` would take. `docs/SECURITY.md` §5.1 has the full finding, what was
+and was not leaked, and the command that re-runs the check.
 
 ## 7. Running it
 
@@ -574,13 +615,13 @@ GET /health
 ```
 
 ```json
-{"status":"ok","version":"0.6.5","commit":"a1b2c3d4e5f6","runtime":"available"}
+{"status":"ok","version":"0.7.5","commit":"a1b2c3d4e5f6","runtime":"available"}
 ```
 
 | Field | Value | What it is |
 | --- | --- | --- |
 | `status` | `"ok"` | Liveness. This is the field a supervisor reads. |
-| `version` | the release, e.g. `"0.6.5"` | Which build answered. |
+| `version` | the release, e.g. `"0.7.5"` | Which build answered. |
 | `commit` | the git revision, twelve characters | Absent when the binary carries no commit. |
 | `runtime` | `"available"` or `"unavailable"` | Readiness: whether a persistent terminal session can execute on this machine at all. |
 
@@ -610,6 +651,32 @@ The path is deliberately outside `/api`. It is not part of the product's API
 surface, it is not versioned with the protocol, and a monitor should not have to
 track the protocol version to ask whether the process is alive. A test pins the
 placement, including that the SPA fallback does not answer it.
+
+### 8.1 `GET /api/health`, the same answer for API clients
+
+```json
+{"status":"ok","version":"0.7.5","uptime":"3h12m4s","runtimeAvailable":true}
+```
+
+Four fields: `status` (always `"ok"` on a served response), `version`, `uptime`
+rounded to the second, and `runtimeAvailable` as a boolean. Readiness is a
+boolean here and a word on `/health`, which is the whole of the difference.
+
+**Both routes call one expression in the server** (`runtimeAvailable` in
+`internal/httpapi/handlers.go`), which is what stops two health checks from
+disagreeing about the same machine — the failure that leaves an operator
+deciding which of two answers to believe. A test runs both at each setting of the
+condition and asserts they agree (`TestTheTwoHealthEndpointsAgree`).
+
+`uptime` is measured from process start rather than from when the server began
+listening. `deploy/linux/install.sh` checks this route as well as `/health` after
+it starts the service, so an install with a binary that predates it is caught
+while somebody is still watching the terminal; `cmd/server/deploy_test.go` pins
+that the script and the routes agree.
+
+The response carries no credential, no path and no secret, for the same reason
+`/health`'s does not: it is the one endpoint a beta deployment is expected to
+expose beyond loopback, and what it may say is bounded deliberately.
 
 `runtime` is computed from three conditions, all of which are required and each
 of which is a different kind of fact: this build contains the runtime; the
@@ -663,8 +730,44 @@ for one run and hand over a report that names the paths.
 It is deliberately separate from `logging.level`. An operator who turns up log
 verbosity to chase a problem has not thereby decided to publish a map of the
 disk from an endpoint that has no authentication, and a setting that coupled the
-two would publish those paths by surprise. Enabling it affects nothing else: no
-handler is skipped, no check is relaxed, and no credential exists to reveal.
+two would publish those paths by surprise.
+
+Enabling it affects two things, and both are reads. This paragraph used to say
+"nothing else", which was true before Phase 7.5:
+
+1. the four paths above appear on this endpoint;
+2. `GET /api/debug/runtime` **exists**, where on every other installation the
+   path is not routed at all.
+
+No handler is skipped and no check is relaxed. `docs/SECURITY.md` §7 is the full
+statement of what the second one can and cannot say.
+
+### 9.1 `GET /api/debug/runtime`, when debug is on
+
+```json
+{"runtimeCount":1,"tmuxAvailable":true,"activeSessions":1,"websocketConnections":0,"subscriptions":0}
+```
+
+Four counts and a boolean: how many projects have a runtime this server is
+supervising, whether the tmux binary can be run, how many sessions are live, how
+many terminal sockets are open, and how many subscriptions sit across them. It is
+what an operator looks at when a runtime will not start and the question is
+whether the missing piece is tmux, the session, or nothing at all — a question
+`/api/server`'s single `tmuxAvailable` boolean answers only partly.
+
+**The route is registered only when `server.debug` is on, and that is a
+construction-time decision rather than a check inside a handler.** A handler that
+decided to refuse would still be a handler, and the Phase 4 deletion of the
+debug surface was made permanent for exactly that reason. On an ordinary
+installation this path answers `404 not_found` like any path that does not exist,
+and it accepts nothing but `GET`: a write to it is answered by the server's
+`/api/` catch-all with that same 404, so a refused write is indistinguishable
+from a path that was never there.
+
+It carries no project name, no identifier, no session name, no path, no prompt and
+no byte of terminal output or input history. That is not a filter — the response
+has five fields, and a test asserts the encoded key set exactly and greps the
+encoded bytes for the forbidden words.
 
 ## 10. Logs
 
@@ -839,7 +942,7 @@ service restarted:
 
 ```sh
 curl -s http://127.0.0.1:8787/health
-# {"status":"ok","version":"0.6.5","commit":"a1b2c3d4e5f6","runtime":"available"}
+# {"status":"ok","version":"0.7.5","commit":"a1b2c3d4e5f6","runtime":"available"}
 ```
 
 `commit` is the git revision the binary was built from, set at link time by the

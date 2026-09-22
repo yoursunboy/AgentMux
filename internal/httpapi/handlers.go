@@ -330,6 +330,32 @@ type healthResponse struct {
 	Runtime string `json:"runtime"`
 }
 
+// runtimeAvailable reports whether a persistent terminal session can run on
+// this machine, probing for itself.
+//
+// It exists because two handlers now ask the question and neither of them has a
+// reason to gather the probe results: GET /health and GET /api/health are
+// terse answers for a script, so they ask this and are told yes or no. GET
+// /api/server is the opposite - it publishes the probe results themselves - and
+// so it calls terminalCanRun directly with the values it already holds rather
+// than probing a second time.
+//
+// Whichever way it is reached, the rule is the one in terminalCanRun.
+func (s *Server) runtimeAvailable(ctx context.Context) bool {
+	return s.terminalCanRun(s.host.Info(ctx), s.host.CheckDependencies(ctx))
+}
+
+// uptime is how long this process has been serving, rendered for a reader.
+//
+// The rendering is time.Duration's own - "30s", "2m15s", "1h3m" - rather than a
+// number of seconds, because this string is what an operator sees when they run
+// curl against a service they have just restarted, and "a minute and a half" is
+// the answer they are looking for. GET /api/server keeps its seconds as a
+// number: that one is read by the dashboard, which formats it itself.
+func (s *Server) uptime() string {
+	return s.now().Sub(s.startedAt).Round(time.Second).String()
+}
+
 // handleHealth implements GET /health.
 //
 // It answers 200 whenever the process can serve a request at all. There is no
@@ -351,10 +377,73 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		Commit:  version.ShortCommit(),
 		Runtime: "unavailable",
 	}
-	if s.terminalCanRun(s.host.Info(ctx), s.host.CheckDependencies(ctx)) {
+	if s.runtimeAvailable(ctx) {
 		response.Runtime = "available"
 	}
 	writeJSON(w, s.log, http.StatusOK, response)
+}
+
+// apiHealthResponse is the body of GET /api/health.
+//
+// It exists beside GET /health rather than replacing it, and the difference
+// between them is who reads each one. /health is for a supervisor: it is
+// deliberately outside /api, it is the shortest thing that answers "is this
+// process alive", and install.sh and the systemd unit both curl it. /api/health
+// is for the beta's own clients - a person checking a deployment from a
+// browser, and the usage collector that wants to stamp an environment - so it
+// follows the API's naming and lives under the API's prefix where the CORS
+// middleware, the request log and the error envelope already apply.
+//
+// The two answer the same question and must not disagree, which is why both
+// call runtimeAvailable rather than each deriving it.
+//
+// The fields are the four the phase brief names, and there is no fifth. No
+// password, no path, no environment, no credential, no build metadata beyond
+// the version: this endpoint is unauthenticated like the rest of the API, and
+// docs/SECURITY.md §7 is the argument for what it therefore may not say.
+type apiHealthResponse struct {
+	// Status is "ok" while the process can serve this request. Like /health,
+	// there is no other value: this endpoint reports liveness, and the machine
+	// facts are in RuntimeAvailable.
+	Status string `json:"status"`
+
+	// Version is the release this binary was built from.
+	Version string `json:"version"`
+
+	// Uptime is how long the process has been up, as a duration string.
+	Uptime string `json:"uptime"`
+
+	// RuntimeAvailable is whether a persistent terminal session can run here,
+	// which is readiness rather than liveness and is a different question from
+	// Status. A server with no tmux is up and answers every request; it simply
+	// cannot host a terminal.
+	RuntimeAvailable bool `json:"runtimeAvailable"`
+}
+
+// apiHealthStatusOK is the one value Status takes.
+//
+// It is a constant because it is compared in tests and in the deployment
+// contract: a beta health check that a script greps for has to be a string that
+// is spelled identically everywhere.
+const apiHealthStatusOK = "ok"
+
+// handleAPIHealth implements GET /api/health.
+//
+// It is a single call with no arguments and no side effects, and it is
+// deliberately not a read of anything that could fail: a health check that
+// returns 500 when the database is locked would be reporting a different thing
+// from what it is asked. Storage failures are reported by every endpoint that
+// needs storage.
+func (s *Server) handleAPIHealth(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := s.contextWithTimeout(r, 5*time.Second)
+	defer cancel()
+
+	writeJSON(w, s.log, http.StatusOK, apiHealthResponse{
+		Status:           apiHealthStatusOK,
+		Version:          version.Version,
+		Uptime:           s.uptime(),
+		RuntimeAvailable: s.runtimeAvailable(ctx),
+	})
 }
 
 // terminalCanRun reports whether a persistent terminal session can run on this
@@ -374,6 +463,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) terminalCanRun(info host.SystemInfo, dependencies []host.Dependency) bool {
 	dep, ok := findDependency(dependencies, "tmux")
 	return info.RuntimeAvailable && ok && dep.Available && version.TerminalRuntimeImplemented
+}
+
+// tmuxAvailable reports whether the tmux probe found a usable tmux.
+//
+// It is the probe alone, without the two conditions around it that make up
+// terminalCanRun, and the debug endpoint asks for it in that form deliberately:
+// an operator looking at a runtime that will not start needs to know which of
+// the three conditions failed, and "the build is fine and the runtime is
+// available but tmux is missing" is a different afternoon's work from the other
+// two.
+func (s *Server) tmuxAvailable(ctx context.Context) bool {
+	dep, ok := findDependency(s.host.CheckDependencies(ctx), "tmux")
+	return ok && dep.Available
 }
 
 // runtimeBlocker explains why the terminal runtime is not ready, or "" when it

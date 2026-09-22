@@ -79,9 +79,14 @@ const (
 	// of its own because a record about it is about assembling an answer from
 	// other components rather than about any of them.
 	ComponentController = "controller"
-	ComponentTerminal   = "terminal"
-	ComponentAPI        = "httpapi"
-	ComponentServer     = "server"
+	// ComponentUsage is the beta usage recorder. It is a component of its own
+	// because its records are about the deployment rather than about any part
+	// of it: a warning here says a count was not written, which is not a
+	// failure of the page, socket or lease that produced it.
+	ComponentUsage    = "usage"
+	ComponentTerminal = "terminal"
+	ComponentAPI      = "httpapi"
+	ComponentServer   = "server"
 )
 
 // Placeholder is written in place of any value that must not reach a log.

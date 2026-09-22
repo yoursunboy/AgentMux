@@ -237,6 +237,27 @@ web:
   dir: web/dist
 
 # ---------------------------------------------------------------------------
+# beta — usage metrics
+# ---------------------------------------------------------------------------
+beta:
+  # Off, and off is the default. A deployment that does not set this is the
+  # deployment it was before: the recorder is never constructed, nothing is
+  # written, and no code path that could write is reached.
+  #
+  # On, it records five events into a usage_events table in the metadata
+  # database — a page opened, a terminal connected, a keyboard taken, a keyboard
+  # given back, one action read — each as an event type and a timestamp, and
+  # nothing else. There is no path, no query string, no project, no session, no
+  # client identifier and no deduplication, so the rows count occurrences rather
+  # than people, and there is deliberately no way to tell one person from three.
+  #
+  # What it can never hold: terminal output, anything typed, a prompt, Claude's
+  # output, a project or session name. The table has no column for any of them.
+  # docs/BETA_TEST.md is the long form, including how to read the rows; there is
+  # no HTTP endpoint that returns them.
+  enabled: false
+
+# ---------------------------------------------------------------------------
 # dataDir — where AgentMux keeps its own state
 # ---------------------------------------------------------------------------
 #

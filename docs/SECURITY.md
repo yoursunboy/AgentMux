@@ -251,12 +251,47 @@ test fixture, and not in a shell or PowerShell script. Where a connection needs
 one, it is entered interactively at the moment it is needed and is not written
 down afterwards. The local note that names the runtime test machine
 (`docs/serverinfo.md`) gives the host, the account and the authentication method,
-and says that authentication is interactive — which is the whole of it.
+and says that authentication is interactive.
 
 That file is in `.gitignore` because it names a machine, not because it holds a
-credential; it holds none. The distinction matters in both directions: ignoring
-a file is not what makes it safe, and a file worth ignoring is still governed by
-the rule above.
+credential. The distinction matters in both directions: ignoring a file is not
+what makes it safe, and a file worth ignoring is still governed by the rule above.
+
+**This section used to end there, with the stronger claim that the note file
+"holds none". That claim was checked during Phase 7.5 and was false**, so it is
+corrected here rather than left standing. The file's table held a plaintext
+password for one of its rows — three lines above its own sentence saying no
+password is recorded anywhere — and four tracked documents repeated the
+"no password" claim on the strength of it.
+
+What was and was not exposed:
+
+- **Not committed.** `git check-ignore -v docs/serverinfo.md` reports
+  `.gitignore:34`, and `git ls-files` does not list it, so the password never
+  entered the repository's history. §9's check passes on the strict question it
+  asks.
+- **Still exposed.** A password in a working-tree file is a password in an
+  editor's buffer, a filesystem that gets backed up, and a file that a future
+  `git add -f` or a `.gitignore` edit would commit. "Not in git" is not the same
+  as "not leaked", and the gap between them is where this was sitting.
+
+The two things that follow from it are an operator's, not this document's: the
+password must be **rotated**, and the row must be **deleted** from the note file
+— a file that names the host and the account and says authentication is
+interactive needs no secret to be useful, which is the whole design above.
+
+The claim above is now about what is *tracked*, which is checkable, rather than
+about what is *on disk*, which this document cannot see. The check is one command
+over the tracked tree:
+
+```bash
+git grep -nEi '(password|passwd|secret|api[_-]?key|token)[[:space:]]*[:=][[:space:]]*[^[:space:]]'
+```
+
+Anything it prints in a tracked file is a finding. Note what it cannot see: an
+untracked file, which is exactly how the one above was missed, so it is run
+alongside `git status --ignored` rather than instead of it. Phase 7.5's report
+records both, with their output.
 
 ## 6. What it never logs
 
@@ -304,12 +339,13 @@ its own. `docs/DEPLOYMENT.md` §Logs has the queries.
 ## 7. What it does and does not publish over HTTP
 
 Two endpoints describe the server, and both are reachable by anyone who can
-reach the port (§1).
+reach the port (§1). A third answers the same liveness question under the API's
+own prefix, and a fourth exists only when debug is on; all four are below.
 
 **`GET /health`** returns liveness, identity, and one machine capability:
 
 ```json
-{"status":"ok","version":"0.6.5","commit":"31e0f208a3aa","runtime":"available"}
+{"status":"ok","version":"0.7.5","commit":"31e0f208a3aa","runtime":"available"}
 ```
 
 `status` is `ok` whenever the process can serve a request at all — the endpoint
@@ -326,6 +362,25 @@ that describes the filesystem. A test asserts the exact key set
 (`TestHealthSaysNothingElse`), because a field added later by somebody who had
 not read this document would fail an exact-set assertion and would pass a list
 of forbidden names.
+
+**`GET /api/health`** answers the same question for clients that only speak the
+API, and adds one field: `uptime`, how long the process has been running.
+
+```json
+{"status":"ok","version":"0.7.5","uptime":"3h12m4s","runtimeAvailable":true}
+```
+
+Readiness is spelled as a boolean here rather than as `/health`'s `available` /
+`unavailable` string, and that is the whole of the difference. Both routes call
+one expression in the server (`internal/httpapi/handlers.go`, `runtimeAvailable`),
+so they cannot come to different conclusions about the same machine — a second
+independent reading is how two health checks come to disagree, and an operator
+then has to decide which one to believe.
+
+`uptime` is measured from process start, not from when the server began
+listening, so it is not a way to infer when the database was opened. It names no
+path, no project and no client. A test asserts the exact key set for this
+response too (`TestAPIHealthSaysNothingElse`).
 
 **`GET /api/server`** is the richer report: version, phase, uptime, operating
 system and architecture, where the runtime executes, the runtime backend, whether
@@ -384,10 +439,51 @@ API — they are needed to probe it. Turn it on to diagnose a deployment, turn i
 off again, and do not turn it on at all on a server whose port is reachable
 beyond this machine. §13 has it as a checklist item.
 
-Debug affects nothing else. No handler is skipped, no check is relaxed, and
-`/health` does not change: a probe answered every few seconds by a supervisor is
-not where a filesystem layout belongs, and a test asserts the four fields do not
-appear there even with debug on.
+**Debug affects two things, and they are both reads.** This paragraph used to say
+"debug affects nothing else", which was true when it was written and is not any
+more, so here is the whole of what the flag does:
+
+1. `GET /api/server` discloses the four paths in the table above.
+2. `GET /api/debug/runtime` **exists**. It is registered only when debug is on;
+   on every other installation the path is not routed and answers
+   `404 not_found` like any unknown path.
+
+The second is worth its own paragraph, because it is the one thing Phase 7.5
+added to this document's subject. The endpoint returns four counts and a boolean:
+how many runtimes this server supervises, whether the tmux binary can be run, how
+many sessions are live, how many terminal sockets are open.
+
+```json
+{"runtimeCount":1,"tmuxAvailable":true,"activeSessions":1,"websocketConnections":0,"subscriptions":0}
+```
+
+**There is no field in it that could carry content.** No project name, no
+identifier, no session name, no path, no prompt, no tool input, no byte of
+terminal output or input history. That is not a filter applied to a richer
+response — the struct has five fields and a test asserts the encoded key set
+exactly (`TestTheDebugEndpointReportsCounts`), then greps the encoded bytes for
+the project's own name, its id, the data directory and the strings `password`,
+`token`, `secret`, `prompt`, `transcript`, `input`, `capture` and `output`
+(`TestTheDebugEndpointNeverCarriesTerminalContent`). A sixth field added later
+fails the build.
+
+It is a read in the strict sense: it accepts no method but `GET`, takes no input
+of any kind, and holds no state. A `POST` to it is answered by the server's
+`/api/` catch-all with the same `404 not_found` any invented path gets, so a
+refused write is indistinguishable from a path that was never there — and a test
+asserts the runtime count is unchanged across four refused writes
+(`TestTheDebugEndpointRefusesAnythingButARead`).
+
+`/health` and `/api/health` are unchanged by the flag: a probe answered every few
+seconds by a supervisor is not where a filesystem layout belongs, and a test
+asserts the four fields do not appear there even with debug on. So is every
+mutating endpoint — the flag skips no handler and relaxes no check, and the one
+route it adds is a count.
+
+The honest summary is that debug now widens two read-only surfaces instead of
+one. Both are the kind of thing you turn on to diagnose a deployment and turn off
+again, and neither is a reason to enable it on a port reachable beyond this
+machine. §13 has it as a checklist item.
 
 ## 8. File permissions
 

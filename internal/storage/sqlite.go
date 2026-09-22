@@ -142,6 +142,10 @@ func (s *Store) AgentStates() *AgentStateStore { return &AgentStateStore{db: s.d
 // from agent_events and can be rebuilt from them at any time.
 func (s *Store) Attention() *AttentionStore { return &AttentionStore{db: s.db} }
 
+// Usage returns the beta usage event log. It is append-only and nothing
+// derives anything from it.
+func (s *Store) Usage() *UsageStore { return &UsageStore{db: s.db} }
+
 // dataSourceName builds the driver connection string.
 //
 // Pragmas are passed as DSN parameters rather than executed after opening, so

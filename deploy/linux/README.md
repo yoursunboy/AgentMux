@@ -191,12 +191,26 @@ after a change is the startup line:
 journalctl -u agentmux -n 5
 ```
 
+**`beta.enabled` is off, and the installer writes it off.** It is the one key
+this file sets that a beta might want turned on: with it on, the server records
+five event types into a `usage_events` table, each row an event name and a
+timestamp and nothing else. It has no column for terminal output, anything
+typed, a prompt, or a project or session name, and no HTTP endpoint returns a
+row. Turning it on is a decision about collecting from the people using your
+deployment, which is why nothing turns it on for you — `docs/BETA_TEST.md` §10
+is what it records and how to read it.
+
 ## 6. Upgrade
 
 `install.sh` re-run **is** the upgrade. It stops the service, copies the
 database aside, replaces the binary and the bundle, starts the service and
 checks `/health` — the sequence in `docs/DEPLOYMENT.md` §Upgrade, performed
 rather than described.
+
+It then checks `GET /api/health` too, and a build that does not answer it is
+reported rather than failed: that route arrived in 0.7.5, so a server that is
+running and answering `/health` but not `/api/health` is an older binary, and
+the installer says so instead of calling the deployment down.
 
 It decides it is an upgrade from the machine — a binary under the prefix, or
 the unit file — and not from whether the service happens to be running, so
@@ -235,7 +249,7 @@ the service restarted:
 
 ```sh
 curl -s http://127.0.0.1:8787/health
-# {"status":"ok","version":"0.6.5","commit":"a1b2c3d4e5f6","runtime":"available"}
+# {"status":"ok","version":"0.7.5","commit":"a1b2c3d4e5f6","runtime":"available"}
 ```
 
 `commit` is the git revision the binary was built from. It is absent on a binary

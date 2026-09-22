@@ -28,6 +28,7 @@ iPad / Phone / PC
 │ Attention & Actions         │   internal/attention      — built in Phase 7.3C-2
 │ Controller Aggregation      │   internal/controller     — built in Phase 7.4A
 │ Controller Manager          │   internal/terminal       — built in Phase 6
+│ Usage Recorder              │   internal/usage          — built in Phase 7.5, off by default
 │ Provider Adapter            │   Phase 8, not stubbed
 │ Host Adapter                │   internal/host           — built
 │ Storage                     │   internal/storage        — built
@@ -49,6 +50,13 @@ The Task Model is in that table and **not** in that diagram, and the omission is
 than an oversight. Everything else in the box is a thing that owns a process, a socket, or a byte
 stream. A task owns none of them: it is a row, and a later phase is what will connect it to the
 machinery below. The Task Model boundary in §3 is the whole of that distinction.
+
+The Usage Recorder is the one row that is neither. It owns no process and no stream; it is called by
+the two things that do — the page fallback in `internal/httpapi` and the socket events in
+`internal/terminal` — and it writes one row per call when a deployment has switched it on. It is
+listed because its call sites are spread across the layers above it, and a reader looking for "where
+would a count of a page view come from" should find an answer in this box rather than none. §15 has
+what it records and what it cannot.
 
 The server's own process is the one that owns tmux, which is why the box above is inside the runtime
 environment rather than beside it. Everything above `SessionBackend` is transport-agnostic; everything
@@ -710,8 +718,9 @@ A separate `collections` table is optional; collection path may initially be sto
 
 Created so far: `projects`, `settings`, `schema_migrations` (the migration bookkeeping table), and —
 from Phase 2 — `project_runtime`, and — from Phase 7.1 — `agent_events`, and — from Phase 7.2 —
-`tasks` and `agent_sessions`. Collection membership is a column on `projects`, which is why registering
-an existing project is a single insert and finding a project's collection needs no join.
+`tasks` and `agent_sessions`, and — from Phase 7.5 — `usage_events`. Collection membership is a
+column on `projects`, which is why registering an existing project is a single insert and finding a
+project's collection needs no join.
 
 `project_runtime` stores only what cannot be answered after a restart: the owning backend, the session
 name, the user's intent, the canonical size, and the timestamps. It stores **no terminal output at any
@@ -761,6 +770,23 @@ the point of it.
 Nothing in either table is deleted by this build — there is no DELETE on a task or an attempt — so
 those cascades describe what would happen the day something does delete, rather than a path this phase
 opens.
+
+Phase 7.5 added `usage_events` (`0009`), and it is the smallest table in the build because of what it
+is not. It has three columns — the event's identity, its type, and when the server recorded it — and
+one index on `created_at`, which is the whole of it: a row says that one of five named things happened
+at a time the server stamped, and it says nothing else. What it deliberately is not is the point.
+There is no column for a project, a session, a device or a client, so no query against it can answer
+"who did what" even by accident. There is no payload column, and no column one could go in, so the
+rule that no terminal output, no prompt, no input and no Claude output is ever recorded is the schema
+rather than a filter somebody has to remember to extend — the way to keep that promise is a table with
+nowhere to put those things. And there is no uniqueness constraint, so the rows count occurrences and
+never people: three people opening the console once and one opening it three times are the same three
+rows, and nothing here can tell them apart. The five names live in `internal/usage` and are enforced
+where the row is written rather than by a `CHECK` on the column, because a constraint here would be a
+second copy of the vocabulary that could drift from the one the writer knows. Nothing derives anything
+from the table, nothing reads it to decide anything, and a beta that ends by truncating it has lost a
+count and nothing else. `migrations/0009_usage_events.sql` is the long form, and §15 says when the
+rows are written at all.
 
 ## 14. Security
 
@@ -858,3 +884,85 @@ The server itself is one binary and one SQLite file, both under a directory that
 unprivileged service account. There is no container, no cluster and no separate database process:
 `docs/DEPLOYMENT.md` is the operator's view, and the decision not to ship Docker in this phase is
 recorded there and in the root `README.md`.
+
+Phase 7.5 made the Linux deployment the deployment rather than a server that happens to work, and
+three of its changes are visible from here. **The configuration file is looked for as YAML first.**
+When neither `-config` nor `AGENTMUX_CONFIG` names a file, the data directory is probed in the order
+`config.yaml`, `config.yml`, `config.json`, and the first that exists is read. YAML leads because it
+is what the documentation, the checked-in example in `config/` and the file `install.sh` writes are
+all in, so a person who drops a `config.yaml` into the data directory gets it read; JSON stays last so
+that every installation that exists today keeps loading, without a flag and without being migrated.
+The two formats share one decoder — a YAML document is read into a generic structure and re-encoded to
+the same `json.Unmarshal` the JSON path uses — so they cannot disagree about a key name or about how
+an unknown key is treated. The file a first run *writes* is still JSON, and that asymmetry is
+deliberate: the writer is the encoder every other part of this program uses, and a YAML writer would
+be a second one that could disagree with the reader. `DefaultConfigFileNames` in
+`internal/config/config.go` is where the order is declared and `decodeConfigFile` is where the
+dispatch on extension happens.
+
+**There is a health resource inside the API beside the supervisor's probe.** `GET /health` stays what
+it was — the shortest answer to "is this process alive", deliberately outside `/api` — and
+`GET /api/health` is the same question under the API's prefix, where the CORS middleware, the request
+log and the error envelope already apply, for the beta's own clients rather than for a supervisor.
+It answers `{"status","version","uptime","runtimeAvailable"}` and nothing more: no path, no
+environment, no credential, because an endpoint with no authentication is the wrong place to publish
+those, which is the same rule §14 applies to `GET /api/server`. The two cannot disagree, and that is
+structural rather than careful — both call one expression, `runtimeAvailable` in
+`internal/httpapi/handlers.go`, so there is no second derivation that could drift. `runtimeAvailable`
+is readiness and not liveness: a server with no tmux is up, answers every request, and cannot host a
+terminal.
+
+**One diagnostic path came back, and it is registered rather than gated at the handler.** Phase 4
+deleted the whole `/api/debug` surface; Phase 7.5 returns a single read-only endpoint, `GET
+/api/debug/runtime`, which reports five counts and booleans about this process — how many runtimes it
+is monitoring, whether tmux is available, how many sessions the backend actually has, and how many
+sockets and subscriptions are open. It accepts no input, holds no state, and has no field for
+terminal output, input history, a project, a session, a socket directory or a database path. The
+registration is a construction-time `if` in `routes()` and not a handler that refuses, because a
+handler that decided to refuse would still be a handler — on an ordinary installation the route does
+not exist and the path 404s exactly as the deleted surface does. `internal/httpapi/debug.go` is the
+argument for why this one may exist.
+
+**What keeps the three artifacts of a deployment saying the same thing is a test rather than a
+procedure.** `cmd/server/deploy_test.go` asserts that the systemd unit, `deploy/linux/install.sh` and
+`config/agentmux.example.yaml` still agree with the program they deploy. It checks that every `sed`
+expression the installer applies to the unit still matches a line in it — a pattern that stops
+matching substitutes nothing and exits successfully, so a renamed default silently produces a unit
+pointing at a directory nothing installed into — that `KillMode=process` is still set, and that the
+example loads through the real `config.Load` with no warning. None of it needs Linux or starts a
+server, because the class of mistake it guards against is made in a file rather than at runtime.
+
+### Beta usage instrumentation
+
+Recording is opt-in, and off is the default. `beta.enabled` — or `AGENTMUX_BETA`, or `-beta` — is
+the whole of the switch, and `main.go` builds a `usage.Service` only when it is true. It is held in a
+`usage.Recorder` **interface** field rather than a `*usage.Service`, so that "off" is a true nil
+interface and not a typed nil: an interface holding a nil `*usage.Service` does not compare equal to
+nil, and every producer's opt-out check would be wrong in the quiet way that only shows up as rows
+appearing on a server nobody instrumented. The switch is separate from `server.debug` on purpose —
+debug widens what an endpoint *reports* about this machine, and this decides whether the server
+*records* what was done to it, so turning on a diagnostic must not start collecting, and joining a
+beta must not publish a filesystem layout.
+
+Five events are counted, and each is recorded where it happens rather than at one choke point. Two are
+page events derived from a request pathname in `internal/httpapi/usage.go` — `dashboard.open` and
+`action.view` — and that mapping mirrors the client's own routing table in
+`web/src/dashboard/route.ts` and its `actionIdOf` regexp, because the server has to agree with the
+client about what a path means. They are recorded at the single-page fallback and not by a beacon from
+the page: a beacon would be a second write path, a second thing to secure, and a claim from the far
+end of the connection that this server has no way to check. The workspace path records nothing,
+because it is also what a bookmark, a deep link and a reload all land on, and a count of those is a
+count of the browser rather than of a person. The other three are socket events recorded in
+`internal/terminal`: `terminal.connect` on subscribe in `conn.go`, and `controller.request` and
+`controller.release` in `control.go`. A refused control request is counted and a refused release is
+not, and the asymmetry is deliberate — somebody asking for a keyboard and finding it busy is a finding
+a beta wants, while a client releasing a lease it never held is a bug in the client.
+
+**Recording never fails its caller.** `Recorder.Record` returns nothing, because the thing being
+counted has already happened by the time it is called — the page was served, the socket subscribed,
+the lease moved — and it is in that state whatever the database does next. A write that fails is a
+`log.Warn` and nothing else; a navigation that failed because a count could not be written would be
+the count taking down the feature it exists to measure. And nothing reads the table over HTTP: there
+is no endpoint that returns a row, and the repository's `Count` exists for tests and for an operator
+looking at the database directly, which is why the beta's procedure ends at a SQL prompt rather than
+at a page. §13 says what the table holds and what it deliberately cannot.

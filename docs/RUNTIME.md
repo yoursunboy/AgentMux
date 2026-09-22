@@ -481,12 +481,19 @@ end to end before there was a Web Terminal to exercise it with: a session listin
 reconcile, buffered output, raw input, a resize. They were off unless `-debug-api` (or
 `AGENTMUX_DEBUG_API`) turned them on.
 
-**Phase 4 deleted them.** There is no flag, no environment variable, and no handler: every
-`/api/debug/...` path answers `404 not_found` on every build. A flag that registers the routes and
+**Phase 4 deleted them.** There is no flag, no environment variable, and no handler behind any of
+those five paths: each answers `404 not_found` on every build. A flag that registers the routes and
 refuses inside the handler leaves the surface present and one configuration line away from live, and a
 route that writes arbitrary bytes into a session is not a thing to leave standing next to the real
 one. Where the runtime is exercised from now is the WebSocket at `/api/ws`, which reaches it
 only through `RuntimeManager` — see `docs/TERMINAL.md`.
+
+**Phase 7.5 added back one diagnostic, and it is not of that set.** `GET /api/debug/runtime` returns
+four counts and a boolean about this process — how many runtimes are supervised, whether tmux can be
+run, how many sessions are live, how many terminal sockets are open. It takes no input and cannot be
+aimed at a session, which is the property the five above lacked, and it is registered only when
+`server.debug` is on, so on an ordinary installation the 404 above is still the whole answer. See
+`internal/httpapi/debug.go`.
 
 What the deleted endpoints established about the runtime is still true and still tested, and it is now
 asserted through the runtime's own API rather than through a diagnostic:
@@ -686,9 +693,11 @@ Stated rather than hidden.
   scrollback in tmux is unaffected, and that is what a client gets on reconnect.
 - **One backend.** `TmuxBackend` is the only implementation. The interface is shaped so a second one
   fits, but nothing has been written against a hypothetical second one.
-- **The debug API is gone.** Phase 4 deleted it rather than gating it: no `/api/debug/...` path is
-  routed on any build. The surface that replaced it authenticates nothing either, and that is a
-  Phase 5+ concern — it binds to `127.0.0.1` and must not be exposed beyond a local test.
+- **The debug API is gone.** Phase 4 deleted it rather than gating it: none of the five paths it
+  added is routed on any build, and Phase 7.5's `GET /api/debug/runtime` is a read-only count that
+  accepts no input and is registered only when `server.debug` is on. The surface that replaced the
+  rest authenticates nothing either, and that is a Phase 5+ concern — it binds to `127.0.0.1` and must
+  not be exposed beyond a local test.
 
 ## 11. What this phase does not do
 

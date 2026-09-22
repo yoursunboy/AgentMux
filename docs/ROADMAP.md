@@ -2,7 +2,7 @@
 
 ## Implementation status
 
-As of version 0.6.5:
+As of version 0.7.5:
 
 | Phase | Status | Note |
 | --- | --- | --- |
@@ -28,6 +28,7 @@ As of version 0.6.5:
 | Phase 7.4B-2A — Terminal viewer | **Done** | The console stopped being a page of numbers: every card whose runtime is up carries the project's real terminal, drawn by the workspace's own xterm instance over the page's single existing WebSocket. Its read-only behaviour comes from the protocol's viewer position rather than from a flag, and no backend change was needed. See `docs/TERMINAL_VIEWER.md`. |
 | Phase 7.4B-2B — Controller lease and input | **Done** | A client can ask to own a terminal's input, be granted it, type at it, and give it back — one controller at a time, never preempted, expiring on its own when the holder goes away. The lease is in memory only and no keystroke is ever recorded. The console types and never reshapes the pty. See `docs/TERMINAL_CONTROLLER.md`. |
 | Phase 7.4C — Agent action centre | **Done** | `/actions` shows *which* action is waiting and `/actions/{id}` shows one, joined across projects by two new GET routes. Read-only by construction: no Allow, no Deny, no acknowledge, and a browser test asserting the detail page has no button. The attention projection is unchanged — still one writer, still no way to answer. Needs-you versus notices is a reading of the level, not a new state. See `docs/ACTION_CENTER.md`. |
+| Phase 7.5 — Linux server beta deployment | **Done** | Not a capability phase, and it adds no business functionality of any kind. A configuration file probed as YAML first, the systemd unit and installer under `deploy/linux/`, `GET /api/health`, a debug-only `GET /api/debug/runtime`, opt-in beta usage events, and a contract test that keeps the deployment files in agreement with the program. See below. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -40,7 +41,9 @@ the terminal itself: the live screen, a Prompt Bar, a resize that follows the wi
 for the screen again. Starting Claude is still available only through the API — the runtime panel
 shows the agent's state and offers no button for it, which is a gap in the UI rather than in the
 runtime. The provider still reports `integrated: false`, because Phase 8's provider switching is what
-that field describes. Nothing in the running product claims to do more than the table above.
+that field describes. Nothing in the running product claims to do more than the table above. Phase 7.5
+changes none of that: it is the deployment the beta runs on rather than a capability, it adds no
+business functionality, and the version a running server now reports is `0.7.5`.
 
 One consequence of Phase 4 being done is worth stating where the phases are listed: the terminal is
 only as useful as what is inside it. The WSL Claude Code on the development host is installed but not
@@ -120,7 +123,9 @@ What was built:
   auto-started, Case C recorded as an orphan and **left running**.
 - Runtime API: `GET`/`POST start`/`POST stop`/`DELETE` under `/api/projects/{id}/runtime`.
 - Off-by-default diagnostic endpoints under `/api/debug`. **Deleted in Phase 4**, not gated: no flag,
-  no environment variable, no handler.
+  no environment variable, no handler. (One endpoint came back in Phase 7.5 — `GET /api/debug/runtime`,
+  read-only and registered only when `server.debug` is on; the Phase 7.5 section below says why that
+  one is not one of these.)
 - Frontend: Start/Stop runtime controls and an honest "Terminal UI coming in Phase 4".
 
 Not built, deliberately: Claude Code launch, any WebSocket, any real terminal view, controller/viewer
@@ -767,6 +772,49 @@ again, an agent started without a task being invisible, and a failure or
 completion action never leaving the queue — are inherited here unchanged; the
 first two also mean the notices list only ever grows, which
 `docs/ACTION_CENTER.md` §8 records as a limit rather than hiding.
+
+## Phase 7.5 — Linux server beta deployment
+
+**Done.** Not a capability phase, and it is worth saying plainly: this phase added no business
+functionality of any kind. Nothing a person can do with AgentMux changed. What it did was make the
+product that already existed installable on a Linux server by somebody who did not write it, and
+observable afterwards — a configuration file, a health resource inside the API, one read-only
+diagnostic, an opt-in counter, and a test that keeps the deployment files honest.
+
+| Deliverable | What it is |
+| --- | --- |
+| Configuration file probe | `config.yaml`, then `config.yml`, then `config.json`, in that order, under the data directory. Dispatched on extension by `decodeConfigFile`: a YAML document is read into a generic structure and re-encoded to the same `json.Unmarshal` the JSON path uses, so the two formats cannot disagree about a key name. YAML leads because it is what the documentation and the installer use, and JSON is last so that every existing installation keeps loading without being migrated. `WriteDefaultFile` still writes JSON on purpose. |
+| `deploy/linux/` | The systemd unit, `install.sh` and `README.md` that Phase 6.5 added, extended rather than replaced. The installer now verifies `GET /api/health` as well as `/health` after starting the service, and writes a `beta: enabled: false` block into the configuration it generates. |
+| `GET /api/health` | A health resource inside the API beside the supervisor's probe, answering `{"status","version","uptime","runtimeAvailable"}`. Uptime is measured from process start. It and `GET /health` call one expression, `runtimeAvailable`, so a monitor and a browser cannot be told different things about the same machine. |
+| `GET /api/debug/runtime` | The one diagnostic path that comes back from the `/api/debug` surface Phase 4 deleted. Five fields — `runtimeCount`, `tmuxAvailable`, `activeSessions`, `websocketConnections`, `subscriptions` — and no input. It is GET-only, and it is registered only when `server.debug` is on, so an ordinary installation has no such route at all. |
+| Beta usage events | `internal/usage`, `internal/storage/usage.go` and migration `0009_usage_events.sql`. One row per occurrence of one of five events: `dashboard.open`, `terminal.connect`, `controller.request`, `controller.release` and `action.view`. Recorded only when `beta.enabled` is on, into a table with three columns and no place for a payload. |
+| `cmd/server/deploy_test.go` | A contract test rather than a deployment test. It asserts that the unit, the installer and `config/agentmux.example.yaml` still agree with the program: every `sed` substitution still matches a line in the unit, `KillMode=process` is still set, and the example loads through the real `config.Load` with no warning. |
+
+**Recording is opt-in, and "off" is a real nil.** `beta.enabled` — or `AGENTMUX_BETA`, or `-beta` — is
+the whole of the switch, and `main.go` builds the `usage.Service` only when it is true and holds it in
+a `usage.Recorder` **interface** field. That the field is the interface rather than the concrete type
+is the load-bearing part: an interface holding a nil `*usage.Service` is not a nil interface, so a
+typed nil would pass a producer's opt-out check and write rows on a server nobody instrumented. It is
+deliberately separate from `server.debug`, because debug widens what an endpoint *reports* about the
+machine and this decides whether the server *records* what was done to it.
+
+**Each event is recorded where it happens, and recording never fails its caller.** The two page events
+come from a request pathname in `internal/httpapi/usage.go`, which mirrors the client's own routing
+table in `web/src/dashboard/route.ts`; the three socket events come from `internal/terminal`, on
+subscribe and on the two messages that take and give a keyboard. All of it is best-effort:
+`Recorder.Record` returns nothing, a failure is a warning in the log, and no request or socket is ever
+failed by the count it produced. Nothing reads the table over HTTP — there is no endpoint that returns
+a row — and `docs/BETA_TEST.md` is the procedure, including how to read the rows at a SQL prompt.
+`docs/ARCHITECTURE.md` §13 and §15 carry the detail.
+
+**What it did not do, listed rather than left implicit.** No CC Switch control, and no provider
+switching of any kind: the provider adapter is still not stubbed, and `integrated` is still false. No
+model switching. No notification — nothing tells anybody that an agent needs them except a page they
+are already looking at. No mobile app; the client is still the web bundle, and the phone and tablet
+support it has is a browser at a narrow viewport. And no multi-user authentication: access control
+remains the network boundary `docs/SECURITY.md` describes, so a second person on the same network is
+not a user this program knows about. Every one of those is a later phase's subject or is not in this
+roadmap at all, and none of them is claimed here.
 
 ## Phase 8 — CC Switch integration
 

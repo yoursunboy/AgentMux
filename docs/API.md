@@ -11,9 +11,16 @@ Two facts shape the whole document. The first is that **the server runs where th
 Windows that means inside WSL, and `/api/server` says which side it is on. The second is that **the
 terminal stream is not HTTP**. Sessions are real, input and output are real, and since Phase 3 a
 project's runtime can host the real Claude Code CLI — but the bytes that carry a terminal travel over
-the WebSocket at `/api/ws`, documented in `docs/TERMINAL.md`. This document covers the REST
-surface only, and the diagnostic endpoints that used to stand in for the terminal are gone: `/api/debug`
-is not routed, not flag-gated, and answers `404 not_found` on an ordinary build and on every other one.
+the WebSocket at `/api/ws`, documented in `docs/TERMINAL.md`. This document covers the REST surface
+only, and the diagnostic endpoints that used to stand in for the terminal are gone: `/api/debug`
+is not routed and answers `404 not_found` on an ordinary build.
+
+One exception stands where that paragraph used to be categorical, and it is small enough to state
+exactly: since Phase 7.5 there is a single endpoint, `GET /api/debug/runtime`, registered **only when
+`server.debug` is on**. It takes no input, holds no state, and returns four counts and a boolean —
+"§Runtime diagnostics" below has it, and `internal/httpapi/debug.go` has the argument for why it
+came back. An installation that did not turn debug on has no route there at all, which is what every
+installation this document was previously written for is.
 
 ## Requests that change something have to say where they came from
 
@@ -51,7 +58,7 @@ versioned with it, and a monitor should not have to track the protocol version t
 process is alive.
 
 ```json
-{"status":"ok","version":"0.6.5","commit":"31e0f208a3aa","runtime":"available"}
+{"status":"ok","version":"0.7.5","commit":"31e0f208a3aa","runtime":"available"}
 ```
 
 | Field | Meaning |
@@ -65,6 +72,57 @@ process is alive.
 check should not have to read a body to learn that a process is alive; `runtime` is what says whether
 it is useful. It returns no credential, no filesystem detail and no secret — nothing that would make
 an unauthenticated endpoint worth probing for more than this.
+
+## GET /api/health
+
+The same question under the API's prefix, for clients that only speak the API.
+
+```json
+{"status":"ok","version":"0.7.5","uptime":"3h12m4s","runtimeAvailable":true}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `status` | Liveness, always the string `ok` on a served response. |
+| `version` | The version this binary was built as. |
+| `uptime` | How long this process has been running, rounded to the second — measured from process start, not from when the server began listening. |
+| `runtimeAvailable` | Readiness, as a boolean rather than `GET /health`'s `"available"`/`"unavailable"` string. |
+
+**One rule, two spellings.** Both routes call the same expression
+(`internal/httpapi/handlers.go`, `runtimeAvailable`), so they cannot answer differently about the
+same machine; `docs/DEPLOYMENT.md` §Health and `deploy/linux/install.sh` both check `/health`, and
+the beta's own page checks this one. The two exist because `/health` is for supervisors, which will
+never look under `/api`, and `/api/health` is for API clients, which will never look outside it.
+
+Like `/health`, this endpoint returns no credential, no path and no secret. It is the one endpoint a
+Linux beta deployment is expected to expose, so what it may say is bounded deliberately: a status
+word, a version, a duration and a boolean.
+
+## GET /api/debug/runtime
+
+**Registered only when `server.debug` is on.** On every other installation this path does not exist
+and answers `404 not_found` like any other unknown path — the route is added conditionally when the
+server is built, rather than a handler that decides to refuse, because a handler that refuses is
+still a handler. See `internal/httpapi/debug.go`.
+
+```json
+{"runtimeCount":1,"tmuxAvailable":true,"activeSessions":1,"websocketConnections":0,"subscriptions":0}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `runtimeCount` | Projects with a runtime this server is supervising. |
+| `tmuxAvailable` | Whether the tmux binary this configuration names can be found and run. |
+| `activeSessions` | Supervised sessions currently live. |
+| `websocketConnections` | Open terminal sockets. |
+| `subscriptions` | Terminal subscriptions across those sockets. |
+
+It takes no input and accepts no method but `GET`; a write to it is answered `404` by the `/api/`
+catch-all, the same as any path that does not exist. **It carries four numbers and a boolean and
+nothing else** — no project name, no identifier, no session name, no path, and no byte of terminal
+output, input history or prompt. That is not a discipline applied to the handler; it is the whole set
+of fields the response has. `internal/httpapi/debug_test.go` asserts the key set exactly and greps
+the encoded bytes, so a field added later fails the build rather than the promise.
 
 ## GET /api/server
 
@@ -85,7 +143,7 @@ the same origin. It is one call to a real deployment, not a mock-up:
 ```json
 {
   "appName": "AgentMux",
-  "version": "0.6.5",
+  "version": "0.7.5",
   "phase": "Phase 6.5 - Stabilization",
   "status": "online",
   "startedAt": "2026-09-19T01:16:03Z",
@@ -1346,7 +1404,7 @@ GET. `docs/CONTROLLER_API.md` is the long form.
   "server": {
     "status": "online",
     "runtimeAvailable": true,
-    "version": "0.6.5",
+    "version": "0.7.5",
     "uptimeSeconds": 4211
   },
   "projects": [
@@ -1461,16 +1519,17 @@ The lease lives in memory only. There is no table, no row, and no record of what
 `docs/TERMINAL_CONTROLLER.md` §5 is the reasoning, and the log lines carry a project id and a client
 id and never a keystroke.
 
-## The diagnostic endpoints are gone
+## What happened to the diagnostic endpoints, and the one that came back
 
 Phase 2 and Phase 3 exposed a set of off-by-default endpoints under `/api/debug` — raw terminal
 input, buffered output, a resize, a session listing, an on-demand reconcile. They existed because
 there was no terminal stream, and the runtime had to be exercisable by something.
 
 **Phase 4 deleted them.** Not gated them, not marked them debug-only: deleted. There is no
-`-debug-api` flag, no `AGENTMUX_DEBUG_API` environment variable, and no handler behind any
-`/api/debug/...` path. Every one of those paths answers `404 not_found` on every build, exactly like
-any other unknown path.
+`-debug-api` flag, no `AGENTMUX_DEBUG_API` environment variable, and no handler behind
+`/api/debug/input`, `/api/debug/output`, `/api/debug/resize`, `/api/debug/sessions` or
+`/api/debug/reconcile`. Every one of those paths answers `404 not_found` on every build, exactly
+like any other unknown path.
 
 That is the honest shape of the change. A flag that registers the routes and refuses inside the
 handler leaves the surface present and one configuration line away from live, and a route that
@@ -1479,7 +1538,14 @@ real one. The terminal's input and output now travel over the WebSocket at `/api
 they are subject to a subscription that the server resolves from a `projectId` — see
 `docs/TERMINAL.md` for the protocol and `docs/PROTOCOL.md` for what the surface is meant to become.
 
-The one thing that was not deleted is reconciliation, which was never a debug concern: it runs on
+**Phase 7.5 put back exactly one endpoint, and the difference is worth reading.** `GET
+/api/debug/runtime` is documented above. It is not a resurrection of the set: it accepts no input,
+writes nothing, changes nothing, and returns four counts and a boolean about this process. The
+deleted endpoints were the ones where a caller could reach into a terminal; this one cannot be aimed
+at anything. It is also registered only when `server.debug` is on, so the 404 above is still what an
+ordinary installation answers — which is the property the Phase 4 deletion was made permanent for.
+
+The one thing that was never deleted is reconciliation, which was never a debug concern: it runs on
 startup, as it must, and it reports what it found to the log. Its three answers are unchanged and are
 worth stating, because they are the whole of the restart policy:
 
@@ -1488,6 +1554,20 @@ worth stating, because they are the whole of the restart policy:
   server restart is not a request to resume work.
 - **Orphans** — a session in AgentMux's namespace with no project behind it. Report it and **leave it
   running**. It may hold work somebody needs, and killing it would be a guess.
+
+## There is no endpoint for beta usage events
+
+Phase 7.5 records five events — `dashboard.open`, `terminal.connect`, `controller.request`,
+`controller.release`, `action.view` — into a `usage_events` table when the deployment starts the
+server with `-beta` (or `beta.enabled: true`). **They are written and never read over HTTP.** There
+is no `GET /api/usage`, no metrics route and no exporter; reading them is a query against the
+database or `sqlite3`, and `docs/BETA_TEST.md` §Reading the events says how.
+
+The table holds an event type and a timestamp and nothing else — no path, no query string, no
+identifier, no session, no deduplication. There is deliberately no session or client identifier that
+could be used to count people, which is what keeps the whole feature opt-in and the rows free of
+anything that identifies anybody. What the table may never contain is stated in
+`migrations/0009_usage_events.sql` and asserted in `internal/usage/service_test.go`.
 
 ## Error envelope
 

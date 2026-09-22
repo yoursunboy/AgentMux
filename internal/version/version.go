@@ -13,10 +13,18 @@ const AppName = "AgentMux"
 // Version is the AgentMux release version.
 //
 // The scheme is major.minor.patch, where the minor tracks the roadmap phase:
-// 0.6.5 is the sixth phase, shipped as a stabilization release. It is bumped by
-// hand when a phase is tagged, not derived from the commit, because the number
-// answers "which phase is this" and a commit count answers "how many commits".
-const Version = "0.6.5"
+// 0.7.5 is the seventh phase, shipped as the beta deployment preparation. It is
+// bumped by hand when a phase is tagged, not derived from the commit, because
+// the number answers "which phase is this" and a commit count answers "how many
+// commits".
+//
+// The patch digit is the sub-phase, so 0.6.5 (Phase 6.5) and 0.7.5 (Phase 7.5)
+// are the same number two phases apart. Phases between them - 7.1 through 7.4C -
+// never bumped it, which is why a server running Phase 7.4C reported 0.6.5. That
+// was a real ambiguity rather than a deliberate one, and it is why this value is
+// now read as "the newest phase that changed the deployment story" rather than
+// "the commit that last touched this file".
+const Version = "0.7.5"
 
 // Commit is the git commit this binary was built from, set at link time:
 //
@@ -42,11 +50,18 @@ var BuildDate = ""
 // Claude Code CLI, that terminal is in a browser, several of them are on screen
 // at once, and exactly one client holds a project's lease at a time.
 //
-// Phase 6.5 adds no product capability. It is the deployment phase: a checked-in
-// configuration example, a systemd unit, a health endpoint, a logging rule, a
-// backup and upgrade procedure, and the documentation that makes them usable by
-// somebody who did not write the code.
-const Phase = "Phase 6.5 - Stabilization"
+// Phase 6.5 added what a deployment needs: a checked-in configuration example, a
+// systemd unit, a health endpoint, a logging rule, a backup and upgrade
+// procedure, and the documentation that makes them usable by somebody who did
+// not write the code.
+//
+// Phase 7.5 adds no product capability either. It is the beta deployment: the
+// deployment is made Linux-native rather than Linux-on-a-server-that-happens-to-
+// work, the configuration file is looked for as YAML first, there is a health
+// resource inside /api beside the supervisor's probe, a debug-only runtime
+// diagnostic that exists only when server.debug is on, and a beta usage record
+// that counts five events into a table with no column a payload could go in.
+const Phase = "Phase 7.5 - Beta Deployment"
 
 // TerminalRuntimeImplemented reports whether this build can run persistent
 // terminal sessions.
@@ -71,13 +86,13 @@ func ShortCommit() string {
 	return c
 }
 
-// String is the version, for a log line or a page footer: "AgentMux v0.6.5".
+// String is the version, for a log line or a page footer: "AgentMux v0.7.5".
 func String() string {
 	return AppName + " v" + Version
 }
 
 // StringWithCommit is String plus the commit when the build has one, and String
-// alone when it does not: "AgentMux v0.6.5 (a1b2c3d4e5f6)".
+// alone when it does not: "AgentMux v0.7.5 (a1b2c3d4e5f6)".
 //
 // The commit is included rather than always shown as a placeholder, because a
 // build with no commit is a real state - `go build` from a working tree - and a

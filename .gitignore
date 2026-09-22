@@ -26,7 +26,11 @@ dist/
 # on them, which is local operational detail rather than project source. It is
 # listed here so that a `git add -A` cannot pick it up by accident, which is the
 # only way it would ever reach a commit. No credential belongs in it - the file
-# points at interactive authentication instead.
+# points at interactive authentication instead. That was found to be untrue of
+# one row during Phase 7.5; see docs/SECURITY.md §5.1. Being listed here keeps a
+# secret out of git and does not keep it out of the working tree, a backup, or an
+# editor's history, so the rule is about the file's contents and not about this
+# line.
 docs/serverinfo.md
 *serverinfo*.local.md
 

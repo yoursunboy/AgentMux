@@ -17,6 +17,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/usage"
 	"github.com/kutonlagos/agentmux/internal/version"
 )
 
@@ -844,6 +845,11 @@ func (c *Conn) startSubscription(projectID string) *subscription {
 		sub.run()
 	}()
 	c.log.Info("terminal subscribed", "projectId", projectID)
+	// Recorded beside the log line, which is the other witness to the same
+	// fact. It is here rather than in handleSubscribe because this is the one
+	// place a subscription comes into existence, and a resync does not go
+	// through it: a terminal that re-established its stream was already opened.
+	c.hub.noteUsage(c.ctx, usage.EventTerminalConnect)
 	return sub
 }
 

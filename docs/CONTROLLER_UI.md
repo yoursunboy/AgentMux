@@ -5,7 +5,7 @@ question — *what needs me?* — and it answers it for every project at once.
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
-│ ● Online | Runtime: available | CC Switch: Unknown [Switch]   0.6.5  │
+│ ● Online | Runtime: available | CC Switch: Unknown [Switch]   0.7.5  │
 ├──────────────────────────────────────────────────────────────────────┤
 │ ┌────────────────┐ ┌────────────────┐ ┌────────────────┐             │
 │ │ checkout       │ │ studio         │ │ alpha          │             │

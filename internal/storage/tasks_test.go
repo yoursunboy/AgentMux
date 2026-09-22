@@ -1191,7 +1191,7 @@ func TestMigrateUpgradesAPhase71Database(t *testing.T) {
 	}
 	want := []string{
 		"0004_tasks", "0005_agent_sessions", "0006_agent_states",
-		"0007_agent_attention", "0008_agent_actions",
+		"0007_agent_attention", "0008_agent_actions", "0009_usage_events",
 	}
 	if len(result.Applied) != len(want) {
 		t.Fatalf("Migrate applied %v, want %v", result.Applied, want)

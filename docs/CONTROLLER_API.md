@@ -66,7 +66,7 @@ an operator everything is still there for an operator.
   "server": {
     "status": "online",
     "runtimeAvailable": true,
-    "version": "0.6.5",
+    "version": "0.7.5",
     "uptimeSeconds": 4211
   },
   "projects": [

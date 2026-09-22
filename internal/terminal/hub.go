@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/session"
+	"github.com/kutonlagos/agentmux/internal/usage"
 )
 
 // Runtime is what the terminal layer needs from the runtime manager.
@@ -184,6 +185,17 @@ type HubOptions struct {
 	// value a deployment might want is a product decision rather than a
 	// protocol one.
 	ControlGrace time.Duration
+
+	// Usage records the three beta usage events this package is the only
+	// witness to: a terminal being subscribed to, and a keyboard being taken
+	// and given back.
+	//
+	// It is the interface rather than *usage.Service so that "no recorder" is
+	// an ordinary value rather than a typed nil that survives a nil check. Nil,
+	// which is the default, records nothing - see internal/usage.Recorder for
+	// what may and may not be recorded, and note that nothing in this struct
+	// carries a byte of terminal content in either direction.
+	Usage usage.Recorder
 }
 
 // ConnInfo describes who is on the other end of a socket.
@@ -227,6 +239,11 @@ type Hub struct {
 	log *slog.Logger
 	now func() time.Time
 
+	// usage records the beta's terminal and controller events. It is nil on
+	// every installation that is not running a beta, and noteUsage is the one
+	// place that is checked.
+	usage usage.Recorder
+
 	// authority is who may type into what. It is the only thing in the server
 	// that answers that question, and the connections below reach the runtime
 	// only through it - see the file comment on authority.go.
@@ -265,6 +282,7 @@ func NewHub(rt Runtime, opts HubOptions) (*Hub, error) {
 		rt:    rt,
 		log:   opts.Logger,
 		now:   opts.Now,
+		usage: opts.Usage,
 		conns: make(map[*Conn]struct{}),
 		sizes: make(map[string]size),
 	}

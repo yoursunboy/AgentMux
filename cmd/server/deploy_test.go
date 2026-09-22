@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -584,5 +585,45 @@ func TestTheExampleConfigIsNotTheFileTheServerWrites(t *testing.T) {
 		t.Errorf("the implicit config file is probed in the order %v; YAML is first "+
 			"because it is what the documentation and install.sh write",
 			config.DefaultConfigFileNames)
+	}
+}
+
+// TestTheScriptsTheDocumentationRunsAreExecutable pins a claim the deployment
+// documents make in nine places and that nothing here was checking.
+//
+// docs/DEPLOYMENT.md, deploy/linux/README.md and docs/BETA_TEST.md all give
+// `sudo ./deploy/linux/install.sh`, and the unit's own comments give
+// `sudo ./deploy/linux/recovery-test.sh`. A shell answers "command not found"
+// for either when the file is not executable, which is the state this
+// repository shipped in: every file was committed 100644, because the commit
+// that added them was made on Windows, where git cannot record an executable
+// bit for a file that NTFS does not mark. Nothing compiled differently and no
+// test noticed; the first person to follow the document got an error.
+//
+// loadtest.py is not in the list because no document runs it directly - it is
+// always `python3 deploy/linux/loadtest.py`, which needs no bit.
+//
+// Skipped on Windows rather than guessed at there: the mode Go reports for a
+// file on NTFS has no executable bit in it, so reading it would be reading a
+// constant and passing whatever the repository contained.
+func TestTheScriptsTheDocumentationRunsAreExecutable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes carry no executable bit on Windows; this is checked on the host that runs them")
+	}
+	for _, name := range []string{
+		"deploy/linux/install.sh",
+		"deploy/linux/recovery-test.sh",
+	} {
+		info, err := os.Stat(filepath.Join(repoRoot(t), filepath.FromSlash(name)))
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			t.Errorf("%s is mode %04o, so `./%s` - the command the deployment documents "+
+				"give - fails with \"command not found\"; commit it with "+
+				"`git update-index --chmod=+x %s`",
+				name, info.Mode().Perm(), name, name)
+		}
 	}
 }

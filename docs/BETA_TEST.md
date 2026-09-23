@@ -77,6 +77,32 @@ The first field of the first body is liveness and the last is readiness, and the
 questions: a server on a host with no tmux answers `ok` and `"runtime":"unavailable"`, which is a
 working AgentMux that cannot host a terminal. `docs/DEPLOYMENT.md` §8 is the long form.
 
+### The agent is a second, separate dependency
+
+`runtime: available` means tmux was found. It says nothing about the Claude Code CLI, which is
+resolved **for the service account** — `agentmux`, not you — when a runtime starts. Install it in
+your own account and a runtime will still report `"agent":{"type":"none","available":false,
+"running":false}` with the message `claude was not found on PATH`. That is a working runtime with a
+shell in it and no agent, which is a supported state, and it is the one to expect on a first install
+because it is the easy mistake to make: `npm install -g` under your own account, or an `nvm` install,
+puts the binary somewhere `/home/agentmux` cannot reach — `/home/<you>` is mode 0750, so the service
+account cannot even traverse into it.
+
+Install it for the service account, and log in there:
+
+```bash
+sudo -u agentmux -H bash -lc 'npm install -g @anthropic-ai/claude-code'
+sudo -u agentmux -H claude      # the login is yours; it cannot be done for you
+```
+
+The check is `sudo -u agentmux -H bash -lc 'command -v claude'`. A `claude` that works in your own
+shell proves nothing about the service's. `terminal.claudeBinary` in
+`/etc/agentmux/agentmux.yaml` overrides the search when the binary lives somewhere unusual.
+
+Scenarios 2–4 are about the console, the keyboard and the iPad, and none of them needs the agent —
+they are worth running either way. An agent that is installed and logged in is what makes a runtime
+show `type: claude` rather than `none`.
+
 ---
 
 ## 3. Building it from source on the server
@@ -93,6 +119,25 @@ go test ./...           # the whole suite
 cd web && npm ci && npm run build && cd ..
 go build -o agentmux-server ./cmd/server
 ```
+
+One trap on the way in, worth stating because it reports itself as a missing toolchain rather
+than as a missing `PATH`. `sudo` runs commands under its own `secure_path` (the
+`Defaults secure_path=...` line in `/etc/sudoers`), which is not your shell's `PATH`. A Go
+installed from the tarball into `/usr/local/go` and put on the path by `/etc/profile.d` is
+therefore visible to you and invisible to `sudo ./deploy/linux/install.sh`, which stops with
+*the Go toolchain is not on PATH*. `/usr/local/bin` **is** on `secure_path`, so one symlink
+settles it for every account and every shell, login or not:
+
+```bash
+sudo ln -sf /usr/local/go/bin/go    /usr/local/bin/go
+sudo ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+```
+
+A distribution package — `apt install golang-go` — lands in `/usr/bin` and needs none of this.
+Node and npm installed system-wide do not hit it either; a per-user `nvm` does, for the same
+reason and with one more consequence, since the service account cannot see into another
+account's home directory at all. §2's *The agent is a second, separate dependency* is that
+consequence.
 
 The suite includes the deployment contract test, which is the part that matters here: it reads
 `deploy/linux/agentmux.service`, `deploy/linux/install.sh` and `config/agentmux.example.yaml` and

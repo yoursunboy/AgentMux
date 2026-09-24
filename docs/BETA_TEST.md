@@ -103,6 +103,43 @@ Scenarios 2–4 are about the console, the keyboard and the iPad, and none of th
 they are worth running either way. An agent that is installed and logged in is what makes a runtime
 show `type: claude` rather than `none`.
 
+### The first launch stops on two dialogs, and neither is AgentMux's
+
+The first time the service account's Claude Code runs in a project, it stops on two questions before
+it reaches its prompt. AgentMux cannot answer either of them, and the way that fails is worth
+knowing in advance: the runtime reports `RUNNING` with a live pid the whole time, because a tmux
+session with a process in it *is* running. The console looks healthy and the agent is sitting on a
+menu doing nothing. There is no error to find, because nothing went wrong.
+
+* **The workspace trust prompt** — *"Is this a project you created or one you trust?"*. Once per
+  project directory. Answer it at the terminal; the runtime is up and the pane is yours:
+
+  ```bash
+  sudo tmux -S /var/lib/agentmux/tmux/<project-id>.sock attach -t amx-<project-id>
+  ```
+
+  Down-arrow to `Yes, I trust this folder`, then Enter. Claude records the answer in
+  `/home/agentmux/.claude.json`, under `projects["/srv/projects/<name>"].hasTrustDialogAccepted`.
+
+* **The API key prompt** — *"Detected a custom API key in your environment… Do you want to use this
+  API key?"*, which appears whenever the settings file carries `ANTHROPIC_API_KEY`. That is exactly
+  what CC Switch writes for a proxy profile, so a CC-Switch-configured beta will meet it. **The
+  highlighted default is `No`**, and a profile-driven setup wants `Yes` — answering No makes Claude
+  ignore the key and go looking for a subscription login that was never done. Up-arrow to `Yes`,
+  then Enter. The answer is recorded once, globally, in `/home/agentmux/.claude.json` under
+  `customApiKeyResponses.approved` as the key's last 20 characters — the same field your own account
+  keeps its answer in, which is what to diff if the two accounts ever disagree.
+
+Onboarding itself — the theme picker and the survey behind it — can be skipped rather than answered.
+Seeding `/home/agentmux/.claude.json` with `hasCompletedOnboarding: true` and a
+`lastOnboardingVersion` makes Claude go straight to the prompt; the file has to be owned by
+`agentmux` and mode 0600, and Claude rewrites it on every start while keeping both fields.
+
+One thing that is not a fault: the pane may say **`Claude Code can't auto-update · run claude
+doctor`**. A `npm install -g` as root leaves `/usr/lib/node_modules` unwritable by `agentmux`, so
+the CLI cannot update itself. Update it as root when you want a new version; the beta does not
+depend on it.
+
 ---
 
 ## 3. Building it from source on the server

@@ -209,6 +209,7 @@ func run(args []string) error {
 	bridge := &runtimeBridge{}
 	projectService, err := project.NewService(project.Options{
 		Repository: store.Projects(),
+		Settings:   store.ProjectSettings(),
 		Host:       adapter,
 		Logger:     logging.Component(logger, logging.ComponentProject),
 		Runtime:    bridge,
@@ -321,6 +322,7 @@ func run(args []string) error {
 		Agents:    stateService,
 		Attention: attentionService,
 		Actions:   attentionService,
+		Settings:  projectService,
 		Logger:    controllerLog,
 	})
 	if err != nil {
@@ -412,7 +414,11 @@ func run(args []string) error {
 		Adapters: adapters,
 		Sessions: taskService,
 		Settings: agent.NewFileSettings(cfg.DataDir),
-		Logger:   agentLog,
+		// What a person configured for the project, which is a different thing
+		// from the document above: that one tells Claude where to send its
+		// hooks, and this one tells it how much to ask before it acts.
+		LaunchSettings: projectService,
+		Logger:         agentLog,
 	})
 	if err != nil {
 		return err
@@ -671,6 +677,14 @@ type agentSpecs struct {
 // line, and this is the one place the two meet. What comes back is a single
 // line the runtime types into a shell, with the binary and every argument
 // quoted for it.
+//
+// The permission mode crosses here as a string and is not checked. The set of
+// modes AgentMux offers is enforced where a mode is stored - internal/project
+// refuses anything else before it reaches a database - and a check here would
+// be a second copy of that set, which is the thing that drifts. Nothing is
+// risked by leaving it out: the value is rendered as one quoted shell word, so
+// a mode that was somehow not one of the three would be a command the CLI
+// rejects rather than anything a shell acts on.
 func (a agentSpecs) Spec(ctx context.Context, launch session.AgentLaunch) (session.AgentSpec, error) {
 	installation := a.launcher.Resolve(ctx)
 	if !installation.Available {
@@ -680,8 +694,9 @@ func (a agentSpecs) Spec(ctx context.Context, launch session.AgentLaunch) (sessi
 		Type:    installation.Type,
 		Version: installation.Version,
 		Command: claude.LaunchCommand(installation, claude.LaunchOptions{
-			SessionID:    launch.SessionID,
-			SettingsPath: launch.SettingsPath,
+			SessionID:      launch.SessionID,
+			SettingsPath:   launch.SettingsPath,
+			PermissionMode: claude.PermissionMode(launch.PermissionMode),
 		}),
 		Executable: installation.Path,
 	}, nil

@@ -62,8 +62,10 @@ web/src/dashboard/
   DashboardPage.tsx        the page: the three states, and the fourth
   ServerBar.tsx            server state, runtime availability, provider, queue
   ProjectGrid.tsx          the grid, and the empty case
-  ProjectPanel.tsx         one project: its statuses, its screen, its queue
-  TerminalViewer.tsx       one project's terminal, watched and never typed into
+  ProjectPanel.tsx         one project: its statuses, its session, its screen
+  TerminalViewer.tsx       one project's terminal, drawn from the card's session
+  ModeSwitch.tsx           the keyboard's Shift+Tab, for a screen without one
+  PermissionMenu.tsx       the mode the next launch starts in, and nothing else
   StatusBadge.tsx          one status: a word and a dot
   status.ts                status → tone, and nothing about colour
   useDashboard.ts          the read, and the polling
@@ -84,6 +86,20 @@ Each one does one thing and the dependencies run one way:
 `DashboardPage → ServerBar | ProjectGrid → ProjectPanel → StatusBadge →
 status.ts`, and `ActionsPage → ActionCenter | ActionDetail → ActionCard →
 actionStyle.ts`. Nothing below a page component fetches anything.
+
+`TerminalViewer` and `ModeSwitch` are the two that are driven rather than
+driving: both take a session the *card* owns, because a control in the Runtime
+row and the terminal below it are the same subscription, and neither may create
+one.
+
+`PermissionMenu`, added in Phase 7.5.1, is neither driven nor driving in that
+sense — it is the only control on a card that talks to no session at all. It
+takes a project id, a mode and whether the server could report one, and a press
+on it is a `PATCH` to a settings row. It is drawn on the title row rather than
+the Runtime row for exactly that reason, and the two controls are named
+`Mode` and `Permission` so that a card cannot be read as claiming a keystroke and
+a setting are the same act. `docs/PERMISSION_MODE.md` §2 is that comparison as a
+table.
 
 `route.ts` stays in `dashboard/` although it answers for all three pages, because
 that is where routing has always lived and the workspace it already answered for
@@ -247,9 +263,15 @@ page has a fixed set of seven labels, and the test builder deliberately carries
 `prompt`, `tool_input`, `command` and `token` keys that must never reach the DOM.
 `docs/ACTION_CENTER.md` §6 is the argument.
 
-The only server-supplied text that reaches the DOM is a status word and a short
-fixed reason phrase from the attention projection — both of which are
-enumerations on the server side, and both of which React escapes.
+The only server-supplied text that reaches the DOM is a status word, a short
+fixed reason phrase from the attention projection, and a permission mode — all
+three of which are enumerations on the server side, and all three of which React
+escapes. The mode is the newest of them and the one that had to be argued for,
+because it is the only server string this client echoes back: it is rendered by
+the menu that writes it, so a value that was not one of the three would be
+repeated rather than put on a command line. It cannot be one — the server refuses
+anything else with a 400 before it is stored — and `docs/PERMISSION_MODE.md` §10
+is why the refusal is a membership test rather than an escape.
 
 ## 7. What is not here
 
@@ -264,7 +286,30 @@ rather than an omission:
   7.4C, and it is the same position one step further in: it names the action, the
   project and the type, and its detail page has no button at all —
   `docs/ACTION_CENTER.md` §4 and §6. The bar's `Needs you` link and a card's
-  `⚠ n actions pending` row are the two ways there from here;
+  `⚠ n actions pending` row are the two ways there from here.
+
+  One later control comes close enough to be worth naming, and it is not an
+  exception to this. The card's **mode switch** sends the two bytes Shift+Tab
+  sends, which is the keyboard moved to a screen that has none: a tablet has no
+  Shift and no Tab, and the alternative was walking to a machine that does. What
+  it changes is how much the agent asks, not the answer to anything it has
+  asked — an approval is about *this* question and *this* work, and a mode is
+  about how often the person wants to be asked at all. It is in the same family
+  as the touch keys `TerminalView` draws, and it goes out under the same gate:
+  only from a client holding the lease, and the terminal cannot tell it from the
+  key. What it will *not* do is draw the mode, because nothing reports it, and §8
+  is where that is written down.
+
+  The **permission menu** on the title row is the other half of that pair and not
+  a third instance of the same thing. It writes a setting rather than sending a
+  key; it changes nothing about an agent that is already running; and the card
+  says "Restart Agent to apply" rather than restarting anything. Both answer the
+  tablet — the mode switch gets somebody through a question they can already see,
+  and this gets a project that asks differently the next time it starts. That the
+  menu *draws* a mode is the difference: it draws the one it stored, which is a
+  fact the server holds, and not the mode any running agent is in, which is not
+  available to be drawn. `docs/PERMISSION_MODE.md` §4 is that distinction and §7
+  the list of what follows from it;
 - **no real CC Switch.** The provider section shows `Unknown` and a disabled
   button. It does not guess a model: a name that came from nowhere is a name
   somebody would act on;
@@ -301,8 +346,8 @@ little: because the console drives the workspace's client, the lease it asks for
 is the same lease the workspace asks for, on the same socket, with the same
 `control.request` and `control.release` frames. **No endpoint was added** — not
 `/api/runtime/{id}/controller` nor its request and release siblings — because the
-console is never a different *kind* of client, only a different page. The three
-pieces that are the console's own are:
+console is never a different *kind* of client, only a different page. The pieces
+that are the console's own are:
 
 - `dashboard/TerminalControl.tsx`, the card's control bar: the badge, the
   Request/Release button, and the pending requests a holder can accept or refuse.
@@ -312,10 +357,34 @@ pieces that are the console's own are:
 - the card's own two derived props (`interactive`, `showKeys`, both following the
   lease) and the one that is not (`mayResize={false}`, always);
 - the third notice, so a refused message is a sentence in the corner rather than
-  the whole card replaced by an error.
+  the whole card replaced by an error;
+- `dashboard/ModeSwitch.tsx`, the Runtime row's Shift+Tab. It is the smallest of
+  them and the only one that is not drawn on the terminal's own control bar —
+  it sends the key the terminal would have sent, and the reason a card needs it
+  is that the person reading the card may be holding a tablet.
+
+The mode switch is also where the console *stops*, and the stopping is the
+interesting part. It sends the keystroke and it does not draw the result: Claude
+Code cycles its mode inside its own TUI, no hook fires on a Shift+Tab, and the
+mode reaches AgentMux only when a prompt, a notification or the end of a turn
+comes round. A card that showed a mode would be showing its own guess at one,
+which is the same rule §6 of the phase brief sets for the provider name in the
+bar — `Unknown` rather than a plausible answer.
 
 `docs/TERMINAL_CONTROLLER.md` is the design in full. What belongs here is the
 seam this document has been describing since §1: a card that can take the
 keyboard is still a card, and taking it changes nothing about the card's four
 rows, its polling, or what it renders. The lease is a property of the connection
 the page already had.
+
+Phase 7.5.1 added the one control on a card that has nothing to do with the lease,
+and it is the console's first **write to a project** rather than to a terminal.
+The permission menu stores the mode a project's next launch will start in, and
+afterwards the page re-reads the dashboard rather than patching the card's own
+copy — the rule this page has followed since Phase 7.4B-1, and the reason a card
+never holds server state it did not just read. Nothing about the terminal
+changes: the menu sends no bytes, subscribes to nothing and asks for no lease,
+which is a claim the browser suite makes against a live runtime by comparing the
+runtime's own `startedAt` before and after a save. `docs/PERMISSION_MODE.md` §8 is
+the argument for not restarting, §9 the launch line the setting eventually
+reaches, and §11 the component.

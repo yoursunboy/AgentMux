@@ -13,7 +13,9 @@ import type {
   ControllerServer,
   Dashboard,
   ModelBinding,
+  PermissionMode,
   ProjectCard,
+  ProjectSettings,
   QueueSummary,
 } from '../api/types'
 
@@ -44,6 +46,10 @@ export function makeProjectCard(overrides: Partial<ProjectCard> = {}): ProjectCa
     },
     attention: { available: true, level: 'NONE', reason: 'agent started' },
     actions: { available: true, pending: 0 },
+    // The default is the one nobody chose, which is what a project has before
+    // anybody opens the menu. It is not a stand-in for "unknown": a test that
+    // wants the server unable to answer says `available: false`.
+    settings: { available: true, permissionMode: 'manual' },
     updatedAt: '2026-09-21T09:00:12Z',
     ...overrides,
   }
@@ -63,6 +69,39 @@ export function makeQuietProjectCard(overrides: Partial<ProjectCard> = {}): Proj
 /** How much is waiting, for the console's bar. */
 export function makeQueueSummary(overrides: Partial<QueueSummary> = {}): QueueSummary {
   return { needsYou: 0, notices: 0, ...overrides }
+}
+
+/**
+ * The three modes this build offers, in the order the menu lists them.
+ *
+ * It is written here as well as in `PermissionMenu` on purpose: a test that
+ * walked the menu by asking the component what it contains would pass whatever
+ * the component happened to render, including nothing. The list is the claim
+ * being checked.
+ */
+export const PERMISSION_MODES: readonly PermissionMode[] = [
+  'manual',
+  'acceptEdits',
+  'bypassPermissions',
+]
+
+/** One project's launch settings, from GET /api/projects/{id}/settings. */
+export function makeProjectSettings(overrides: Partial<ProjectSettings> = {}): ProjectSettings {
+  return { permissionMode: 'manual', ...overrides }
+}
+
+/**
+ * The `settings` section of a card.
+ *
+ * `available: true` with `manual` is the state a project is in before anybody
+ * has opened the menu, which is what most tests want. A test about the server
+ * being unable to answer passes `available: false`, and should then expect no
+ * mode rather than a defaulted one.
+ */
+export function makeCardSettings(
+  overrides: Partial<ProjectCard['settings']> = {},
+): ProjectCard['settings'] {
+  return { available: true, permissionMode: 'manual', ...overrides }
 }
 
 /**

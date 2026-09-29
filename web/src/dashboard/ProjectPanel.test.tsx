@@ -1,8 +1,9 @@
-import { screen } from '@testing-library/react'
+import { act, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { makeProjectCard, makeQuietProjectCard } from '../test/controller'
+import { makeCardSettings, makeProjectCard, makeQuietProjectCard } from '../test/controller'
 import { renderWithTerminal } from '../test/dashboard'
+import { CLIENT_ID, makeControlView } from '../test/terminal'
 import { ProjectPanel } from './ProjectPanel'
 import { ACTIONS_PATH } from './route'
 // xterm is a third-party boundary with its own renderer, and running the real
@@ -31,6 +32,9 @@ function row(container: HTMLElement, term: string): HTMLElement {
   if (!(dd instanceof HTMLElement)) throw new Error(`no row for ${term}`)
   return dd
 }
+
+/** A roster naming this client, which is the one that carries the lease. */
+const OURS = makeControlView({ controller: { clientId: CLIENT_ID, device: 'Chrome on Windows' } })
 
 describe('ProjectPanel', () => {
   it('names the project', () => {
@@ -141,5 +145,126 @@ describe('ProjectPanel', () => {
       <ProjectPanel card={makeProjectCard({ actions: { available: true, pending: 1 } })} />,
     )
     expect(row(one.container, 'Actions')).toHaveTextContent('1 action pending')
+  })
+
+  // The card owns the session, and these are the two facts that ownership is
+  // for. The viewer used to create it, which was fine while the console could
+  // only watch - but the mode switch in the Runtime row drives the same
+  // terminal, and a second `useTerminalSession` would be a second subscription
+  // to one project and a second claim on one lease.
+  it('watches the project once, however many controls the card has', () => {
+    const { terminal } = renderWithTerminal(<ProjectPanel card={makeProjectCard()} />)
+
+    expect(terminal.subscribes).toHaveLength(1)
+  })
+
+  // §7: the console types and never reshapes. `TerminalViewer` passes
+  // `mayResize={false}` as well, but by then it is too late to matter - the
+  // subscribe is the frame that carries a size, and the server applies it when
+  // the client holds the lease. So the assertion belongs where the session is
+  // made, not where it is handed on.
+  it('offers no size when it subscribes, so a card cannot reshape a shared pty', () => {
+    const { terminal } = renderWithTerminal(<ProjectPanel card={makeProjectCard()} />)
+
+    expect(terminal.subscribes[0]?.size).toBeNull()
+  })
+
+  // The Runtime row, which is where a person looks to find out what a project is
+  // doing - and so where the button that changes what the agent will ask them
+  // belongs. It is drawn only where there is a terminal to send it to: a stopped
+  // card offering a mode switch would be offering to type into nothing.
+  it('offers the mode switch beside a running runtime, and not beside a stopped one', () => {
+    const live = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ runtime: { status: 'running' } })} />,
+    )
+    expect(within(row(live.container, 'Runtime')).getByRole('button', { name: 'Mode' })).toBeVisible()
+    live.unmount()
+
+    const stopped = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ runtime: { status: 'stopped' } })} />,
+    )
+    expect(within(row(stopped.container, 'Runtime')).queryByRole('button', { name: 'Mode' })).toBeNull()
+  })
+
+  // And the two halves reach each other: a mode switch pressed on the card puts
+  // its bytes on the same subscription the screen below is drawing. This is what
+  // the session moving up to the card bought, so it is the thing to assert -
+  // two sessions would each have their own subscription and this would send
+  // nothing to the terminal on screen.
+  it('sends the mode keystroke down the terminal the card is drawing', () => {
+    const { terminal } = renderWithTerminal(<ProjectPanel card={makeProjectCard()} />)
+
+    act(() => terminal.deliverControl(OURS))
+    act(() => screen.getByRole('button', { name: 'Mode' }).click())
+
+    expect(terminal.current()?.input).toHaveBeenCalledWith('\x1b[Z')
+  })
+
+  // §7 of the permission-mode brief: the setting sits at the right of the title,
+  // beside the name of the thing it configures. It is on every card, running or
+  // not, because it is about the next launch rather than the current one - which
+  // is the opposite of the mode switch above it and the reason the two are named
+  // differently.
+  it('offers the permission control on the title row, running or not', () => {
+    const live = renderWithTerminal(<ProjectPanel card={makeProjectCard()} />)
+    const header = live.container.querySelector('.project-card__header')
+    expect(header).toContainElement(screen.getByRole('button', { name: 'Permission' }))
+    expect(header).toContainElement(screen.getByRole('heading', { level: 3 }))
+    live.unmount()
+
+    const stopped = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ runtime: { status: 'stopped' } })} />,
+    )
+    expect(screen.getByRole('button', { name: 'Permission' })).toBeVisible()
+    stopped.unmount()
+  })
+
+  // The card draws what the server said and never a default of its own: a menu
+  // that marked `manual` on a project configured with `acceptEdits` would be
+  // telling somebody the wrong thing about the next launch.
+  it('marks the mode the server reported, not the default', () => {
+    renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ settings: makeCardSettings({ permissionMode: 'acceptEdits' }) })} />,
+    )
+
+    act(() => screen.getByRole('button', { name: 'Permission' }).click())
+
+    const chosen = screen
+      .getAllByRole('menuitemradio')
+      .filter((item) => item.getAttribute('aria-checked') === 'true')
+    expect(chosen).toHaveLength(1)
+    expect(chosen[0]).toHaveTextContent('acceptEdits')
+  })
+
+  // And the write reaches the page. A card that saved a setting and told nobody
+  // would leave the dashboard showing a mode the server no longer holds.
+  //
+  // The second half is §10's fifth case at the level the card can see it: saving
+  // a mode types nothing into the terminal and subscribes to nothing new, so
+  // the agent on screen is left exactly as it was.
+  it('asks the page to re-read after the setting is saved, and touches no terminal doing it', async () => {
+    const onSettingsChanged = vi.fn()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(JSON.stringify({ settings: { permissionMode: 'acceptEdits' } }), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+        ),
+      ),
+    )
+
+    const { terminal } = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard()} onSettingsChanged={onSettingsChanged} />,
+    )
+    act(() => screen.getByRole('button', { name: 'Permission' }).click())
+    act(() => screen.getByRole('menuitemradio', { name: /^acceptEdits/ }).click())
+
+    await waitFor(() => expect(onSettingsChanged).toHaveBeenCalledTimes(1))
+    expect(terminal.current()?.input).not.toHaveBeenCalled()
+    expect(terminal.subscribes).toHaveLength(1)
+    vi.unstubAllGlobals()
   })
 })

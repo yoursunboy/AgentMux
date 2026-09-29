@@ -278,6 +278,15 @@ func (s *Server) routes() http.Handler {
 	// endpoint.
 	mux.HandleFunc("PATCH /api/projects/{id}", s.handleUpdateProject)
 
+	// How much Claude is asked before it acts, for one project. It is a
+	// resource of its own rather than a third field on the PATCH above because
+	// it is stored in its own table and read by a different caller, and it is
+	// the mode of the project's *next* launch rather than of any running one -
+	// there is deliberately no endpoint here that changes a mode in place. See
+	// internal/httpapi/settings.go.
+	mux.HandleFunc("GET /api/projects/{id}/settings", s.handleGetProjectSettings)
+	mux.HandleFunc("PATCH /api/projects/{id}/settings", s.handleUpdateProjectSettings)
+
 	// Every agent state in a project, most recently updated first. It is what a
 	// workspace asks for when it wants to show what each of its projects is
 	// doing without reading a timeline per project - and it is one query, where

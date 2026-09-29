@@ -349,10 +349,19 @@ func Quote(path string) string {
 
 // LaunchOptions are the arguments AgentMux adds to the command line.
 //
-// They are the whole of what this build passes, and the emptiness of the rest
-// is deliberate. Nothing here selects a model, sets a permission mode, or
-// resumes anything: the first two are product decisions no phase has made, and
-// the third belongs with a session that is being continued rather than started.
+// They are the whole of what this build passes. Nothing here selects a model or
+// resumes anything: the first is a product decision no phase has made, and the
+// second belongs with a session that is being continued rather than started.
+//
+// The permission mode used to be in that list, and §8 of docs/CLAUDE_RUNTIME.md
+// used to say that AgentMux adds no `--permission-mode` at all. The reason it
+// gave was that a mux which auto-approved its agents would be a mux that runs
+// arbitrary commands on somebody's machine without them, and that reason is
+// answered rather than overturned here: the mode is not chosen by AgentMux, it
+// is chosen by the person who owns the project, one project at a time, and it
+// is stored with the project rather than with the installation. `manual` is the
+// default, so a project nobody has configured is a project that has not
+// changed - docs/PERMISSION_MODE.md is the long form.
 type LaunchOptions struct {
 	// SessionID is the id the session will use, which AgentMux chooses.
 	//
@@ -373,6 +382,21 @@ type LaunchOptions struct {
 	// that nothing AgentMux does is visible outside the runtime it belongs to,
 	// and so that removing the file removes the configuration.
 	SettingsPath string
+
+	// PermissionMode is the value of `--permission-mode`.
+	//
+	// Empty means the flag is not passed at all, which leaves the CLI's own
+	// configuration to decide - the behaviour this build had before the option
+	// existed. It is the zero value, so a caller with nothing to say passes
+	// nothing and gets the command line it would have got anyway.
+	//
+	// A value that is not one this build offers is a caller's mistake rather
+	// than a command-line one: it is quoted like every other argument, so it
+	// arrives as a single inert word whatever it contains, and the set it is
+	// supposed to come from is enforced where it is stored rather than here -
+	// see the note in internal/project about why a second check would be a
+	// second copy of the vocabulary that could drift from the first.
+	PermissionMode PermissionMode
 }
 
 // LaunchCommand renders the line typed into a runtime's shell to start the
@@ -386,17 +410,23 @@ type LaunchOptions struct {
 //
 // Empty options render the installation's own command and nothing more, so a
 // launch with nothing configured produces exactly the line it produced before
-// there was anything to configure.
+// there was anything to configure. That includes the permission mode: a caller
+// that passes none gets the command line this build produced before the option
+// existed, which is what keeps the old behaviour the default rather than
+// something that has to be asked for.
 func LaunchCommand(installation Installation, o LaunchOptions) string {
 	if installation.Command == "" {
 		return ""
 	}
-	args := make([]string, 0, 4)
+	args := make([]string, 0, 6)
 	if o.SessionID != "" {
 		args = append(args, "--session-id", Quote(o.SessionID))
 	}
 	if o.SettingsPath != "" {
 		args = append(args, "--settings", Quote(o.SettingsPath))
+	}
+	if o.PermissionMode != "" {
+		args = append(args, "--permission-mode", Quote(string(o.PermissionMode)))
 	}
 	if len(args) == 0 {
 		return installation.Command

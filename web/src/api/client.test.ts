@@ -7,15 +7,18 @@ import {
   createTask,
   discoverProjects,
   fetchProject,
+  fetchProjectSettings,
   fetchProjects,
   fetchServerInfo,
   fetchSession,
   fetchSessions,
   fetchTasks,
   registerProject,
+  setPermissionMode,
   updateSession,
   updateTask,
 } from './client'
+import type { PermissionMode } from './types'
 import { makeDiscovery, makeProject, makeServerInfo, makeSession, makeTask } from '../test/fixtures'
 
 /** jsonResponse builds the Response a fetch mock returns. */
@@ -257,5 +260,58 @@ describe('tasks and agent sessions', () => {
 
     await fetchSessions('task_1')
     expect(String(spy.mock.calls[0]?.[0])).toBe('/api/tasks/task_1/sessions')
+  })
+})
+
+describe('project settings', () => {
+  it('reads a project’s launch settings, unwrapping the named envelope', async () => {
+    const spy = mockFetch(jsonResponse({ settings: { permissionMode: 'acceptEdits' } }))
+
+    const settings = await fetchProjectSettings('p_0123456789abcdef0123')
+
+    expect(settings).toEqual({ permissionMode: 'acceptEdits' })
+    expect(String(spy.mock.calls[0]?.[0])).toBe(
+      '/api/projects/p_0123456789abcdef0123/settings',
+    )
+    // A read, so no method: `request` defaults to GET and the server has no verb
+    // to get wrong here.
+    expect(spy.mock.calls[0]?.[1]?.method).toBeUndefined()
+  })
+
+  it('writes a permission mode with the PATCH the server expects', async () => {
+    const spy = mockFetch(jsonResponse({ settings: { permissionMode: 'bypassPermissions' } }))
+
+    const settings = await setPermissionMode('p_0123456789abcdef0123', 'bypassPermissions')
+
+    expect(settings.permissionMode).toBe('bypassPermissions')
+    const [url, init] = spy.mock.calls[0]!
+    expect(String(url)).toBe('/api/projects/p_0123456789abcdef0123/settings')
+    expect(init?.method).toBe('PATCH')
+    expect(JSON.parse(String(init?.body))).toEqual({ permissionMode: 'bypassPermissions' })
+  })
+
+  // §11 of the brief, at the client boundary. The value is not escaped, encoded
+  // or trimmed on its way out - it is sent as it stands and the server refuses
+  // it. A client that sanitised would be a client that made a payload look like
+  // a mode, which is the failure this rule exists to prevent.
+  it('sends a mode that cannot be one unchanged, and lets the server refuse it', async () => {
+    const spy = mockFetch(
+      errorResponse(400, 'invalid_input', '"xxx; rm -rf /" is not a Claude permission mode'),
+    )
+
+    await expect(
+      setPermissionMode('p_1', 'xxx; rm -rf /' as PermissionMode),
+    ).rejects.toMatchObject({ status: 400, code: 'invalid_input' })
+
+    expect(JSON.parse(String(spy.mock.calls[0]?.[1]?.body))).toEqual({
+      permissionMode: 'xxx; rm -rf /',
+    })
+  })
+
+  it('escapes a project identifier in the settings path', async () => {
+    const spy = mockFetch(jsonResponse({ settings: { permissionMode: 'manual' } }))
+
+    await fetchProjectSettings('a/b')
+    expect(String(spy.mock.calls[0]?.[0])).toBe('/api/projects/a%2Fb/settings')
   })
 })

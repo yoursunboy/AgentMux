@@ -513,6 +513,72 @@ consequences and their own phases.
 terminal running: this writes one column of one row. `docs/WORKSPACE.md` §2 is the
 model and §9 is why that half of the rule matters.
 
+## A project's launch settings
+
+Two endpoints, at `/api/projects/{id}/settings`, holding how much Claude asks
+before it acts the next time this project's agent is launched.
+
+| Call | Effect |
+| --- | --- |
+| `GET /api/projects/{id}/settings` | What the next launch is configured with. Never starts anything. |
+| `PATCH /api/projects/{id}/settings` | Stores a mode for the next launch. **Does not touch a running agent.** |
+
+Both answer with the same shape:
+
+```json
+{ "settings": { "permissionMode": "acceptEdits" } }
+```
+
+`permissionMode` is one of `manual`, `acceptEdits` or `bypassPermissions` — the
+CLI's own spellings, and the whole of what this build offers. The set is closed:
+the server refuses a string outside it rather than passing it on.
+
+**This is a setting and not a state.** It is what the project's *next* launch
+will be told, at the moment the command line is typed. Claude reads its
+permission mode once, from that command line, so a mode stored here while an
+agent is running has not reached that agent and nothing in this API claims it
+has — the console says "Restart Agent to apply" rather than drawing the change as
+though it had taken effect. `docs/PERMISSION_MODE.md` is the long form, including
+why no endpoint here simulates Shift+Tab.
+
+**Nothing is restarted.** A `PATCH` is two statements against a local SQLite
+file: no process, no filesystem, no terminal, no keystroke.
+
+### GET /api/projects/{id}/settings
+
+```json
+{ "settings": { "permissionMode": "manual" } }
+```
+
+A project that exists and has never been configured is answered with `manual`
+rather than with a `404` or an empty object. Those are three different facts: the
+first says the project launches under the default, the second would say it has no
+settings at all, and a client that had to tell them apart would be a client that
+knew what the default is.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `project_not_found` | 404 | No project with that identifier |
+
+### PATCH /api/projects/{id}/settings
+
+```json
+{ "permissionMode": "acceptEdits" }
+```
+
+It answers with what is now stored, in the same shape as the read.
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `invalid_request` | 400 | The body is not JSON, carries an unknown field, or omits `permissionMode` or sends it as `null` |
+| `invalid_input` | 400 | A value that is not one of the three, with the vocabulary named in the message and `details.field = "permissionMode"` |
+| `project_not_found` | 404 | No project with that identifier |
+
+**There is no mode that means "unset".** Every project has one, and a project
+nobody has configured has `manual`. A request asking to clear the field is asking
+for something this resource cannot express, and a `400` says so rather than
+storing the absence as a value.
+
 ## The runtime resource
 
 A project's runtime lives at `/api/projects/{id}/runtime`, nested rather than a top-level
@@ -775,10 +841,16 @@ The runtime is started if it is not already running, which is what makes one cal
 stopped project to a running agent. The budget is wider than a runtime start's because it covers one
 too.
 
-The command line is the resolved Claude Code path, plus `--session-id` and `--settings` and nothing
-else. AgentMux still does not add `--dangerously-skip-permissions`, `--permission-mode`,
-`--allowedTools`, `--model`, or `-p`. Claude's interactive permission model is preserved exactly as it
-is, and answering Claude's prompts is the user's job on a terminal the user owns.
+The command line is the resolved Claude Code path, plus `--session-id` and `--settings`, plus
+`--permission-mode` when the project has been configured with one — see
+[the launch settings](#a-projects-launch-settings). The mode is read from the project's settings at
+the moment the line is rendered, so it is the mode stored by the most recent `PATCH` and not one a
+client sent here.
+
+AgentMux still does not add `--dangerously-skip-permissions`, `--allowedTools`, `--model`, or `-p`.
+Claude's interactive permission model is preserved exactly as it is, and answering Claude's prompts is
+the user's job on a terminal the user owns. A permission mode decides how often Claude asks; it never
+answers for anybody, and it changes nothing about an agent already running.
 
 A `taskId` belonging to another project is refused (400, `agent_task_mismatch`). The project path and
 the task's own project have to agree; a runtime id from one project under another project's history
@@ -1392,7 +1464,7 @@ projection was not changed to produce it, and what the page is forbidden to rend
 ## The controller dashboard
 
 One response for a console, instead of the seven it would otherwise have to call and join itself. The
-join happens here, once, in four queries rather than four per project.
+join happens here, once, in six queries rather than six per project.
 
 It is a **read model**: no table, no cache, no state that survives a request, and every route is a
 GET. `docs/CONTROLLER_API.md` is the long form.
@@ -1421,6 +1493,7 @@ GET. `docs/CONTROLLER_API.md` is the long form.
       },
       "attention": { "available": true, "level": "ACTION_REQUIRED", "reason": "permission requested" },
       "actions": { "available": true, "pending": 1 },
+      "settings": { "available": true, "permissionMode": "manual" },
       "updatedAt": "2026-09-21T09:00:12Z"
     }
   ],
@@ -1439,8 +1512,14 @@ running, then what has finished, then everything else. Within that, most recentl
 
 Each section speaks its own layer's vocabulary and none is translated — `runtime.status` is the
 project model's, `agent.status` is the agent state projection's, `attention.level` is the attention
-projection's. A client that knows one endpoint's vocabulary should not have to learn a second spelling
-of it here.
+projection's, and `settings.permissionMode` is the CLI's own.
+
+`settings` is the newest section. It is an object rather than a nullable one, like `actions` and
+unlike `agent` and `attention`, because a project with no settings row is a project configured with
+the default rather than a project with nothing there. `available: false` means the server could not
+read it, and in that case `permissionMode` is empty rather than filled in with `manual` — a card that
+showed the default as a reading would be showing a guess as the one thing that section is for. It
+reports what the next launch is configured with, never what a running agent is doing.
 
 **Null and unavailable are different** and the response distinguishes them:
 

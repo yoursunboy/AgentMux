@@ -29,9 +29,18 @@ import type { DashboardColumns } from './useDashboardColumns'
 export interface ProjectGridProps {
   cards: ProjectCardData[]
   columns: DashboardColumns
+  /**
+   * Passed to every card, for a card that writes something.
+   *
+   * It is one callback for the grid rather than one per card because the grid is
+   * what knows how many cards there are: a page that re-read after a write has
+   * one answer for all of them, and a per-card handler would be the same
+   * function stored N times.
+   */
+  onSettingsChanged?: (() => void) | undefined
 }
 
-export function ProjectGrid({ cards, columns }: ProjectGridProps) {
+export function ProjectGrid({ cards, columns, onSettingsChanged }: ProjectGridProps) {
   if (cards.length === 0) {
     return (
       // Not a live region. The message is static content, and a page that
@@ -48,7 +57,7 @@ export function ProjectGrid({ cards, columns }: ProjectGridProps) {
       style={{ '--columns': columns } as CSSProperties}
     >
       {cards.map((card) => (
-        <ProjectPanel key={card.id} card={card} />
+        <ProjectPanel key={card.id} card={card} onSettingsChanged={onSettingsChanged} />
       ))}
     </div>
   )

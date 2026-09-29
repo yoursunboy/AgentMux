@@ -163,11 +163,12 @@ func (g *gitRecorder) init(_ context.Context, dir string) error {
 // harness is a Service wired to a temp Projects Root, a fake repository, and a
 // stubbed git.
 type harness struct {
-	service *Service
-	repo    *fakeRepo
-	git     *gitRecorder
-	root    string
-	now     time.Time
+	service  *Service
+	repo     *fakeRepo
+	settings *fakeSettings
+	git      *gitRecorder
+	root     string
+	now      time.Time
 }
 
 func newHarness(t *testing.T, roots ...string) *harness {
@@ -180,11 +181,13 @@ func newHarness(t *testing.T, roots ...string) *harness {
 		t.Fatalf("could not build the host adapter: %v", err)
 	}
 	repo := newFakeRepo()
+	settings := newFakeSettings()
 	git := &gitRecorder{}
 	fixed := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
 
 	service, err := NewService(Options{
 		Repository: repo,
+		Settings:   settings,
 		Host:       adapter,
 		GitInit:    git.init,
 		Now:        func() time.Time { return fixed },
@@ -193,7 +196,7 @@ func newHarness(t *testing.T, roots ...string) *harness {
 	if err != nil {
 		t.Fatalf("could not build the service: %v", err)
 	}
-	return &harness{service: service, repo: repo, git: git, root: roots[0], now: fixed}
+	return &harness{service: service, repo: repo, settings: settings, git: git, root: roots[0], now: fixed}
 }
 
 // mkdir creates a directory below the temp root and returns its path.
@@ -467,6 +470,7 @@ func TestRegisterUnderWSLMode(t *testing.T) {
 	repo := newFakeRepo()
 	service, err := NewService(Options{
 		Repository: repo,
+		Settings:   newFakeSettings(),
 		Host:       adapter,
 		GitInit:    (&gitRecorder{}).init,
 		Logger:     discardLogger(),
@@ -1052,6 +1056,9 @@ func TestNewServiceRequiresItsCollaborators(t *testing.T) {
 	}
 	if _, err := NewService(Options{Host: adapter}); err == nil {
 		t.Error("NewService must reject a missing Repository")
+	}
+	if _, err := NewService(Options{Repository: newFakeRepo(), Host: adapter}); err == nil {
+		t.Error("NewService must reject a missing Settings repository")
 	}
 	if _, err := NewService(Options{Repository: newFakeRepo()}); err == nil {
 		t.Error("NewService must reject a missing Host adapter")

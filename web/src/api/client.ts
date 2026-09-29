@@ -15,7 +15,9 @@ import type {
   CreateProjectInput,
   CreateTaskInput,
   DiscoveryResult,
+  PermissionMode,
   Project,
+  ProjectSettings,
   RegisterProjectInput,
   Runtime,
   ServerInfo,
@@ -522,4 +524,63 @@ export async function updateSession(
     signal: signal ?? null,
   })
   return body.session
+}
+
+/**
+ * One project's launch configuration.
+ *
+ * A project that exists and has never been configured is answered with the
+ * default rather than with a 404 or an empty object. Those are three different
+ * facts, and a client that had to tell them apart would be a client that knew
+ * what the default is - which is the server's to decide, and the whole reason
+ * the answer is a value rather than an absence.
+ */
+export async function fetchProjectSettings(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectSettings> {
+  const body = await request<{ settings: ProjectSettings }>(
+    `/projects/${encodeURIComponent(projectId)}/settings`,
+    { signal: signal ?? null },
+  )
+  return body.settings
+}
+
+/**
+ * Choose the permission mode this project's **next** launch will start in.
+ *
+ * # What it does not do, and why the caller must say so
+ *
+ * It does not change the mode of an agent that is already running. Claude reads
+ * its permission mode once, from its own command line, and the only thing that
+ * can change it afterwards is Shift+Tab inside its TUI - see `ModeSwitch`, which
+ * sends exactly that and is a different act from this one. Making this endpoint
+ * do it would mean typing a keystroke into somebody's terminal on their behalf,
+ * from a menu that said it was a setting.
+ *
+ * So a caller that gets a successful response has stored a preference and
+ * changed nothing yet, and it must say so. The console says "Permission mode
+ * updated. Restart Agent to apply."
+ *
+ * # The value is refused rather than sanitised
+ *
+ * The server answers a mode outside the three with `400 invalid_input` naming
+ * the vocabulary. Nothing here encodes or escapes the value: it is one of three
+ * strings or it is an error, which is a stronger guarantee than any escaping
+ * would be.
+ */
+export async function setPermissionMode(
+  projectId: string,
+  permissionMode: PermissionMode,
+  signal?: AbortSignal,
+): Promise<ProjectSettings> {
+  const body = await request<{ settings: ProjectSettings }>(
+    `/projects/${encodeURIComponent(projectId)}/settings`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ permissionMode }),
+      signal: signal ?? null,
+    },
+  )
+  return body.settings
 }

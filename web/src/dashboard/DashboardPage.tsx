@@ -86,7 +86,17 @@ export function DashboardPage({ pollMs }: DashboardPageProps = {}) {
           )}
 
           <main className="dashboard__body">
-            <ProjectGrid cards={data.projects} columns={columns} />
+            {/* A card that changes a project's launch settings re-reads the
+                dashboard rather than patching its own copy of the card. The
+                response to a settings write is the settings, not the console -
+                so the only way this page can be sure the badge it is showing is
+                the one the server holds is to ask again. It is also the rule
+                the workspace follows after every write. */}
+            <ProjectGrid
+              cards={data.projects}
+              columns={columns}
+              onSettingsChanged={reload}
+            />
           </main>
         </>
       )}

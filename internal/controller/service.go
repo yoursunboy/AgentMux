@@ -7,6 +7,7 @@ import (
 
 	"github.com/kutonlagos/agentmux/internal/agentstate"
 	"github.com/kutonlagos/agentmux/internal/attention"
+	"github.com/kutonlagos/agentmux/internal/claude"
 	"github.com/kutonlagos/agentmux/internal/project"
 )
 
@@ -19,6 +20,7 @@ type Service struct {
 	agents    StateReader
 	attention AttentionReader
 	actions   ActionReader
+	settings  SettingsReader
 	log       *slog.Logger
 }
 
@@ -40,6 +42,17 @@ type StateReader interface {
 type AttentionReader interface {
 	AttentionForProjects(ctx context.Context, projectIDs []string) (map[string]attention.Attention, error)
 	PendingCountsForProjects(ctx context.Context, projectIDs []string) (map[string]int, error)
+}
+
+// SettingsReader is the project's launch configuration as this package reads
+// it.
+//
+// It asks for the one thing a card shows and nothing else about a project,
+// which is why it is this narrow. The service behind it also creates, archives
+// and renames projects; a caller drawing cards has no business doing any of
+// that, and an interface that could would be an interface that eventually does.
+type SettingsReader interface {
+	PermissionModesForProjects(ctx context.Context, ids []string) (map[string]claude.PermissionMode, error)
 }
 
 // Options configures a Service. Projects is required.
@@ -73,6 +86,16 @@ type Options struct {
 	// warning the two above carry.
 	Actions ActionReader
 
+	// Settings is where a project's launch configuration is read, for the one
+	// field a card shows of it.
+	//
+	// It may be nil, with the same untyped-nil warning the three above carry.
+	// Degrading matters here in a way it does not for the others: a server
+	// built without this is a server whose cards cannot say what a launch will
+	// do, and a card that said `manual` because it could not read the answer
+	// would be inventing the one fact this section exists to report.
+	Settings SettingsReader
+
 	// Logger receives diagnostics. Nil means slog.Default.
 	Logger *slog.Logger
 }
@@ -87,6 +110,7 @@ func NewService(o Options) (*Service, error) {
 		agents:    o.Agents,
 		attention: o.Attention,
 		actions:   o.Actions,
+		settings:  o.Settings,
 		log:       o.Logger,
 	}
 	if s.log == nil {
@@ -121,22 +145,23 @@ func (s *Service) Dashboard(ctx context.Context, server ServerSummary) (Dashboar
 //
 // # How many queries it takes
 //
-// Three, plus the project listing itself, whatever the number of projects:
+// Four, plus the project listing itself, whatever the number of projects:
 //
-//	projects.List                  one
-//	agents.StatesForProjects       one
-//	attention.AttentionForProjects one
-//	attention.PendingCounts        one
+//	projects.List                     one
+//	agents.StatesForProjects          one
+//	attention.AttentionForProjects    one
+//	attention.PendingCounts           one
+//	project.PermissionModesForProjects one
 //
 // That is the whole of what §13 of the phase brief asks for. The obvious
-// implementation - a loop over the projects asking each one four questions -
-// would be four hundred queries for a hundred projects, and the cost would grow
+// implementation - a loop over the projects asking each one five questions -
+// would be five hundred queries for a hundred projects, and the cost would grow
 // with the number of projects rather than with the size of the answer.
 //
 // # What degrades, and what does not
 //
 // The project listing is the request. If it fails there is no console to show
-// and the error is returned. The three projections are sections: a missing one,
+// and the error is returned. The four projections are sections: a missing one,
 // or one that could not be read, marks that section `available: false` and the
 // rest of the card is still built. A dashboard that shows five of seven things
 // is worth more than an error page, and the failure is logged where an operator
@@ -154,22 +179,46 @@ func (s *Service) Projects(ctx context.Context) ([]ProjectCard, error) {
 
 	// A console with no projects asks nothing. The projections answer an empty
 	// list correctly - each returns early - but a batch query for no rows is a
-	// query that cannot match anything, and three of them per dashboard request
-	// on an installation with nothing registered is three too many.
+	// query that cannot match anything, and four of them per dashboard request
+	// on an installation with nothing registered is four too many.
 	if len(ids) == 0 {
 		return []ProjectCard{}, nil
 	}
 
-	states, statesOK := s.statesFor(ctx, ids)
-	levels, attentionOK := s.attentionFor(ctx, ids)
-	pending, actionsOK := s.pendingFor(ctx, ids)
+	sec := sections{}
+	sec.states, sec.statesOK = s.statesFor(ctx, ids)
+	sec.levels, sec.attentionOK = s.attentionFor(ctx, ids)
+	sec.pending, sec.actionsOK = s.pendingFor(ctx, ids)
+	sec.modes, sec.settingsOK = s.settingsFor(ctx, ids)
 
 	cards := make([]ProjectCard, 0, len(projects))
 	for _, p := range projects {
-		cards = append(cards, s.card(p, states, statesOK, levels, attentionOK, pending, actionsOK))
+		cards = append(cards, s.card(p, sec))
 	}
 	sortCards(cards)
 	return cards, nil
+}
+
+// sections is what the four projections answered, gathered so that a card can
+// be built from one value instead of eight.
+//
+// # Why it is a struct and not eight parameters
+//
+// Four of the eight are booleans. A call that passed `statesOK` where
+// `attentionOK` belonged - or `pending` where `modes` did - would compile, run,
+// and mark the wrong section of every card unavailable, and nothing would
+// report it: both are bools, both are maps of a project id to something. Naming
+// them at the call site makes that mistake a compile error rather than a
+// dashboard that quietly lies about which part of the server is missing.
+type sections struct {
+	states      map[string]agentstate.AgentState
+	statesOK    bool
+	levels      map[string]attention.Attention
+	attentionOK bool
+	pending     map[string]int
+	actionsOK   bool
+	modes       map[string]claude.PermissionMode
+	settingsOK  bool
 }
 
 // statesFor reads the agent state of every project, degrading to "unavailable".
@@ -211,16 +260,23 @@ func (s *Service) pendingFor(ctx context.Context, ids []string) (map[string]int,
 	return pending, true
 }
 
+// settingsFor reads how every project's next launch is configured.
+func (s *Service) settingsFor(ctx context.Context, ids []string) (map[string]claude.PermissionMode, bool) {
+	if s.settings == nil {
+		return nil, false
+	}
+	modes, err := s.settings.PermissionModesForProjects(ctx, ids)
+	if err != nil {
+		s.log.Warn("could not read the permission modes for the controller dashboard", "error", err)
+		return nil, false
+	}
+	return modes, true
+}
+
 // card builds one project's card from what the four reads produced.
-func (s *Service) card(
-	p *project.Project,
-	states map[string]agentstate.AgentState,
-	statesOK bool,
-	levels map[string]attention.Attention,
-	attentionOK bool,
-	pending map[string]int,
-	actionsOK bool,
-) ProjectCard {
+//
+// It takes the reads as one value rather than eight arguments - see sections.
+func (s *Service) card(p *project.Project, sec sections) ProjectCard {
 	card := ProjectCard{
 		ID:        p.ID,
 		Name:      p.Name,
@@ -228,11 +284,11 @@ func (s *Service) card(
 		UpdatedAt: p.UpdatedAt,
 	}
 
-	if !statesOK {
+	if !sec.statesOK {
 		// The projection is not wired, or could not be read. A section that
 		// says so is more useful than one that says nothing is running.
 		card.Agent = &AgentSummary{Available: false}
-	} else if state, ok := states[p.ID]; ok {
+	} else if state, ok := sec.states[p.ID]; ok {
 		card.Agent = &AgentSummary{
 			Available: true,
 			SessionID: state.AgentSessionID,
@@ -245,9 +301,9 @@ func (s *Service) card(
 	// No state at all leaves Agent nil, which is what §8 asks for: an agent
 	// that has never run is reported as absent rather than invented.
 
-	if !attentionOK {
+	if !sec.attentionOK {
 		card.Attention = &AttentionSummary{Available: false}
-	} else if a, ok := levels[p.ID]; ok {
+	} else if a, ok := sec.levels[p.ID]; ok {
 		card.Attention = &AttentionSummary{
 			Available: true,
 			Level:     string(a.Level),
@@ -256,7 +312,22 @@ func (s *Service) card(
 		card.UpdatedAt = latest(card.UpdatedAt, a.UpdatedAt)
 	}
 
-	card.Actions = ActionsSummary{Available: actionsOK, Pending: pending[p.ID]}
+	card.Actions = ActionsSummary{Available: sec.actionsOK, Pending: sec.pending[p.ID]}
+
+	// Settings is a value rather than a pointer, unlike Agent and Attention
+	// above. Those two are nil when a project simply has nothing in them; this
+	// one is never absent - every project has a mode, and the one nobody chose
+	// is the default - so there is no absence for a nil to carry. What can be
+	// missing is the answer, and that is what Available says.
+	//
+	// When it is missing the mode is left empty rather than filled in with the
+	// default. The default is what a launch will actually use, so a card that
+	// showed it here would be showing a guess as though it were a reading - on
+	// the one section whose whole job is to say what the next launch will do.
+	card.Settings = SettingsSummary{
+		Available:      sec.settingsOK,
+		PermissionMode: string(sec.modes[p.ID]),
+	}
 	return card
 }
 

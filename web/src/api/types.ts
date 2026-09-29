@@ -376,6 +376,16 @@ export interface ProjectCard {
   /** Whether anybody needs to look, or null if nothing has happened here. */
   attention: AttentionSummary | null
   actions: { available: boolean; pending: number }
+  /**
+   * How this project's next launch is configured.
+   *
+   * It is always present rather than nullable, unlike `agent` and `attention`
+   * above it: those are null when a project simply has nothing in them, and
+   * every project has a permission mode - the one nobody chose is the default.
+   * What can be missing is the server's ability to answer, which is what
+   * `available` reports.
+   */
+  settings: { available: boolean; permissionMode: PermissionMode | string }
   updatedAt: string
 }
 
@@ -398,6 +408,33 @@ export interface AttentionSummary {
   level: string
   /** A short fixed phrase, never a quotation from a payload. */
   reason?: string
+}
+
+/**
+ * How much Claude asks before it acts, for one project.
+ *
+ * # A closed set, and a setting rather than a state
+ *
+ * These three are the whole of what this build offers, and they are the CLI's
+ * own spellings. They are what a project's *next* launch is configured with,
+ * which is not the same as what a running agent is doing: Claude reads its
+ * permission mode once, from its own command line, and an agent that is already
+ * running keeps the mode it started with. Changing one of these therefore
+ * changes nothing until the agent is restarted, and the console says so rather
+ * than showing the change as though it had taken effect.
+ *
+ * The CLI accepts three more - `auto`, `dontAsk` and `plan` - and offering one
+ * of them would be a product decision this build has not made. The type is a
+ * union of three rather than `string` so that a fourth would be a compile error
+ * at every place that switches on it.
+ *
+ * See `docs/PERMISSION_MODE.md`.
+ */
+export type PermissionMode = 'manual' | 'acceptEdits' | 'bypassPermissions'
+
+/** One project's launch configuration, from GET /api/projects/{id}/settings. */
+export interface ProjectSettings {
+  permissionMode: PermissionMode | string
 }
 
 /**

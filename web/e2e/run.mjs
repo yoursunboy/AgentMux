@@ -241,6 +241,10 @@ const ALL_SUITES = [
   'controller-input',
   'controller',
   'action-center',
+  // Last on purpose: it is the one suite that writes a project setting rather
+  // than reading the fixture, and although it puts the mode back, a suite that
+  // ran after it would be running after a write for no reason.
+  'permission-mode',
 ]
 
 /**

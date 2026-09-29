@@ -99,6 +99,26 @@ type AdapterOperator interface {
 	Subscribe(ctx context.Context, runtimeID string) (<-chan claude.Event, error)
 }
 
+// LaunchSettings is the project model as this package uses it, for the one
+// thing a launch needs from a project.
+//
+// The name says "launch" and not just "settings" because this package already
+// has a Settings, and it means something else entirely: SettingsWriter is the
+// on-disk Claude hook document, one per runtime. This is what a person has
+// configured for a project, one per project. The two are unrelated, and a field
+// called Settings beside a type called SettingsWriter would be the kind of
+// ambiguity that survives review.
+//
+// It is one method wide because one method is the whole of what the chain
+// needs: the chain decides *when* to launch, and this decides only what the
+// launch is told. A project nobody has configured answers with the default
+// rather than an error, so no caller has to tell "not configured" apart from
+// "configured to the ordinary thing".
+type LaunchSettings interface {
+	// Settings returns a project's launch configuration.
+	Settings(ctx context.Context, id string) (project.Settings, error)
+}
+
 // SessionOperator is the task model as this package uses it.
 type SessionOperator interface {
 	// GetTask is how the chain checks that a task belongs to the project the
@@ -113,13 +133,21 @@ type SessionOperator interface {
 	UpdateSessionStatus(ctx context.Context, id, to string) (*task.AgentSession, error)
 }
 
-// Options configures a Service. Runtimes, Adapters, Sessions and Settings are
-// required.
+// Options configures a Service. Runtimes, Adapters, Sessions, LaunchSettings
+// and Settings are required.
 type Options struct {
 	Runtimes RuntimeOperator
 	Adapters AdapterOperator
 	Sessions SessionOperator
 	Settings SettingsWriter
+
+	// LaunchSettings is what a project has been configured with. It is required
+	// rather than optional: a launch that could not read its project's
+	// configuration would either refuse every launch or silently use the
+	// default, and the second is the failure AgentProvider.Spec's own comment
+	// calls out - an agent started without the arguments the caller asked for
+	// looks exactly like one that was started correctly.
+	LaunchSettings LaunchSettings
 
 	// Logger receives diagnostics. Nil means slog.Default.
 	Logger *slog.Logger
@@ -141,13 +169,14 @@ type Options struct {
 // It is safe for concurrent use. Operations on one project are serialised
 // against each other; operations on different projects run at the same time.
 type Service struct {
-	runtimes RuntimeOperator
-	adapters AdapterOperator
-	sessions SessionOperator
-	settings SettingsWriter
-	log      *slog.Logger
-	now      func() time.Time
-	newID    func() (string, error)
+	runtimes       RuntimeOperator
+	adapters       AdapterOperator
+	sessions       SessionOperator
+	settings       SettingsWriter
+	launchSettings LaunchSettings
+	log            *slog.Logger
+	now            func() time.Time
+	newID          func() (string, error)
 
 	// locks serialises the chain per project stripe. It is held across a process
 	// launch, so it is deliberately not the lock that guards runs.
@@ -173,17 +202,20 @@ func NewService(o Options) (*Service, error) {
 		return nil, newError(CodeInvalidInput, "agent: a session operator is required")
 	case o.Settings == nil:
 		return nil, newError(CodeInvalidInput, "agent: a settings writer is required")
+	case o.LaunchSettings == nil:
+		return nil, newError(CodeInvalidInput, "agent: a launch settings reader is required")
 	}
 
 	s := &Service{
-		runtimes: o.Runtimes,
-		adapters: o.Adapters,
-		sessions: o.Sessions,
-		settings: o.Settings,
-		log:      o.Logger,
-		now:      o.Now,
-		newID:    o.NewSessionID,
-		runs:     make(map[string]*Run),
+		runtimes:       o.Runtimes,
+		adapters:       o.Adapters,
+		sessions:       o.Sessions,
+		settings:       o.Settings,
+		launchSettings: o.LaunchSettings,
+		log:            o.Logger,
+		now:            o.Now,
+		newID:          o.NewSessionID,
+		runs:           make(map[string]*Run),
 	}
 	if s.log == nil {
 		s.log = slog.Default()
@@ -234,6 +266,20 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 	defer lock.Unlock()
 
 	runtimeID := project.SessionNameFor(projectID)
+
+	// 0. What this project's launch is configured with, before anything has
+	// happened that would have to be undone.
+	//
+	// It is read first rather than beside the launch in step 8 because the
+	// answer can be a refusal. A refusal that arrived after a terminal had been
+	// brought up, a receiver attached and a settings document written would have
+	// to undo all three to leave the project as it found it; here there is
+	// nothing to undo, and a project whose configuration cannot be read is a
+	// project that is not launched into.
+	settings, err := s.launchSettings.Settings(ctx, projectID)
+	if err != nil {
+		return Result{}, err
+	}
 
 	// 1. The terminal has to exist first.
 	rt, err := s.runtimes.Runtime(ctx, projectID)
@@ -340,10 +386,11 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 		}
 	}
 
-	// 8. The launch, carrying the id and the document.
+	// 8. The launch, carrying the id, the document and the project's mode.
 	status, err := s.runtimes.StartAgent(ctx, projectID, session.AgentLaunch{
-		SessionID:    sessionID,
-		SettingsPath: settingsPath,
+		SessionID:      sessionID,
+		SettingsPath:   settingsPath,
+		PermissionMode: string(settings.PermissionMode),
 	})
 	if err != nil {
 		u.run(ctx)

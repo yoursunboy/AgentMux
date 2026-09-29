@@ -22,10 +22,18 @@ package main
 //
 // What they deliberately do not do:
 //
-//   - They never pass --dangerously-skip-permissions, --permission-mode, or any
-//     other flag that approves a tool call on the user's behalf. The permission
-//     model is the thing being preserved; a test that disabled it would be
-//     testing a program nobody runs.
+//   - They never pass --dangerously-skip-permissions, or any other flag that
+//     approves a tool call on the user's behalf. The permission model is the
+//     thing being preserved; a test that disabled it would be testing a program
+//     nobody runs.
+//
+//     --permission-mode is not in that list, and its absence is deliberate. Since
+//     Phase 7.5.1 a launch passes the mode its project is configured with, so
+//     the flag is part of the product rather than a way round it - and the mode
+//     the tests use is whatever the project's settings say, which is `manual`
+//     until somebody chooses otherwise. What no test does is *choose*
+//     bypassPermissions to make an agent get on with it; that is a decision for
+//     a person, and docs/PERMISSION_MODE.md §4 is why.
 //   - They never pass --model. The CLI's own configuration decides which model
 //     it uses, and AgentMux has no opinion.
 //   - They never decide anything from the terminal's text. A start is confirmed
@@ -745,9 +753,12 @@ func TestRealClaudeIsResolvedByTheProductionAdapter(t *testing.T) {
 
 	// The permission model is the CLI's own, and nothing may approve on the
 	// user's behalf or override the model the CLI would otherwise choose.
+	//
+	// --permission-mode is not here. Since Phase 7.5.1 it is a flag this product
+	// passes, carrying the mode the project is configured with; the assertion
+	// below is that an unconfigured launch does not pass it at all.
 	for _, forbidden := range []string{
 		"--dangerously-skip-permissions",
-		"--permission-mode",
 		"--allowedTools",
 		"--allowed-tools",
 		"--model",
@@ -755,6 +766,14 @@ func TestRealClaudeIsResolvedByTheProductionAdapter(t *testing.T) {
 		if strings.Contains(spec.Command, forbidden) {
 			t.Errorf("Command = %q carries %q; the CLI's own settings decide", spec.Command, forbidden)
 		}
+	}
+
+	// An empty mode means the flag is absent, which is the behaviour this build
+	// had before the option existed: the CLI's own configuration decides. It is
+	// checked rather than assumed because "no mode" rendering as
+	// `--permission-mode ""` would be a flag with a value the CLI would reject.
+	if strings.Contains(spec.Command, "--permission-mode") {
+		t.Errorf("Command = %q carries --permission-mode for a launch with no mode; want the flag omitted", spec.Command)
 	}
 
 	// And nothing here is a credential. The runtime is handed a program to run,

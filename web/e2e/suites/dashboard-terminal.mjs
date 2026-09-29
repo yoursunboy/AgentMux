@@ -469,7 +469,75 @@ async function main() {
     )
 
     // =======================================================================
-    // G. Nothing threw
+    // G. The card's Shift+Tab (§7 of CONTROLLER_UI)
+    // =======================================================================
+
+    // A tablet has no Shift and no Tab, so the Runtime row carries a button that
+    // sends the two bytes the key sends. It is the console's second way of
+    // typing, added after this suite was written, and the claim is the one
+    // section B makes about the first: a tap is not a keystroke until the server
+    // has handed this client the lease. Nothing in this page holds it, so the
+    // tap has to ask - and the keystroke that follows is the answer arriving.
+    //
+    // It is last because it takes the keyboard. Everything above is about a
+    // console that has taken nothing, and a control request sent over this same
+    // socket would have made those checks false rather than wrong.
+    const mode = card(page).getByRole('button', { name: 'Mode' })
+    report.check(
+      'the card offers a mode switch beside a running runtime',
+      (await mode.count()) === 1,
+      `${await mode.count()} mode switch(es) on the card`,
+    )
+
+    const beforeMode = frames.length
+    await settleShell(ALPHA)
+    await mode.click()
+
+    // What the terminal sends when Shift and Tab are pressed together, in the
+    // encoding an input message carries - the same one a forged frame uses.
+    const shiftTab = Buffer.from('\u001b[Z', 'utf8').toString('base64')
+    const types = (from) =>
+      frames
+        .slice(from)
+        .map((frame) => {
+          if (frame.dir !== 'out' || typeof frame.payload !== 'string') return ''
+          try {
+            return JSON.parse(frame.payload).type
+          } catch {
+            return ''
+          }
+        })
+        .filter((type) => type === 'control.request' || type === 'input')
+
+    const tapped = await waitFor(
+      async () =>
+        sent(frames.slice(beforeMode), 'input').some(
+          (frame) => JSON.parse(frame.payload).data === shiftTab,
+        ),
+      15_000,
+      250,
+    )
+    report.check(
+      'and tapping it puts the bytes Shift+Tab sends on the wire',
+      tapped,
+      tapped
+        ? 'the page sent Shift+Tab as an input message'
+        : `the page sent ${sent(frames.slice(beforeMode), 'input').length} input message(s), ` +
+            'none of them Shift+Tab',
+    )
+    // The order is the whole of the component. A client that is not the
+    // controller has `input` refused inside the hook, so a switch that typed on
+    // the tap would put nothing on the wire at all and read as a broken button -
+    // which is exactly the shape of failure this check exists to catch.
+    const sequence = types(beforeMode)
+    report.check(
+      'having asked for the lease first, and typed only after it arrived',
+      sequence[0] === 'control.request' && sequence.includes('input'),
+      `the page sent ${sequence.join(', ') || 'neither'}`,
+    )
+
+    // =======================================================================
+    // H. Nothing threw
     // =======================================================================
 
     const crashes = [...errors, ...second.errors].filter((text) => text.startsWith('pageerror:'))

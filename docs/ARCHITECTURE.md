@@ -11,12 +11,13 @@ iPad / Phone / PC
 │       AgentMux Server       │   runs inside WSL on Windows (see §7)
 │                             │
 │ Project Manager             │   internal/project        — built
+│ Project Settings            │   internal/project        — built in Phase 7.5.1
 │ Task Model                  │   internal/task           — built in Phase 7.2
 │ Session Manager             │   internal/session        — built in Phase 2
 │ Terminal Manager            │   part of session.Manager — sequence, history
 │ Terminal Transport          │   internal/terminal       — built in Phase 4
 │ Workspace                   │   web/src/workspace       — built in Phase 5
-│ Console (read-only)         │   web/src/dashboard       — built in Phase 7.4B-1
+│ Console                     │   web/src/dashboard       — built in Phase 7.4B-1
 │ Terminal Viewer             │   web/src/dashboard       — built in Phase 7.4B-2A
 │ Action Centre               │   web/src/actions         — built in Phase 7.4C
 │ Agent Manager               │   part of session.Manager — built in Phase 3
@@ -101,8 +102,8 @@ that decides it. `docs/AGENT_ATTENTION.md` §1 separates the layers, §3 is the 
 
 The Controller Aggregation, added in Phase 7.4A as `internal/controller`, is the one component that
 reads several of the others to build a single answer. It exists because a console would otherwise
-call seven endpoints and join them itself — once per client, and four times per project — and the join
-belongs where it can be five queries instead of four hundred. **It owns nothing**: no table, no cache,
+call eight endpoints and join them itself — once per client, and six times per project — and the join
+belongs where it can be six queries instead of six hundred. **It owns nothing**: no table, no cache,
 no state that survives a request, and every route it serves is a GET. Delete the package and nothing
 is lost but the convenience. `docs/CONTROLLER_API.md` §1 is the boundary, §4 the sort, and §7 what it
 does not cover.
@@ -151,6 +152,28 @@ page therefore leads with **needs you** — pending and `ACTION_REQUIRED` — an
 **notices**. `docs/ACTION_CENTER.md` §2 is that argument, §4 is why the detail page has no button at
 all, and §6 is the one claim this page had to be built to keep: it names a type and never a payload.
 
+The permission setting, added in Phase 7.5.1, is the smallest thing in this box and the one whose
+boundary is easiest to get wrong. A project now stores how much Claude should ask before it acts —
+`internal/project/settings.go` over one `project_settings` row — and the launch reads it when it
+renders the command line, as one more quoted argument beside `--session-id` and `--settings`. That is
+the whole of the plumbing: a menu on the card writes the row, and the next launch reads it.
+
+It is a **setting and not a control**, and the reason is a fact about Claude rather than about
+AgentMux. Claude reads its permission mode once, from its own command line, and changes it afterwards
+only by Shift+Tab inside its TUI — a cycle with no argument and no hook, so nothing AgentMux can
+observe reports where it landed. There is therefore no way to read a running agent's mode, and no way
+to reach a chosen one by advancing a cycle from an unknown position. A control that claimed to switch
+a live mode could only be guessing, and it would be guessing about the one thing it exists to tell
+somebody.
+
+So the row records what the next launch is configured with and nothing else; the console says
+"Restart Agent to apply" rather than restarting anything itself; and a restart that does happen goes
+the long way round — Dashboard → Controller API → Runtime Manager. **Nothing added by this phase sends
+a keystroke**, and the `Mode` button on the Runtime row is still the only thing in the console that
+types into somebody's terminal. `docs/PERMISSION_MODE.md` §7 is the full list of what was deliberately
+not built, §9 is the rendered launch line, and §10 is why a value that reaches a command line cannot
+be a command.
+
 ## 2. Project vs Collection
 
 AgentMux distinguishes:
@@ -186,9 +209,19 @@ Owns:
 - explicit project registration;
 - project creation;
 - project metadata;
+- a project's launch settings — the permission mode it starts in;
 - archive/open state.
 
-Does not own terminal behavior.
+The last bullet but one is Phase 7.5.1 and is the only one that is not metadata *about* a project.
+A permission mode is a fact about a project that something downstream acts on — the runtime renders it
+into the launch line — which makes this package the place the vocabulary is enforced. It is, and it is
+the only place: `project.Service.SetPermissionMode` is the single check against
+`claude.ValidPermissionMode`, the column carries no `CHECK`, and the launcher re-checks nothing. One
+list in one place cannot drift from itself, the same argument `internal/usage` makes for its five
+names, and `docs/PERMISSION_MODE.md` §10 for why the check is a membership test rather than an escape.
+
+Does not own terminal behavior, and does not own the launch either: it owns the preference a launch is
+given, and `internal/session` is what renders and runs it.
 
 ### Session Manager
 
@@ -788,6 +821,34 @@ from the table, nothing reads it to decide anything, and a beta that ends by tru
 count and nothing else. `migrations/0009_usage_events.sql` is the long form, and §15 says when the
 rows are written at all.
 
+Phase 7.5.1 added `project_settings` (`0010`), and it is the first table in the build that holds a
+**preference** — neither a record of what happened nor a record of what is. It has four columns: the
+project it belongs to, the mode, and the two timestamps. The project id is the primary key, which is
+the whole of its cardinality: one setting per project, because a second row would be a second answer
+to a question that has one.
+
+It is a table rather than two more columns on `projects`, and the reason is which caller wants it.
+`projects` is the registry and every listing in the build reads all of it; a setting is read by the
+launch path one project at a time, and by the console all of them at once, and neither of those is the
+registry. A column here would put a preference in the middle of the one row every query already reads
+in order to answer a question most of them are not asking. `migrations/0010_project_settings.sql` is
+the long form, and it is also the first migration since this section was written to declare its
+foreign key at the foot of the table, where the argument for it is.
+
+Two of its decisions are the ones `usage_events` made one phase earlier. `permission_mode` is `TEXT`
+with no `CHECK`, because the vocabulary lives in `internal/claude` and a constraint here would be a
+second copy of it that could drift; it is enforced where the row is written. And **no row is the
+default**: a project nobody has configured has no row, reading does not create one, and the absence
+*is* `manual` rather than something filled in with it. That is what makes the migration additive — an
+upgraded database ends up with an empty table and every project on the behaviour it already had — and
+`internal/storage/tasks_test.go` asserts the upgrade, absence included.
+
+What the table deliberately has no column for is the mode any agent is *running* under. That is not an
+omission to be fixed later; it is the same fact §1 states about the launch, written as a schema. There
+is no way to observe a running agent's permission mode, so a column for one could only be filled with
+a guess, and `internal/storage/projectsettings_test.go` asserts the column set so that adding one is a
+test failure rather than a line somebody adds while passing.
+
 ## 14. Security
 
 Do not expose provider secrets.
@@ -837,6 +898,20 @@ that would have been useful while debugging, which is why the test exists rather
 User-Agent header, from a closed vocabulary (`Chrome on Windows`, `Safari on iPad`), and an
 unrecognised header becomes `Unknown device` rather than being passed through. The interface shows that
 label; it never shows an address, and there is no field in any message that could carry one.
+
+**The one client-supplied string that reaches a command line is a member of three.** A project's
+permission mode is rendered into the shell line that launches Claude, which makes it the only value a
+request can carry that ends up there — and the answer is that it is never a string this build accepted
+from anybody. It is a closed set: `claude.ValidPermissionMode` is a membership test against three
+constants, and `manual; rm -rf /`, `$(whoami)`, `` `id` ``, `manual'--dangerously-skip-permissions` and
+a value with an embedded newline are all refused rather than escaped, because a mode that is not one of
+three is not a mode. The check is `project.Service.SetPermissionMode` and it is the only one: the
+column is `TEXT` without a constraint and the flag is rendered without a second test, deliberately, so
+that the list cannot drift from itself. Quoting is the second line of defence rather than the first —
+`claude.Quote` renders every argument as one single-quoted shell word whatever it contains — and a line
+break is the one case quoting does not close, which is exactly why the vocabulary is what closes it.
+The `PATCH` that sets a mode is a write, so `browserOriginAllowed` is asked of it like any other.
+`docs/PERMISSION_MODE.md` §10 is the long form.
 
 Recommended early deployment:
 

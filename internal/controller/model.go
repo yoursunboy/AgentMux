@@ -122,6 +122,9 @@ type ProjectCard struct {
 	// Actions is how much is waiting.
 	Actions ActionsSummary `json:"actions"`
 
+	// Settings is how this project's next launch is configured.
+	Settings SettingsSummary `json:"settings"`
+
 	// UpdatedAt is when anything about this card last changed.
 	//
 	// It is the most recent of the project's own update, its agent state's and
@@ -195,6 +198,37 @@ type ActionsSummary struct {
 	// It counts the whole project rather than its most recent attempt: an
 	// action is a backlog, and a backlog is something a project has.
 	Pending int `json:"pending"`
+}
+
+// SettingsSummary is how a project's next launch is configured.
+//
+// It is a section like the three above it and is always present, so it is a
+// value rather than a pointer: every project has a permission mode, and the one
+// nobody chose is the default. What can be missing is the server's ability to
+// answer at all, and that is what Available reports.
+type SettingsSummary struct {
+	// Available reports whether the server can answer this at all, for the
+	// reason AgentSummary.Available gives.
+	//
+	// It is false when the build has no project settings store or the read
+	// failed. The mode is then empty rather than filled in with the default:
+	// showing the default here would be reporting a guess as a reading, on the
+	// one section whose whole job is to say what the next launch will do.
+	Available bool `json:"available"`
+
+	// PermissionMode is the value the project's next launch will pass to Claude
+	// as `--permission-mode`. It is one of the modes claude.PermissionModes
+	// names, and it is empty only when Available is false.
+	//
+	// # It describes the next launch, not the running agent
+	//
+	// Claude reads its permission mode once, from its own command line. An
+	// agent that is already running keeps the mode it started with, whatever
+	// this says - so a card showing `acceptEdits` is not claiming the agent on
+	// that card is accepting edits. Changing this reaches the project's next
+	// launch and nothing else, which is why the console says "Restart Agent to
+	// apply" rather than showing the change as though it had taken effect.
+	PermissionMode string `json:"permissionMode"`
 }
 
 // ActionItem is one action, with the project it belongs to named.

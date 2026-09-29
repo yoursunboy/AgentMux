@@ -21,19 +21,27 @@ import (
 // malformed request cannot create or register anything outside the roots the
 // user configured.
 type Service struct {
-	repo    Repository
-	host    host.Adapter
-	gitInit GitInitFunc
-	now     func() time.Time
-	newID   func() (string, error)
-	log     *slog.Logger
-	runtime RuntimeState
+	repo     Repository
+	settings SettingsRepository
+	host     host.Adapter
+	gitInit  GitInitFunc
+	now      func() time.Time
+	newID    func() (string, error)
+	log      *slog.Logger
+	runtime  RuntimeState
 }
 
-// Options configures a Service. Only Repository and Host are required.
+// Options configures a Service. Repository, Host and Settings are required.
 type Options struct {
 	Repository Repository
-	Host       host.Adapter
+
+	// Settings is where a project's launch configuration is stored. It is a
+	// separate repository from Repository because it is a separate table and a
+	// separate question: Repository is the registry of what exists, and this is
+	// what each of those things has been configured with.
+	Settings SettingsRepository
+
+	Host host.Adapter
 
 	// GitInit initialises Git for New Project. Nil means ExecGitInit.
 	GitInit GitInitFunc
@@ -61,14 +69,18 @@ func NewService(o Options) (*Service, error) {
 	if o.Host == nil {
 		return nil, errors.New("project: Host adapter is required")
 	}
+	if o.Settings == nil {
+		return nil, errors.New("project: Settings repository is required")
+	}
 	s := &Service{
-		repo:    o.Repository,
-		host:    o.Host,
-		gitInit: o.GitInit,
-		now:     o.Now,
-		newID:   o.NewID,
-		log:     o.Logger,
-		runtime: o.Runtime,
+		repo:     o.Repository,
+		settings: o.Settings,
+		host:     o.Host,
+		gitInit:  o.GitInit,
+		now:      o.Now,
+		newID:    o.NewID,
+		log:      o.Logger,
+		runtime:  o.Runtime,
 	}
 	if s.gitInit == nil {
 		s.gitInit = ExecGitInit

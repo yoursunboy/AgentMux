@@ -22,17 +22,18 @@ GET /api/projects/{id}/runtime          ┐
 GET /api/projects/{id}/tasks            │
 GET /api/projects/{id}/agent-states     │ once per project
 GET /api/projects/{id}/attention        │
-GET /api/projects/{id}/actions          ┘
+GET /api/projects/{id}/actions          │
+GET /api/projects/{id}/settings         ┘
 ```
 
 That is a client reimplementing a join — once per client, in whatever language it
 happens to be written in. A web console, an iPad app and a future mobile client
 would each write it again, and each would get the sorting subtly different.
 
-It is also **four requests per project**. A hundred projects is four hundred
+It is also **five requests per project**. A hundred projects is five hundred
 requests to draw one screen.
 
-The join belongs on the server, where it is five queries for any number of
+The join belongs on the server, where it is six queries for any number of
 projects.
 
 ### What it is not
@@ -87,6 +88,7 @@ an operator everything is still there for an operator.
         "reason": "permission requested"
       },
       "actions": { "available": true, "pending": 1 },
+      "settings": { "available": true, "permissionMode": "manual" },
       "updatedAt": "2026-09-21T09:00:12Z"
     }
   ],
@@ -130,7 +132,7 @@ the page includes settled rows. A caller that asked for ten rows still gets the
 true totals, which is what lets a console show a headline that does not change
 when somebody scrolls.
 
-### Three vocabularies, passed through
+### Four vocabularies, passed through
 
 Each section speaks the vocabulary of the layer it came from, and none is
 translated:
@@ -140,11 +142,34 @@ translated:
 | `runtime.status` | the project model's | `running`, `stopped`, `error`, … |
 | `agent.status` | the agent state projection's | `RUNNING`, `WAITING_PERMISSION`, `COMPLETED`, … |
 | `attention.level` | the attention projection's | `NONE`, `ACTION_REQUIRED`, `WARNING`, `INFO` |
+| `settings.permissionMode` | the CLI's own | `manual`, `acceptEdits`, `bypassPermissions` |
 
 Translating any of them would mean a second spelling of the same value, kept in
 step by hand. A client that already knows one endpoint's vocabulary should not
 have to learn this one's — and a client that sees `runtime.status` disagreeing
 with `GET /api/projects/{id}` would not know which to believe.
+
+### `settings` is a value, and why
+
+`settings` is an object rather than a nullable one, with `available` inside it
+rather than the section itself being `null` — the same shape `actions` has, and
+unlike `agent` and `attention`, which are `null` when a project simply has
+nothing in them. The reason is the same for both of the value-shaped sections: a
+count and a mode always exist, so there is no absence for a `nil` to carry.
+
+A project with no settings row is not a project with no setting. It is a project
+configured with the default, which is `manual` — what every launch did before
+this option existed. What can be missing is the *server's ability to answer*,
+and `available: false` is how it says that.
+
+**When it cannot answer, the mode is sent empty rather than filled in.** A card
+that showed `manual` because the read failed would be showing the default as
+though it were a reading, on the one section whose whole job is to say what the
+next launch will do. A client renders the empty string as "unknown" and must not
+substitute a default of its own.
+
+This is a **setting, not a state** — see §7 item 8, and
+`docs/PERMISSION_MODE.md` §4 for why the distinction is not pedantry.
 
 ### Null, and unavailable
 
@@ -176,6 +201,7 @@ things that must not leave the machine.
 | `agent` | the agent state projection | one query for every project |
 | `attention` | the attention projection | one query for every project |
 | `actions.pending` | the attention projection's action counts | one grouped query |
+| `settings.permissionMode` | the project's stored launch settings | one query for every project |
 | `queue` | the attention projection's pending counts by type | one grouped query |
 
 The runtime status is the project service's own derived field, which it computes
@@ -227,7 +253,7 @@ ones rather than flattening every card together.
 
 ## 5. Performance
 
-Five queries for any number of projects:
+Six queries for any number of projects:
 
 ```text
 projects.List                        one
@@ -235,17 +261,22 @@ agents.StatesForProjects             one
 attention.AttentionForProjects       one
 attention.PendingCountsForProjects   one
 attention.PendingCountsByType        one     the bar's two counts
+project.SettingsByProjects           one     the cards' permission modes
 ```
 
-The implementation this exists to avoid is a loop that asks each project four
+The last one is Phase 7.5.1. It is a section rather than a read per card for the
+same reason as the rest: a query per project is exactly the loop below.
+
+The implementation this exists to avoid is a loop that asks each project six
 questions. That is the N+1 §13 of the phase brief forbids, and it is what a
 client would have written for itself.
 
-A console with no projects asks almost nothing: the three projection reads are
-skipped rather than issued with an empty list, because a query for no rows is a
-query that cannot match anything. The queue count is not skipped, because "how
-much is waiting anywhere" is a question about the installation rather than about
-its projects, and an empty project list is not the same as an empty queue.
+A console with no projects asks almost nothing: the three projection reads and
+the settings read are skipped rather than issued with an empty list, because a
+query for no rows is a query that cannot match anything. The queue count is not
+skipped, because "how much is waiting anywhere" is a question about the
+installation rather than about its projects, and an empty project list is not the
+same as an empty queue.
 
 **There is no cache.** §14 allowed a short in-memory one and it is not here,
 because there is nothing yet to cache: the reads are local and bounded, and
@@ -293,7 +324,7 @@ by this phase.
 6. **The server block is not cached**, so a dashboard request runs the same
    assembly `GET /api/server` does — which includes a dependency check and a
    tmux probe. Both are cached by the layers that do them, but a console polling
-   every second is doing more work than the five queries above suggest.
+   every second is doing more work than the six queries above suggest.
 7. **`queue` counts a backlog that only partly drains.** `needsYou` rises and
    falls, because a permission request settles itself when the session moves on.
    `notices` rises and does not fall, because a failure or a completion action is
@@ -302,6 +333,13 @@ by this phase.
    a person can clear and one that records what has happened. Anyone tempted to
    make the second one go down should read `docs/ACTION_CENTER.md` §2 first: the
    fix is a resolution rule, which is a product decision rather than a bug.
+8. **`settings.permissionMode` is not the mode any agent is running under.** It
+   is what the *next* launch is configured with. Claude reads its mode once, from
+   its own command line, and no hook fires on a Shift+Tab, so nothing AgentMux
+   can observe reports what a running agent is doing. A card that drew this value
+   as the current mode would be drawing a configuration as though it were a
+   reading. `docs/PERMISSION_MODE.md` §4 is that distinction and §7 is why no
+   endpoint closes it.
 
 ## 8. Where this sits
 
@@ -314,4 +352,8 @@ by this phase.
   cards are mostly made of.
 - `docs/ACTION_CENTER.md` — the screen that reads the queue, and why the two
   counts above are shaped the way they are.
+- `docs/PERMISSION_MODE.md` — the `settings` section: what a permission mode is,
+  why a card reports the next launch's rather than any running agent's, and the
+  two endpoints that set it. They are on the project resource and **not** on this
+  one, which is §1's "not a new way to change anything" holding.
 - `docs/ARCHITECTURE.md` §3 — where the aggregation sits among the components.

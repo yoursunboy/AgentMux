@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,8 +146,8 @@ func TestMigrateCreatesTheExpectedTables(t *testing.T) {
 
 	want := []string{
 		"agent_actions", "agent_attention", "agent_events", "agent_sessions",
-		"agent_states", "project_runtime", "projects", "schema_migrations",
-		"settings", "tasks", "usage_events",
+		"agent_states", "project_runtime", "project_settings", "projects",
+		"schema_migrations", "settings", "tasks", "usage_events",
 	}
 	if strings.Join(tables, ",") != strings.Join(want, ",") {
 		t.Errorf("tables = %v, want %v", tables, want)
@@ -261,8 +262,11 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	if _, err := store.db.ExecContext(ctx, schemaMigrationsTable); err != nil {
 		t.Fatalf("creating schema_migrations failed: %v", err)
 	}
-	// Two versions back, so that the upgrade under test is the pair this phase
-	// added rather than one of them.
+	// Two versions back, so that the upgrade under test is a migration with
+	// another one after it rather than the last one alone. The list below is
+	// spelled out rather than derived from the version on purpose: a migration
+	// that stopped being applied would still leave the count right if this test
+	// asked the database what it expected.
 	target := latestVersion(t) - 2
 	for _, m := range all {
 		if m.Version > target {
@@ -323,7 +327,7 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrate returned an error: %v", err)
 	}
-	want := []string{"0008_agent_actions", "0009_usage_events"}
+	want := []string{"0009_usage_events", "0010_project_settings"}
 	if len(result.Applied) != len(want) {
 		t.Fatalf("Migrate applied %v; want %v", result.Applied, want)
 	}
@@ -372,6 +376,14 @@ func TestMigrateUpgradesAFullDatabaseWithoutDisturbingIt(t *testing.T) {
 	}
 	if actions != 0 {
 		t.Errorf("the upgrade left %d action(s); a schema change does not invent history", actions)
+	}
+
+	// And the project that was already here reads as unconfigured, which is
+	// §十's sixth case: an installation that predates this table keeps working,
+	// and the mode its next launch uses comes from the default rather than from
+	// a row the migration invented for it.
+	if _, err := store.ProjectSettings().GetSettings(ctx, projectID); !errors.Is(err, project.ErrSettingsNotFound) {
+		t.Errorf("GetSettings on an upgraded database returned %v, want project.ErrSettingsNotFound", err)
 	}
 }
 

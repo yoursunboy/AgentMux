@@ -29,6 +29,7 @@ As of version 0.7.5:
 | Phase 7.4B-2B — Controller lease and input | **Done** | A client can ask to own a terminal's input, be granted it, type at it, and give it back — one controller at a time, never preempted, expiring on its own when the holder goes away. The lease is in memory only and no keystroke is ever recorded. The console types and never reshapes the pty. See `docs/TERMINAL_CONTROLLER.md`. |
 | Phase 7.4C — Agent action centre | **Done** | `/actions` shows *which* action is waiting and `/actions/{id}` shows one, joined across projects by two new GET routes. Read-only by construction: no Allow, no Deny, no acknowledge, and a browser test asserting the detail page has no button. The attention projection is unchanged — still one writer, still no way to answer. Needs-you versus notices is a reading of the level, not a new state. See `docs/ACTION_CENTER.md`. |
 | Phase 7.5 — Linux server beta deployment | **Done** | Not a capability phase, and it adds no business functionality of any kind. A configuration file probed as YAML first, the systemd unit and installer under `deploy/linux/`, `GET /api/health`, a debug-only `GET /api/debug/runtime`, opt-in beta usage events, and a contract test that keeps the deployment files in agreement with the program. See below. |
+| Phase 7.5.1 — Claude permission mode | **Done** | The first beta-driven capability: a per-project setting for how much Claude asks before it acts, chosen from the console and passed at launch as `--permission-mode`. One table, two endpoints and one menu. It is a startup setting and not a runtime switch — nothing simulates Shift+Tab, nothing reads Claude's screen — and saving one restarts nothing. See below and `docs/PERMISSION_MODE.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -43,7 +44,9 @@ shows the agent's state and offers no button for it, which is a gap in the UI ra
 runtime. The provider still reports `integrated: false`, because Phase 8's provider switching is what
 that field describes. Nothing in the running product claims to do more than the table above. Phase 7.5
 changes none of that: it is the deployment the beta runs on rather than a capability, it adds no
-business functionality, and the version a running server now reports is `0.7.5`.
+business functionality, and the version a running server now reports is `0.7.5`. Phase 7.5.1 is the
+first row since 7.4C that does change what a person can do — a project's Claude permission mode is now
+a setting chosen on its card — and it deliberately does not bump that number either.
 
 One consequence of Phase 4 being done is worth stating where the phases are listed: the terminal is
 only as useful as what is inside it. The WSL Claude Code on the development host is installed but not
@@ -228,9 +231,11 @@ What was built:
   asked for, because the observed-running branch cleared the request that had been recorded. A
   declined interrupt is now reported as running-and-asked, with the reason.
 
-Interactivity is preserved: AgentMux adds no `--dangerously-skip-permissions`, no `--permission-mode`,
-no `--allowedTools`, no `--model` and no `-p`, and there is a test that asserts none of them appears in
-the rendered command. Claude asks the user, on a terminal the user owns.
+Interactivity is preserved: AgentMux adds no `--dangerously-skip-permissions`, no `--allowedTools`, no
+`--model` and no `-p`, and there is a test that asserts none of them appears in the rendered command.
+Claude asks the user, on a terminal the user owns. **Phase 7.5.1 added `--permission-mode`**, rendered
+from a closed set of three values stored per project — a decision about how often Claude asks, never
+an answer on anybody's behalf. See that phase below and `docs/PERMISSION_MODE.md`.
 
 Not built, deliberately: any WebSocket, any terminal view, a prompt bar, controller/viewer roles,
 Claude Hooks, Waiting/Completed state detection, and any CC Switch adapter. The exit code is
@@ -815,6 +820,47 @@ support it has is a browser at a narrow viewport. And no multi-user authenticati
 remains the network boundary `docs/SECURITY.md` describes, so a second person on the same network is
 not a user this program knows about. Every one of those is a later phase's subject or is not in this
 roadmap at all, and none of them is claimed here.
+
+## Phase 7.5.1 — Claude permission mode
+
+**Done.** The first capability in this roadmap that came from the beta rather than from a plan: on a
+tablet there is no Shift+Tab, so a project's permission mode could not be chosen from the console at
+all. This phase makes it a project setting.
+
+| Deliverable | What it is |
+| --- | --- |
+| The vocabulary | `internal/claude/permission.go`: three modes — `manual`, `acceptEdits`, `bypassPermissions` — as the CLI's own spellings, verified against Claude Code 2.1.280 on the beta host. A closed set, and a test that asserts it is exactly three. |
+| The store | `migrations/0010_project_settings.sql` and `internal/storage/projectsettings.go`. One row per project, four columns, no row until somebody chooses something. A table of its own rather than two columns on `projects`, because the registry is read by every listing and a setting is not. |
+| The service | `internal/project/settings.go`. The default is applied here, so "what does an unconfigured project launch under" has one answer in one place. The value is refused here, and this is the only check. |
+| The flag | `claude.LaunchCommand` renders `--permission-mode '<mode>'` beside `--session-id` and `--settings`. A launch with no mode renders the line it always did, and there is a test pinning the exact string. |
+| The API | `GET`/`PATCH /api/projects/{id}/settings`, both answering `{ "settings": { "permissionMode": "…" } }`. An illegal value is a `400 invalid_input` naming the vocabulary, with `details.field`. |
+| The console | `web/src/dashboard/PermissionMenu.tsx`, a `Permission` button on the card's title row opening a three-way menu. `GET /api/controller` carries the mode on every card as a `settings` section. |
+| The E2E | `web/e2e/suites/permission-mode.mjs`, which checks the save against a live runtime: the runtime's `startedAt` is unchanged, its state is unchanged, the tmux session is the same session, and the card says "Restart Agent to apply." |
+
+**It is a startup setting, and the boundary is the point.** §2 of the phase brief ruled out simulating
+Shift+Tab, parsing Claude's TUI, guessing the current mode, `statusLine` parsing, and hook extensions,
+and none of that is built. The reason is one sentence: **Shift+Tab is a cycle, not a stable state
+API.** A cycle has a position you can advance and no name you can set; every refusal above follows
+from that. The mode stored here is what the *next* launch is told, and the console says so rather than
+drawing the change as though it had taken effect.
+
+**Saving a mode restarts nothing.** A running agent may be in the middle of something, and killing its
+session because somebody changed a preference two rows up would be the console deciding the preference
+mattered more than the work. Any restart still goes the long way round — Dashboard → Controller API →
+Runtime Manager — and no path this phase added reaches a terminal at all.
+
+**The two controls on a card are named differently on purpose.** `Mode` sends Shift+Tab to the agent
+running now; `Permission` chooses what the next launch starts in. They are an input device and a
+setting, and a card that renamed one to match the other would be claiming they are the same thing.
+
+**The version is unchanged at 0.7.5.** By this file's own rule — see `internal/version/version.go` —
+the number is "the newest phase that changed the deployment story", and this one did not.
+
+**What it did not do.** No runtime switching, no answering of permission prompts, no hook extension,
+no `statusLine` read, and no global default: the mode is per project, which is precisely the decision
+that must not leak from the project somebody chose it for into the next one they register. The CLI's
+other three modes — `auto`, `dontAsk` and `plan` — are not offered, and offering one would be a
+product decision this build has not made.
 
 ## Phase 8 — CC Switch integration
 

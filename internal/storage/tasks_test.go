@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kutonlagos/agentmux/internal/event"
+	"github.com/kutonlagos/agentmux/internal/project"
 	"github.com/kutonlagos/agentmux/internal/session"
 	"github.com/kutonlagos/agentmux/internal/task"
 	"github.com/kutonlagos/agentmux/migrations"
@@ -1192,6 +1193,7 @@ func TestMigrateUpgradesAPhase71Database(t *testing.T) {
 	want := []string{
 		"0004_tasks", "0005_agent_sessions", "0006_agent_states",
 		"0007_agent_attention", "0008_agent_actions", "0009_usage_events",
+		"0010_project_settings",
 	}
 	if len(result.Applied) != len(want) {
 		t.Fatalf("Migrate applied %v, want %v", result.Applied, want)
@@ -1221,6 +1223,13 @@ func TestMigrateUpgradesAPhase71Database(t *testing.T) {
 	}
 	if _, err := store.Tasks().GetTask(ctx, tk.ID); err != nil {
 		t.Errorf("the upgraded database cannot read a task: %v", err)
+	}
+
+	// And the project that predates this table is unconfigured rather than
+	// configured to something the migration chose for it. A launch on this
+	// installation therefore passes the default mode, which is §十's sixth case.
+	if _, err := store.ProjectSettings().GetSettings(ctx, "p_0123456789abcdef0123"); !errors.Is(err, project.ErrSettingsNotFound) {
+		t.Errorf("GetSettings on a 7.1 database returned %v, want project.ErrSettingsNotFound", err)
 	}
 }
 

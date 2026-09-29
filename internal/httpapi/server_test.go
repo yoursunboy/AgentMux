@@ -242,6 +242,7 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 
 	service, err := project.NewService(project.Options{
 		Repository: store.Projects(),
+		Settings:   store.ProjectSettings(),
 		Host:       adapter,
 		Logger:     discardLogger(),
 	})
@@ -432,11 +433,12 @@ func newHarnessOpts(t *testing.T, o harnessOptions) *harness {
 	})
 
 	coordinator, err := agent.NewService(agent.Options{
-		Runtimes: manager,
-		Adapters: cliAdapters,
-		Sessions: tasks,
-		Settings: agent.NewFileSettings(dataDir),
-		Logger:   discardLogger(),
+		Runtimes:       manager,
+		Adapters:       cliAdapters,
+		Sessions:       tasks,
+		Settings:       agent.NewFileSettings(dataDir),
+		LaunchSettings: service,
+		Logger:         discardLogger(),
 	})
 	if err != nil {
 		t.Fatalf("agent.NewService returned an error: %v", err)

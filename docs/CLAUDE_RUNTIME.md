@@ -97,14 +97,28 @@ The command line is exactly one shell word: `claude.Quote(path)` wraps the resol
 quotes with the POSIX `'\''` escape. That matters because the command is *typed into a shell*, and
 every path under `/mnt/c` is one directory away from containing a space.
 
-**Nothing is added to it.** Measured on this machine, the command typed is:
+**The installation's command is the bare quoted path.** Measured on this machine, it is:
 
 ```text
 '/home/sunboy/.local/share/claude/versions/2.1.274'
 ```
 
-No `--dangerously-skip-permissions`, no `--permission-mode`, no `--allowedTools`, no `--model`, no
-`-p`. There is a test that asserts none of those appear in the rendered command
+A *launch* may add arguments to it, and since Phase 7.5 they are these three and nothing else, each
+quoted the same way:
+
+```text
+'…/claude' --session-id '<uuid>' --settings '<path>' --permission-mode '<mode>'
+```
+
+`--session-id` names the attempt's Claude session, `--settings` points at the per-project settings
+file the hook receiver is configured in (`docs/AGENT_EVENTS.md`), and `--permission-mode` carries how
+much Claude asks before it acts (`docs/PERMISSION_MODE.md`). A launch with none of them configured
+renders the installation's command and nothing more, which is what keeps the older behaviour the
+default rather than something that has to be asked for.
+
+**Approval flags are still never added.** No `--dangerously-skip-permissions`, no `--allowedTools`, no
+`--model`, no `-p`. There is a test that asserts none of those appear in the rendered command, and
+that a launch with no mode carries no `--permission-mode` either
 (`TestRealClaudeIsResolvedByTheProductionAdapter`). See §8.
 
 ### Why tmux `send-keys` rather than running the CLI as a child
@@ -259,16 +273,24 @@ a stale answer waiting to happen.
 
 **Claude Code's interactive permission model is preserved exactly as it is.**
 
-AgentMux does not add `--dangerously-skip-permissions`, or `--permission-mode`, or `--allowedTools`,
-or any equivalent auto-approval. It does not answer Claude's permission prompts, and it does not
-detect them by reading the screen. When Claude asks the user something, it is asking the user, on a
-terminal the user owns, and the answer is the user's to give.
+AgentMux does not add `--dangerously-skip-permissions`, or `--allowedTools`, or any equivalent
+auto-approval. It does not answer Claude's permission prompts, and it does not detect them by reading
+the screen. When Claude asks the user something, it is asking the user, on a terminal the user owns,
+and the answer is the user's to give.
 
 This is a product decision, not a limitation of the implementation. A mux that auto-approved its
 agents would be a mux that runs arbitrary commands on the user's machine on the user's behalf without
 the user. The web terminal built in Phase 4 is the interface for answering those prompts: the prompt
 is on the screen as Claude drew it, and the answer is keystrokes sent back through the same input path
 a keyboard uses. Nothing in that path inspects the prompt or replies to it.
+
+**Phase 7.5.1 added `--permission-mode`, and it is not an exception to the above.** The flag is
+rendered from a closed set of three values stored per project, and it is passed at launch: it decides
+*how often* Claude asks, and it never answers on anybody's behalf. Setting it changes nothing about an
+agent that is already running — Claude reads its mode once, from its own command line — which is why
+the console says "Restart Agent to apply" rather than showing the change as though it had taken
+effect. `docs/PERMISSION_MODE.md` is the long form, including why the console does not simulate
+Shift+Tab to apply one.
 
 The real-integration test `TestRealClaudeAnswersAPrompt` therefore asserts only that the agent is
 still running and that the terminal produced output; whether a file appeared is **logged**, not

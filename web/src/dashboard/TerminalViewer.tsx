@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 
 import { TerminalView } from '../components/TerminalView'
-import { useTerminalSession } from '../terminal/useTerminal'
+import type { TerminalSession } from '../terminal/useTerminal'
 import { TerminalControl } from './TerminalControl'
 
 /**
@@ -58,8 +58,18 @@ import { TerminalControl } from './TerminalControl'
  * have a hundred terminals in it.
  */
 export interface TerminalViewerProps {
-  /** The project whose terminal this is. */
-  projectID: string
+  /**
+   * The card's session, which the card owns.
+   *
+   * It used to be created here, and the card could not reach it - which was
+   * fine while the console could only watch. The mode switch ended that: a
+   * control in the card's Runtime row drives the same terminal this draws, and
+   * a second `useTerminalSession` would have been a second subscription to one
+   * project and a second claim on one lease. So the session moved up to
+   * `ProjectPanel` and this takes it, which is the shape the workspace's panel
+   * has had since Phase 6.
+   */
+  session: TerminalSession
 
   /**
    * Whether there is a terminal to watch.
@@ -78,18 +88,10 @@ export interface TerminalViewerProps {
 const DefaultTerminalFontSize = 11
 
 export function TerminalViewer({
-  projectID,
+  session,
   running,
   fontSize = DefaultTerminalFontSize,
 }: TerminalViewerProps) {
-  // The console types and never reshapes, and that is said here rather than left
-  // to the props below: `mayResize` on the terminal stops this browser from
-  // measuring itself, but a size can still reach the pty without being a resize
-  // at all - a subscribe carries one, and the server applies it for a client
-  // that holds the lease. Withholding it at the session is what makes the rule
-  // structural instead of a property of which branch happens to fire.
-  const session = useTerminalSession(projectID, running, { mayResize: false })
-
   // The same "wait a moment before saying it failed" that a spinner needs
   // everywhere: the first frames of a connection take a few milliseconds, and a
   // card that flashed "unable to connect" during them would be wrong more often

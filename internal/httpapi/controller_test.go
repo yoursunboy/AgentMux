@@ -268,7 +268,7 @@ func TestTheDashboardCarriesNothingItShouldNot(t *testing.T) {
 	}
 	allowed := map[string]bool{
 		"id": true, "name": true, "runtime": true, "agent": true,
-		"attention": true, "actions": true, "updatedAt": true,
+		"attention": true, "actions": true, "settings": true, "updatedAt": true,
 	}
 	for field := range raw.Projects[0] {
 		if !allowed[field] {

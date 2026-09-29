@@ -124,6 +124,14 @@ func (s *Store) Projects() *ProjectStore { return &ProjectStore{db: s.db} }
 // Settings returns the settings repository.
 func (s *Store) Settings() *SettingStore { return &SettingStore{db: s.db} }
 
+// ProjectSettings returns the per-project launch configuration.
+//
+// It is a separate repository from Settings above and not a scoped view of it.
+// That one holds what belongs to the installation - its identity - and this one
+// holds what belongs to each project, which is a different question with a
+// different key and its own table.
+func (s *Store) ProjectSettings() *ProjectSettingsStore { return &ProjectSettingsStore{db: s.db} }
+
 // Runtimes returns the runtime metadata store.
 func (s *Store) Runtimes() *RuntimeStore { return &RuntimeStore{db: s.db} }
 

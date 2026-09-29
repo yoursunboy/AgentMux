@@ -122,6 +122,22 @@ type AgentLaunch struct {
 	// and a runtime that knew would be a second place the agent's configuration
 	// format is written down.
 	SettingsPath string
+
+	// PermissionMode is how much the agent should be asked before it acts, in
+	// the agent's own vocabulary.
+	//
+	// Empty means the launch says nothing and the agent decides for itself,
+	// which is what every launch did before a project could be configured with
+	// one. Like the two fields above it is opaque here: this package hands it
+	// to the provider and never reads it, and which values exist is the
+	// provider's business rather than this one's.
+	//
+	// It is a string rather than the provider's own type for that reason. The
+	// runtime is not a place where the vocabulary of any particular agent is
+	// written down - the comment above says as much about the settings path -
+	// and a named type here would put one agent's set of modes into the
+	// package that hosts all of them.
+	PermissionMode string
 }
 
 // AgentProvider resolves the agent a runtime may host.

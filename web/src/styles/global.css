@@ -1464,8 +1464,23 @@ code {
   border-radius: var(--radius);
 }
 
+/* The title and the one setting that belongs to the whole project. The setting
+   is a row of the header rather than a field below it because that is what it
+   configures: not the attempt on screen, but every future launch. */
+.project-card__header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+/* `flex: 1` with `min-width: 0` is what makes the ellipsis above work inside a
+   flex row: without the zero floor the name refuses to shrink and pushes the
+   button off the card. */
 .project-card__name {
-  margin: 0 0 10px;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
   font-size: 14px;
   font-weight: 600;
@@ -1528,6 +1543,129 @@ code {
 .project-card__glyph {
   font-size: 11px;
   line-height: 1;
+}
+
+/* --- a permission menu --------------------------------------------------- */
+
+/* How much Claude asks before it acts, chosen on the card and applied by the
+   next launch. It is a menu rather than a three-way switch because the value is
+   a setting rather than a state, and it looks like `panel-menu` because it is
+   the same gesture: press a button, pick one of a few. */
+
+.permission-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.permission-menu__button {
+  padding: 3px 8px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* The list hangs from the button's right edge, so it stays inside a card at the
+   right-hand end of a row. */
+.permission-menu__list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 230px;
+  padding: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+
+.permission-menu__heading {
+  margin: 4px 6px 6px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.permission-menu__item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0 8px;
+  padding: 6px 8px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.permission-menu__item:hover {
+  background: var(--bg-sunken);
+}
+
+/* The mark spans both lines of the item, so ● sits beside the pair rather than
+   beside the first line only. It is aria-hidden: `aria-checked` is what says
+   which mode is in force. */
+.permission-menu__mark {
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.permission-menu__item--chosen .permission-menu__mark {
+  color: var(--accent);
+}
+
+.permission-menu__name {
+  grid-column: 2;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.permission-menu__item--chosen .permission-menu__name {
+  font-weight: 600;
+}
+
+.permission-menu__meaning {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* §8 of the phase brief's notice. It is positioned rather than in the flow: a
+   card that grew a line when a setting was saved would push its own terminal
+   down, and every card beside it in the row with it. */
+.permission-menu__status {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  z-index: 19;
+  width: max-content;
+  max-width: 260px;
+  margin: 0;
+  padding: 6px 9px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  background: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+
+/* An empty live region is a zero-height box that still draws a border, so it is
+   removed from the layout when there is nothing to say. */
+.permission-menu__status:empty {
+  display: none;
+}
+
+.permission-menu__status--failed {
+  color: var(--danger);
 }
 
 /* --- a status badge ------------------------------------------------------ */

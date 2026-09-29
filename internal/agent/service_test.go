@@ -283,6 +283,7 @@ func newHarness(t *testing.T, o Options) *harness {
 	}
 	projects, err := project.NewService(project.Options{
 		Repository: store.Projects(),
+		Settings:   store.ProjectSettings(),
 		Host:       adapter,
 		Logger:     discardLogger(),
 	})
@@ -335,6 +336,12 @@ func newHarness(t *testing.T, o Options) *harness {
 	}
 	if o.Settings == nil {
 		o.Settings = settings
+	}
+	// The real project service, so a launch reads its mode through the same
+	// path the server uses. A fake here would let every test in this file pass
+	// while the one read a launch makes of a project was wired to nothing.
+	if o.LaunchSettings == nil {
+		o.LaunchSettings = projects
 	}
 	if o.Logger == nil {
 		o.Logger = discardLogger()
@@ -728,12 +735,13 @@ func TestAFailedStartLeavesNothingBehind(t *testing.T) {
 			h.runtimes = tc.runtimes()
 
 			service, err := NewService(Options{
-				Runtimes: h.runtimes,
-				Adapters: h.adapters,
-				Sessions: h.sessions,
-				Settings: h.settings,
-				Logger:   discardLogger(),
-				Now:      fixedNow,
+				Runtimes:       h.runtimes,
+				Adapters:       h.adapters,
+				Sessions:       h.sessions,
+				Settings:       h.settings,
+				LaunchSettings: h.projects,
+				Logger:         discardLogger(),
+				Now:            fixedNow,
 			})
 			if err != nil {
 				t.Fatalf("NewService returned an error: %v", err)

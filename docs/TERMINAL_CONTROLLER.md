@@ -308,6 +308,7 @@ when it holds the lease, which is what it has always done.
 | `internal/terminal/multi_device_test.go` | two connections on one project, one controller, and a race between two askers |
 | `web/src/terminal/useTerminal.test.tsx` | the React seam: who may type, who may resize, what a client does when it is handed the keyboard, and a controller that holds the lease and still names no geometry |
 | `web/src/dashboard/TerminalViewer.test.tsx` | the console's card: no handler bound while a viewer, exactly one while the controller, the refusal sentence, the queue offered only to the holder, a release offered to a controller whose terminal ended |
+| `web/src/dashboard/ModeSwitch.test.tsx` | the card's Shift+Tab: the bytes it sends, the keystroke that waits for a lease it does not hold, the wait a refusal ends and the one a mere roster change does not, and the two ways it is not offered at all |
 | `web/e2e/suites/controller.mjs` | two real browser contexts on one terminal: the handover, the suspension and the resume, a restarted server |
 | `web/e2e/suites/controller-input.mjs` | typing into the console: the marker reaching the pty from the controller, the geometry not moving, the viewer refused, a forged frame refused by the server, and the handover |
 
@@ -317,7 +318,12 @@ Each is a later phase's subject rather than an omission, and §24 of the phase
 brief is where the list comes from:
 
 - **permission auto-approval** — nothing on a terminal approves anything;
-- **action execution** — a controller types; no button acts on the agent's behalf;
+- **action execution** — a controller types; no button acts on the agent's behalf.
+  The console's mode switch is the one control close enough to need saying so:
+  it sends the bytes Shift+Tab sends, under this same lease, and it is an input
+  device rather than an answer — a mode says how often the agent asks, and an
+  approval is what it is asking about. `docs/CONTROLLER_UI.md` §7 draws the line
+  and the card's button sits on the input side of it;
 - **push notifications** — nothing leaves the browser;
 - **CC Switch control** — no second control surface;
 - **a mobile app** — the console is the same page at a narrower width;

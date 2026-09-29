@@ -1,5 +1,8 @@
 import type { ProjectCard as ProjectCardData } from '../api/types'
 import { pendingSentence } from '../actions/actionStyle'
+import { useTerminalSession } from '../terminal/useTerminal'
+import { ModeSwitch } from './ModeSwitch'
+import { PermissionMenu } from './PermissionMenu'
 import { StatusBadge } from './StatusBadge'
 import { TerminalViewer } from './TerminalViewer'
 import { ACTIONS_PATH } from './route'
@@ -34,12 +37,30 @@ import { absentStyle, agentStyle, attentionStyle, runtimeStyle, unavailableStyle
  * The first is ordinary, the second is a deployment fact, and the third is
  * shown rather than hidden. Collapsing them into one blank would make a
  * dashboard that reports "fine" about a server it cannot read.
+ *
+ * # The two controls, and why they are named the way they are
+ *
+ * The title's `Permission` chooses how much the project's *next* Claude asks
+ * before it acts; the Runtime row's `Mode` sends Shift+Tab to the one running
+ * now. They are named differently because they do different things, and renaming
+ * either to match the other would make the card claim that a keystroke is a
+ * setting or that a setting takes effect the moment it is saved. See
+ * `PermissionMenu`, and `docs/PERMISSION_MODE.md` for the long form.
  */
 export interface ProjectPanelProps {
   card: ProjectCardData
+  /**
+   * Called after this card changes the project's launch settings, so the page
+   * can re-read the dashboard rather than let one card hold a newer truth than
+   * its neighbours.
+   *
+   * It is optional because a card renders without a page behind it - the unit
+   * tests mount one - and a card whose setting changed is still a correct card.
+   */
+  onSettingsChanged?: (() => void) | undefined
 }
 
-export function ProjectPanel({ card }: ProjectPanelProps) {
+export function ProjectPanel({ card, onSettingsChanged }: ProjectPanelProps) {
   const runtime = runtimeStyle(card.runtime.status)
 
   const agent = !card.agent
@@ -64,11 +85,35 @@ export function ProjectPanel({ card }: ProjectPanelProps) {
   // at the same time.
   const running = card.runtime.status === 'running'
 
+  // The card owns the session, and the screen below renders it. It is created
+  // here rather than inside `TerminalViewer` because the Runtime row's mode
+  // switch drives the same terminal, and two `useTerminalSession` calls would be
+  // two subscriptions to one project and two claims on one lease.
+  //
+  // `mayResize: false` is the console's rule rather than this card's: a browser
+  // watching a project from a tablet must not reflow the pty of whoever is
+  // working in the workspace, and it does not need to - a viewer's screen
+  // scrolls to reach what does not fit. `docs/TERMINAL_CONTROLLER.md` §7 is the
+  // long form.
+  const session = useTerminalSession(card.id, running, { mayResize: false })
+
   return (
     <article className="project-card" aria-label={card.name}>
-      <h3 className="project-card__name" title={card.id}>
-        {card.name}
-      </h3>
+      {/* The name and the one setting that belongs to the whole project. The
+          button sits here rather than in the fields below because that is what
+          it configures: not this attempt, not this session, but every future
+          launch of this project. */}
+      <div className="project-card__header">
+        <h3 className="project-card__name" title={card.id}>
+          {card.name}
+        </h3>
+        <PermissionMenu
+          projectId={card.id}
+          mode={card.settings.permissionMode}
+          available={card.settings.available}
+          onChanged={onSettingsChanged}
+        />
+      </div>
 
       {/* What the project is, above the screen: the two facts a person reads
           first, and the two the terminal below them is an answer to. */}
@@ -76,6 +121,10 @@ export function ProjectPanel({ card }: ProjectPanelProps) {
         <dt className="project-card__term">Runtime</dt>
         <dd className="project-card__value">
           <StatusBadge status={runtime} />
+          {/* The keyboard's Shift+Tab, for a tablet that has neither key. It is
+              drawn only when there is a terminal to send it to, so a stopped
+              card offers nothing rather than a button that cannot work. */}
+          {running && <ModeSwitch session={session} />}
         </dd>
 
         <dt className="project-card__term">Agent</dt>
@@ -90,7 +139,7 @@ export function ProjectPanel({ card }: ProjectPanelProps) {
           pixel height, and the reason is rows: a grid that stretched its cards
           to a number would be a grid that clipped one. */}
       <div className="project-card__screen">
-        <TerminalViewer projectID={card.id} running={running} />
+        <TerminalViewer session={session} running={running} />
       </div>
 
       {/* What it needs, below the screen - the reason somebody is looking at the

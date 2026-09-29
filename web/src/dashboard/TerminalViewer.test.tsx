@@ -2,6 +2,7 @@ import { act, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ControlReason } from '../terminal/protocol'
+import { useTerminalSession } from '../terminal/useTerminal'
 import { makeProjectCard } from '../test/controller'
 import { renderWithTerminal } from '../test/dashboard'
 import { CLIENT_ID, makeControlView, makeStatus, makeTerminalError } from '../test/terminal'
@@ -29,6 +30,25 @@ vi.mock('@xterm/addon-unicode11', async () => {
 
 const PROJECT = 'p_0123456789abcdef0123'
 
+/**
+ * Viewer is the terminal, supplied the way a card supplies it.
+ *
+ * `TerminalViewer` takes a session rather than making one, because the card
+ * owns it - the Runtime row's mode switch drives the same terminal, and two
+ * `useTerminalSession` calls would be two subscriptions and two claims on one
+ * lease. So a test about the viewer has to hand it a session, and this is that
+ * hand-off rather than a mock: the real hook, the real client double behind it,
+ * and the same `mayResize: false` the card passes.
+ *
+ * Which means this file still tests the wiring end to end - a subscribe really
+ * happens, `input` really is refused without the lease - and `ProjectPanel`'s
+ * own suite is where the card's half of it is asserted.
+ */
+function Viewer({ projectID = PROJECT, running }: { projectID?: string; running: boolean }) {
+  const session = useTerminalSession(projectID, running, { mayResize: false })
+  return <TerminalViewer session={session} running={running} />
+}
+
 describe('TerminalViewer', () => {
   beforeEach(() => {
     FakeTerminal.reset()
@@ -39,7 +59,7 @@ describe('TerminalViewer', () => {
   })
 
   it('says the runtime is stopped rather than showing a terminal', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running={false} />)
+    const { terminal } = renderWithTerminal(<Viewer running={false} />)
 
     expect(screen.getByText('Runtime stopped')).toBeInTheDocument()
     // Nothing is subscribed, because the server refuses a subscribe to a stopped
@@ -51,14 +71,14 @@ describe('TerminalViewer', () => {
   })
 
   it('subscribes to the project it is watching', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     expect(terminal.subscribes).toHaveLength(1)
     expect(terminal.subscribes[0]?.projectId).toBe(PROJECT)
   })
 
   it('shows what the server sends', async () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
     const screen = FakeTerminal.last
 
     // The snapshot first, then output: that is the order the server sends them,
@@ -76,14 +96,14 @@ describe('TerminalViewer', () => {
   // a socket. This is stronger than "typing does nothing" - it is "typing has
   // nothing to reach".
   it('binds no input handler to the terminal', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     expect(FakeTerminal.last.dataListenerCount).toBe(0)
     expect(terminal.current()?.input).not.toHaveBeenCalled()
   })
 
   it('sends nothing when a key is pressed at it anyway', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     // The terminal refuses the keystroke, and even if something bound a handler
     // the hook refuses input without the lease. Both, not either.
@@ -103,7 +123,7 @@ describe('TerminalViewer', () => {
   // take the keyboard away from whoever is working - one viewer, silently,
   // per project. Opening a terminal is not claiming it.
   it('asks for control only when it is asked to, never by opening', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     expect(terminal.current()?.requestControl).not.toHaveBeenCalled()
     expect(terminal.current()?.releaseControl).not.toHaveBeenCalled()
@@ -112,7 +132,7 @@ describe('TerminalViewer', () => {
   // And not merely before the roster arrives, either: a card that can see the
   // terminal is free still waits to be told.
   it('does not take a free terminal by being open on it', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(makeControlView()))
 
@@ -124,13 +144,13 @@ describe('TerminalViewer', () => {
   // refuses a viewer's resize, and this is the client agreeing with it rather
   // than asking and being refused.
   it('never asks the terminal to be resized', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     expect(terminal.current()?.resize).not.toHaveBeenCalled()
   })
 
   it('says it is connecting before the socket is open', () => {
-    renderWithTerminal(<TerminalViewer projectID={PROJECT} running />, {
+    renderWithTerminal(<Viewer running />, {
       status: makeStatus({ state: 'connecting' }),
     })
 
@@ -139,7 +159,7 @@ describe('TerminalViewer', () => {
 
   it('says the terminal is disconnected when the connection drops', async () => {
     vi.useFakeTimers()
-    renderWithTerminal(<TerminalViewer projectID={PROJECT} running />, {
+    renderWithTerminal(<Viewer running />, {
       status: makeStatus({ state: 'reconnecting' }),
     })
 
@@ -153,7 +173,7 @@ describe('TerminalViewer', () => {
   })
 
   it('says it cannot connect, and offers a retry', async () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />, {
+    const { terminal } = renderWithTerminal(<Viewer running />, {
       status: makeStatus({ state: 'failed', message: 'The server stopped answering.' }),
     })
 
@@ -165,7 +185,7 @@ describe('TerminalViewer', () => {
   })
 
   it('says there is no terminal when the server ends the subscription', async () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverEnded())
 
@@ -187,7 +207,7 @@ describe('TerminalViewer', () => {
   // (`components/ProjectPanel.test.tsx` pins the same case), and this is the
   // console agreeing with it rather than inventing a second answer.
   it('says a refusal without throwing away a terminal that is still live', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
     act(() => terminal.deliverSnapshot(new TextEncoder().encode('ready> ')))
 
     act(() =>
@@ -212,7 +232,7 @@ describe('TerminalViewer', () => {
   // it, is the Notice - because there the terminal is not being drawn and a
   // retry is the thing that helps.
   it('still says it cannot connect when the error arrives with no connection', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />, {
+    const { terminal } = renderWithTerminal(<Viewer running />, {
       status: makeStatus({ state: 'reconnecting' }),
     })
 
@@ -255,7 +275,7 @@ describe('TerminalViewer, holding the lease', () => {
   })
 
   it('says whose turn it is, and offers the one useful action for it', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(THEIRS))
     expect(screen.getByTestId('terminal-control')).toHaveTextContent(
@@ -269,7 +289,7 @@ describe('TerminalViewer, holding the lease', () => {
   })
 
   it('sends one request when the button is pressed, and nothing before it', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(THEIRS))
     expect(terminal.current()?.requestControl).not.toHaveBeenCalled()
@@ -284,7 +304,7 @@ describe('TerminalViewer, holding the lease', () => {
   // than "typing does nothing" is the stronger claim - a viewer has nothing for a
   // keystroke to reach, not a handler that declines it.
   it('binds an input handler for the controller and none for a viewer', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     expect(FakeTerminal.last.dataListenerCount).toBe(0)
 
@@ -303,7 +323,7 @@ describe('TerminalViewer, holding the lease', () => {
   })
 
   it('draws the touch keys with the lease and not without it', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(THEIRS))
     expect(screen.queryByRole('button', { name: 'Escape' })).toBeNull()
@@ -322,7 +342,7 @@ describe('TerminalViewer, holding the lease', () => {
   // one of the two places it otherwise would.
   it('takes the lease without ever naming a shape for the terminal', async () => {
     vi.useFakeTimers()
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     // The server sends the screen and its geometry together on subscribe, and
     // that geometry is the pty's. This card's box had nothing to do with it.
@@ -348,7 +368,7 @@ describe('TerminalViewer, holding the lease', () => {
   })
 
   it('says why a request was refused, since the roster will not', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     // A refusal leaves the project exactly as the roster already described it,
     // so this sentence is the only thing that can explain the button appearing
@@ -367,7 +387,7 @@ describe('TerminalViewer, holding the lease', () => {
 
   it('offers the queue to the client that can answer it, and to nobody else', () => {
     const asking = { clientId: 'c_1111111111111111', device: 'Safari on iPad' }
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     // A viewer is shown the same pending list in a roster it has no way to act
     // on, so it is not offered the buttons.
@@ -386,7 +406,7 @@ describe('TerminalViewer, holding the lease', () => {
   // client that is present, is not suspended, and will not expire. Without this
   // button the person who was typing has no way to stop being the controller.
   it('lets a controller whose terminal ended give the lease up', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(OURS))
     act(() => terminal.deliverEnded())
@@ -400,7 +420,7 @@ describe('TerminalViewer, holding the lease', () => {
   // nothing: a Release button for a client with no lease would be a button that
   // tells the server about a fact it already has.
   it('offers no such thing to a viewer whose terminal ended', () => {
-    const { terminal } = renderWithTerminal(<TerminalViewer projectID={PROJECT} running />)
+    const { terminal } = renderWithTerminal(<Viewer running />)
 
     act(() => terminal.deliverControl(THEIRS))
     act(() => terminal.deliverEnded())
@@ -420,8 +440,8 @@ describe('TerminalViewer, several at once', () => {
     const other = 'p_fedcba9876543210fedc'
     const { terminal } = renderWithTerminal(
       <>
-        <TerminalViewer projectID={PROJECT} running />
-        <TerminalViewer projectID={other} running />
+        <Viewer running />
+        <Viewer projectID={other} running />
       </>,
     )
 

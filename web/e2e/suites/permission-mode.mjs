@@ -9,6 +9,21 @@
  * the server, that the server holds what was chosen afterwards, and that
  * choosing did not disturb anything that was already running.
  *
+ * # What Phase 7.5.2 changed here
+ *
+ * The default became `bypassPermissions`, so the two checks that pinned the
+ * fixture to `manual` now pin it to `bypassPermissions` - and the last section
+ * was added, because the same phase made the control's touch behaviour part of
+ * the spec (§9: a 44px target, and a menu that works without a mouse). Nothing
+ * was rewritten: this is the same suite with its expectations brought up to date
+ * and one section longer, which is what the brief asked for.
+ *
+ * The restore at the end therefore puts the fixture back on `bypassPermissions`
+ * rather than on `manual`. The fixture was never *configured* - it has no
+ * settings row - so what the suite is restoring is the mode an unconfigured
+ * project reports, and a row holding the default is indistinguishable from no
+ * row through this API.
+ *
  * # Why the "did not restart" half is the one that had to be in a browser
  *
  * A menu that saved a preference and a menu that saved a preference *and then
@@ -34,7 +49,8 @@
  *
  * That the mode reaches Claude's command line. That is a claim about a process
  * rather than a screen, it needs a real launch, and it belongs where the launch
- * is built - `internal/claude/permission_test.go` renders the line and
+ * is built - `internal/claude/permission_test.go` renders the line,
+ * `internal/agent/service_test.go` checks the mode reaches the launch, and
  * `cmd/server/claude_e2e_test.go` builds the spec the runtime would run. What
  * this file adds is that a person pressing a button produces the setting those
  * tests are given.
@@ -190,7 +206,7 @@ async function main() {
     const startMode = await serverMode(page)
     report.check(
       'a project nobody has configured is on the default mode',
-      startMode === 'manual',
+      startMode === 'bypassPermissions',
       `the server holds ${JSON.stringify(startMode)}`,
     )
 
@@ -221,7 +237,7 @@ async function main() {
     const marked = await markedMode(page)
     report.check(
       'and it marks the one that is in force',
-      marked === 'manual',
+      marked === 'bypassPermissions',
       `marked ${JSON.stringify(marked)}`,
     )
 
@@ -284,17 +300,111 @@ async function main() {
 
     // --- and it can be put back ---------------------------------------------
 
-    await choose(page, 'manual')
-    const restored = await waitFor(async () => (await serverMode(page)) === 'manual', 10000)
+    // Put back on the default. The fixture was never configured, so this writes
+    // the first row it has ever had; a row that holds the default is the same
+    // thing as no row as far as every read in this API is concerned, which is
+    // what makes this a restore rather than a change.
+    await choose(page, 'bypassPermissions')
+    const restored = await waitFor(async () => (await serverMode(page)) === 'bypassPermissions', 10000)
     report.check(
       'the fixture is left on the mode it started with, for the suites after this one',
       restored,
       `the settings endpoint answers ${JSON.stringify(await serverMode(page))}`,
     )
 
+    // --- the iPad -----------------------------------------------------------
+
+    /*
+     * §9 of the phase brief, checked the only way a CSS rule can be: in a
+     * browser, on a device the page believes is a touch device.
+     *
+     * The media query is confirmed before anything is measured. `@media
+     * (pointer: coarse)` is what the 44px rule is written under, and Chrome
+     * decides that from the emulation rather than from `hasTouch` alone - so a
+     * suite that skipped this line could measure a fine pointer, find the rule
+     * did not apply, and report a failure about the CSS when the fault was the
+     * emulation.
+     *
+     * The three items are measured as well as the button, because they are what
+     * a thumb actually picks. A menu whose entries are smaller than the control
+     * that opened it has moved the hard part down a level.
+     */
+    const ipad = await openPage(browser, {
+      viewport: { width: 820, height: 1180 },
+      deviceScaleFactor: 2,
+      isMobile: true,
+      hasTouch: true,
+    })
+    const touch = ipad.page
+    await touch.goto(CONSOLE_URL, { waitUntil: 'domcontentloaded' })
+    const drawnOnIPad = await waitFor(async () => (await card(touch).count()) > 0, 15000)
+    report.check(
+      'the console draws the card on a tablet, so the control can be reached at all',
+      drawnOnIPad,
+      drawnOnIPad ? 'the card is there at 820x1180' : 'no card on the iPad viewport',
+    )
+
+    const coarse = await touch.evaluate(() => matchMedia('(pointer: coarse)').matches)
+    report.check(
+      'the emulation is a touch device as far as the page is concerned',
+      coarse,
+      `pointer: coarse -> ${coarse}`,
+    )
+
+    const buttonBox = await button(touch).boundingBox()
+    report.check(
+      'the Permission button is at least 44px tall for a thumb',
+      (buttonBox?.height ?? 0) >= 44,
+      `${buttonBox?.height ?? 0}px tall`,
+    )
+
+    await button(touch).tap()
+    await waitFor(async () => (await menu(touch).count()) === 1, 5000)
+
+    const itemBoxes = await touch.evaluate((name) => {
+      const found = document.querySelector(`.project-card[aria-label="${name}"]`)
+      return Array.from(found?.querySelectorAll('.permission-menu__item') ?? []).map((item) => ({
+        name: item.querySelector('.permission-menu__name')?.textContent?.trim() ?? '',
+        height: item.getBoundingClientRect().height,
+      }))
+    }, ALPHA.name)
+    report.check(
+      'and so is every mode inside it, so the hard part is not one level down',
+      itemBoxes.length === 3 && itemBoxes.every((item) => item.height >= 44),
+      itemBoxes.map((item) => `${item.name} ${Math.round(item.height)}px`).join(', '),
+    )
+
+    // Tapping through a real round trip rather than only measuring: a target of
+    // the right size that nothing can be done with is still a target nobody can
+    // use. This changes the mode and changes it back, so the fixture is left
+    // where the section above left it.
+    await card(touch)
+      .getByRole('menuitemradio', { name: /^acceptEdits/ })
+      .tap()
+    const tapped = await waitFor(async () => (await serverMode(touch)) === 'acceptEdits', 10000)
+    report.check(
+      'a tap chooses a mode, with no mouse involved',
+      tapped,
+      `the settings endpoint answers ${JSON.stringify(await serverMode(touch))}`,
+    )
+
+    await button(touch).tap()
+    await waitFor(async () => (await menu(touch).count()) === 1, 5000)
+    await card(touch)
+      .getByRole('menuitemradio', { name: /^bypassPermissions/ })
+      .tap()
+    const putBack = await waitFor(async () => (await serverMode(touch)) === 'bypassPermissions', 10000)
+    report.check(
+      'and the fixture is left on the default once more after the iPad section',
+      putBack,
+      `the settings endpoint answers ${JSON.stringify(await serverMode(touch))}`,
+    )
+
+    await ipad.context.close()
+
     // --- nothing threw ------------------------------------------------------
 
-    const crashes = errors.filter((text) => text.startsWith('pageerror:'))
+    const crashes = [...errors, ...ipad.errors].filter((text) => text.startsWith('pageerror:'))
     report.check(
       'no page threw while the menu was used',
       crashes.length === 0,

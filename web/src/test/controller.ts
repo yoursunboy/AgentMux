@@ -46,10 +46,11 @@ export function makeProjectCard(overrides: Partial<ProjectCard> = {}): ProjectCa
     },
     attention: { available: true, level: 'NONE', reason: 'agent started' },
     actions: { available: true, pending: 0 },
-    // The default is the one nobody chose, which is what a project has before
-    // anybody opens the menu. It is not a stand-in for "unknown": a test that
-    // wants the server unable to answer says `available: false`.
-    settings: { available: true, permissionMode: 'manual' },
+    // The mode a project nobody has configured is on - the server's default,
+    // which is what a project has before anybody opens the menu. It is not a
+    // stand-in for "unknown": a test that wants the server unable to answer
+    // says `available: false`.
+    settings: { available: true, permissionMode: 'bypassPermissions' },
     updatedAt: '2026-09-21T09:00:12Z',
     ...overrides,
   }
@@ -87,21 +88,22 @@ export const PERMISSION_MODES: readonly PermissionMode[] = [
 
 /** One project's launch settings, from GET /api/projects/{id}/settings. */
 export function makeProjectSettings(overrides: Partial<ProjectSettings> = {}): ProjectSettings {
-  return { permissionMode: 'manual', ...overrides }
+  return { permissionMode: 'bypassPermissions', ...overrides }
 }
 
 /**
  * The `settings` section of a card.
  *
- * `available: true` with `manual` is the state a project is in before anybody
- * has opened the menu, which is what most tests want. A test about the server
- * being unable to answer passes `available: false`, and should then expect no
- * mode rather than a defaulted one.
+ * `available: true` with the default mode is the state a project is in before
+ * anybody has opened the menu, which is what most tests want. A test about the
+ * server being unable to answer passes `available: false`, and should then
+ * expect no mode rather than a defaulted one - the default is a mode the server
+ * reports, not one a client fills in.
  */
 export function makeCardSettings(
   overrides: Partial<ProjectCard['settings']> = {},
 ): ProjectCard['settings'] {
-  return { available: true, permissionMode: 'manual', ...overrides }
+  return { available: true, permissionMode: 'bypassPermissions', ...overrides }
 }
 
 /**

@@ -34,8 +34,11 @@ import { describeError } from '../lib/format'
  * The mode shown is the server's, from the card's `settings` section, and it is
  * what the *next* launch will get. When the server cannot answer, the section
  * is unavailable and this renders a disabled control with the reason as its
- * tooltip - rather than defaulting to `manual`, which would be this component
- * inventing the one fact it is here to report.
+ * tooltip - rather than filling in the default, which would be this component
+ * inventing the one fact it is here to report. The server does have a default
+ * (`bypassPermissions`, for a project nobody has configured), and the card
+ * still does not guess it: a card that showed a mode the server had not
+ * confirmed would be right until the day the default changed.
  *
  * # Why the menu marks a choice rather than toggling one
  *

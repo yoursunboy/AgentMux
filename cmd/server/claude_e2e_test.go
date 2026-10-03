@@ -29,11 +29,15 @@ package main
 //
 //     --permission-mode is not in that list, and its absence is deliberate. Since
 //     Phase 7.5.1 a launch passes the mode its project is configured with, so
-//     the flag is part of the product rather than a way round it - and the mode
-//     the tests use is whatever the project's settings say, which is `manual`
-//     until somebody chooses otherwise. What no test does is *choose*
-//     bypassPermissions to make an agent get on with it; that is a decision for
-//     a person, and docs/PERMISSION_MODE.md §4 is why.
+//     the flag is part of the product rather than a way round it - and since
+//     Phase 7.5.2 the mode an unconfigured project gets is `bypassPermissions`,
+//     which means these tests launch an agent that does not stop to ask. That is
+//     the product's default doing it, not a test reaching round the product: no
+//     test here writes a permission-mode setting, and the assertion that the
+//     forbidden flags are absent is still made against the command line the
+//     product builds. A test that *set* bypassPermissions to make an agent get
+//     on with it would be a different thing, and docs/PERMISSION_MODE.md §4 is
+//     why nothing does.
 //   - They never pass --model. The CLI's own configuration decides which model
 //     it uses, and AgentMux has no opinion.
 //   - They never decide anything from the terminal's text. A start is confirmed
@@ -755,8 +759,8 @@ func TestRealClaudeIsResolvedByTheProductionAdapter(t *testing.T) {
 	// user's behalf or override the model the CLI would otherwise choose.
 	//
 	// --permission-mode is not here. Since Phase 7.5.1 it is a flag this product
-	// passes, carrying the mode the project is configured with; the assertion
-	// below is that an unconfigured launch does not pass it at all.
+	// passes, carrying the mode the project is configured with; what the
+	// assertion below covers is the launch that carries no mode at all.
 	for _, forbidden := range []string{
 		"--dangerously-skip-permissions",
 		"--allowedTools",

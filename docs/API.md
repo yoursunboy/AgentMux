@@ -533,6 +533,11 @@ Both answer with the same shape:
 CLI's own spellings, and the whole of what this build offers. The set is closed:
 the server refuses a string outside it rather than passing it on.
 
+**A project nobody has configured is on `bypassPermissions`.** That is AgentMux's
+own default rather than the CLI's, and it is a default rather than a policy: the
+other two are still offered, and a project that has chosen one keeps it.
+`docs/PERMISSION_MODE.md` §5 is where the decision is argued.
+
 **This is a setting and not a state.** It is what the project's *next* launch
 will be told, at the moment the command line is typed. Claude reads its
 permission mode once, from that command line, so a mode stored here while an
@@ -547,10 +552,10 @@ file: no process, no filesystem, no terminal, no keystroke.
 ### GET /api/projects/{id}/settings
 
 ```json
-{ "settings": { "permissionMode": "manual" } }
+{ "settings": { "permissionMode": "bypassPermissions" } }
 ```
 
-A project that exists and has never been configured is answered with `manual`
+A project that exists and has never been configured is answered with the default
 rather than with a `404` or an empty object. Those are three different facts: the
 first says the project launches under the default, the second would say it has no
 settings at all, and a client that had to tell them apart would be a client that
@@ -575,7 +580,7 @@ It answers with what is now stored, in the same shape as the read.
 | `project_not_found` | 404 | No project with that identifier |
 
 **There is no mode that means "unset".** Every project has one, and a project
-nobody has configured has `manual`. A request asking to clear the field is asking
+nobody has configured has `bypassPermissions`. A request asking to clear the field is asking
 for something this resource cannot express, and a `400` says so rather than
 storing the absence as a value.
 
@@ -1517,8 +1522,8 @@ projection's, and `settings.permissionMode` is the CLI's own.
 `settings` is the newest section. It is an object rather than a nullable one, like `actions` and
 unlike `agent` and `attention`, because a project with no settings row is a project configured with
 the default rather than a project with nothing there. `available: false` means the server could not
-read it, and in that case `permissionMode` is empty rather than filled in with `manual` — a card that
-showed the default as a reading would be showing a guess as the one thing that section is for. It
+read it, and in that case `permissionMode` is empty rather than filled in with the default — a card
+that showed the default as a reading would be showing a guess as the one thing that section is for. It
 reports what the next launch is configured with, never what a running agent is doing.
 
 **Null and unavailable are different** and the response distinguishes them:

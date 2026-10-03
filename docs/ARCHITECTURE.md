@@ -839,9 +839,16 @@ Two of its decisions are the ones `usage_events` made one phase earlier. `permis
 with no `CHECK`, because the vocabulary lives in `internal/claude` and a constraint here would be a
 second copy of it that could drift; it is enforced where the row is written. And **no row is the
 default**: a project nobody has configured has no row, reading does not create one, and the absence
-*is* `manual` rather than something filled in with it. That is what makes the migration additive — an
-upgraded database ends up with an empty table and every project on the behaviour it already had — and
-`internal/storage/tasks_test.go` asserts the upgrade, absence included.
+*is* `bypassPermissions` rather than something filled in with it. That is what makes the migration
+additive — an upgraded database ends up with an empty table — and `internal/storage/tasks_test.go`
+asserts the upgrade, absence included.
+
+It is also what made Phase 7.5.2's change of that default safe. Nothing stores it, so lowering it from
+`manual` to `bypassPermissions` moved every project with no row and reached no project that had one:
+a project that had chosen a mode is read from its row, and a project that had not is answered from a
+constant. Had the default been written into rows, changing it would have been a data migration that
+overwrote choices people had made — `internal/project/settings_test.go` pins the property for every
+mode in the vocabulary.
 
 What the table deliberately has no column for is the mode any agent is *running* under. That is not an
 omission to be fixed later; it is the same fact §1 states about the launch, written as a schema. There

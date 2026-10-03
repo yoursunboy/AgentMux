@@ -84,9 +84,10 @@ type updateProjectSettingsRequest struct {
 	// It is an optionalString rather than a plain string even though it is the
 	// only field, so that "not sent" and "sent as null" are told apart. There
 	// is no mode that means "unset": every project has one, and a project that
-	// has never been configured has `manual`. A request asking to clear the
-	// field is therefore asking for something this resource cannot express, and
-	// saying so is a better answer than storing the absence as a value.
+	// has never been configured has `bypassPermissions`. A request asking to
+	// clear the field is therefore asking for something this resource cannot
+	// express, and saying so is a better answer than storing the absence as a
+	// value.
 	PermissionMode optionalString `json:"permissionMode"`
 }
 

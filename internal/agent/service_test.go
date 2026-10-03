@@ -545,8 +545,59 @@ func TestTheLaunchCarriesTheSessionIdAndTheSettingsPath(t *testing.T) {
 	if launch.SessionID == "" {
 		t.Error("the launch carried no session id, so nothing Claude reports can be attributed")
 	}
-	if launch.SettingsPath != launch.SettingsPath || launch.SettingsPath == "" {
+	if launch.SettingsPath == "" {
 		t.Error("the launch carried no settings path, so no hook would ever be delivered")
+	}
+}
+
+// TestTheLaunchCarriesTheProjectPermissionMode is §十六's fifth case, and it is
+// here because it is the one join nothing else covers.
+//
+// The default is decided in internal/project and rendered into an argument in
+// internal/claude; each of those has its own test. What neither has is the step
+// between them - this service reading a project's settings and putting the mode
+// on the launch - and a step that dropped it would leave both those tests
+// passing while every agent in the build started in the CLI's own default.
+//
+// The unconfigured row is the case that matters, and it is a row that does not
+// exist: nothing is written for it, so the value can only have come from the
+// service answering for a project nobody has configured. The other three are
+// here to show the same path does not overwrite a choice.
+func TestTheLaunchCarriesTheProjectPermissionMode(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// configured is what somebody chose, or "" for a project nobody has.
+		configured claude.PermissionMode
+		want       claude.PermissionMode
+	}{
+		{"nobody has configured it", "", claude.PermissionBypass},
+		{"configured to ask", claude.PermissionManual, claude.PermissionManual},
+		{"configured to accept edits", claude.PermissionAcceptEdits, claude.PermissionAcceptEdits},
+		{"configured to bypass", claude.PermissionBypass, claude.PermissionBypass},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{})
+			p := h.registerProject("checkout-service")
+			if tc.configured != "" {
+				if _, err := h.projects.SetPermissionMode(context.Background(), p.ID,
+					tc.configured); err != nil {
+					t.Fatalf("SetPermissionMode returned an error: %v", err)
+				}
+			}
+			tk := h.createTask(p.ID, "Fix the viewer")
+
+			if _, err := h.service.Start(context.Background(), startInput(p, tk)); err != nil {
+				t.Fatalf("Start returned an error: %v", err)
+			}
+			launch, ok := h.runtimes.lastLaunch()
+			if !ok {
+				t.Fatal("the runtime was never asked to launch anything")
+			}
+			if launch.PermissionMode != string(tc.want) {
+				t.Errorf("the launch carried permission mode %q, want %q",
+					launch.PermissionMode, tc.want)
+			}
+		})
 	}
 }
 

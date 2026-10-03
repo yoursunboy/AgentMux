@@ -21,9 +21,10 @@ type PermissionMode string
 const (
 	// PermissionManual is Claude's ordinary behaviour: it asks before it acts.
 	//
-	// It is the CLI's own name for that, and it is the default this setting
-	// takes. A project nobody has configured launches under it, which is what
-	// every project launched under before this option existed.
+	// It is the CLI's own name for that, and it is what Claude does when nothing
+	// says otherwise. It is offered rather than assumed: a person who wants to
+	// be asked chooses it, and AgentMux's own default is not this one -
+	// see internal/project.DefaultPermissionMode for that decision and why.
 	PermissionManual PermissionMode = "manual"
 
 	// PermissionAcceptEdits lets Claude change files without asking, and keeps
@@ -37,11 +38,11 @@ const (
 
 	// PermissionBypass lets Claude act without asking at all.
 	//
-	// It is offered because a person may genuinely want it for a project they
-	// own - and it is the reason this setting is stored per project rather than
-	// once for the installation. It is precisely the decision that must not
-	// leak from the project somebody chose it for into the next one they
-	// register.
+	// It is the mode a project nobody has configured launches under, which is
+	// AgentMux's own decision rather than the CLI's - internal/project's
+	// DefaultPermissionMode is where it is made and argued. It is a default and
+	// not a policy: the other two are still offered, and a project that has
+	// chosen one keeps it.
 	PermissionBypass PermissionMode = "bypassPermissions"
 )
 

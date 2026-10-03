@@ -20,11 +20,24 @@ var ErrSettingsNotFound = errors.New("project settings not found")
 // DefaultPermissionMode is the mode a project launches under until somebody
 // configures it.
 //
-// It is `manual` because that is what Claude does when nothing says otherwise,
-// which makes the default here the same thing as the absence of this feature.
-// A project that has never been configured is not a project that has been
-// configured to ask.
-const DefaultPermissionMode = claude.PermissionManual
+// It is `bypassPermissions`, and that is a product decision rather than the
+// CLI's own default. Claude asks before it acts unless told otherwise, which is
+// the right answer for a person typing at a terminal and the wrong one for a
+// workbench whose whole purpose is to run agents while nobody is watching: a
+// session that stops on a prompt at midnight has done nothing by morning.
+//
+// # Why it is a constant here and not a field anywhere
+//
+// Nothing stores this. A project has a settings row only once somebody has
+// chosen a mode, so changing this value changes what every *unconfigured*
+// project launches under and reaches no project that has a row - which is what
+// makes it a safe thing to change and the reason the table is shaped this way.
+// docs/PERMISSION_MODE.md §5 is the long form.
+//
+// `manual` and `acceptEdits` remain offered. They are what a person who wants
+// to be asked chooses, and this default is not a claim that asking is wrong -
+// it is which of the three a project nobody has decided about gets.
+const DefaultPermissionMode = claude.PermissionBypass
 
 // Settings is one project's launch configuration.
 //

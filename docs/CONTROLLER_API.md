@@ -158,15 +158,16 @@ nothing in them. The reason is the same for both of the value-shaped sections: a
 count and a mode always exist, so there is no absence for a `nil` to carry.
 
 A project with no settings row is not a project with no setting. It is a project
-configured with the default, which is `manual` — what every launch did before
-this option existed. What can be missing is the *server's ability to answer*,
-and `available: false` is how it says that.
+configured with the default, which is `bypassPermissions` — a product decision
+rather than the CLI's own, argued in `docs/PERMISSION_MODE.md` §5. What can be
+missing is the *server's ability to answer*, and `available: false` is how it says
+that.
 
 **When it cannot answer, the mode is sent empty rather than filled in.** A card
-that showed `manual` because the read failed would be showing the default as
-though it were a reading, on the one section whose whole job is to say what the
-next launch will do. A client renders the empty string as "unknown" and must not
-substitute a default of its own.
+that showed `bypassPermissions` because the read failed would be showing the
+default as though it were a reading, on the one section whose whole job is to say
+what the next launch will do. A client renders the empty string as "unknown" and
+must not substitute a default of its own.
 
 This is a **setting, not a state** — see §7 item 8, and
 `docs/PERMISSION_MODE.md` §4 for why the distinction is not pedantry.

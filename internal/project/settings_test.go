@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kutonlagos/agentmux/internal/claude"
 )
@@ -116,12 +117,12 @@ func (h *harness) register(t *testing.T, name string) string {
 // 1. The default
 // ---------------------------------------------------------------------------
 
-// TestAProjectNobodyConfiguredLaunchesManual pins §四's default.
+// TestAProjectNobodyConfiguredLaunchesBypass pins §二's default.
 //
 // It is checked by reading rather than by reading the constant, because the
 // constant being right and the read path returning it are two different facts -
 // and it is the second one a launch depends on.
-func TestAProjectNobodyConfiguredLaunchesManual(t *testing.T) {
+func TestAProjectNobodyConfiguredLaunchesBypass(t *testing.T) {
 	h := newSettingsHarness(t)
 	id := h.register(t, "checkout-service")
 
@@ -129,8 +130,8 @@ func TestAProjectNobodyConfiguredLaunchesManual(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Settings returned an error: %v", err)
 	}
-	if settings.PermissionMode != claude.PermissionManual {
-		t.Errorf("permission mode = %q, want %q", settings.PermissionMode, claude.PermissionManual)
+	if settings.PermissionMode != claude.PermissionBypass {
+		t.Errorf("permission mode = %q, want %q", settings.PermissionMode, claude.PermissionBypass)
 	}
 	if settings.ProjectID != id {
 		t.Errorf("project id = %q, want %q", settings.ProjectID, id)
@@ -138,9 +139,60 @@ func TestAProjectNobodyConfiguredLaunchesManual(t *testing.T) {
 
 	// Reading is not configuring. A project nobody has chosen a mode for must
 	// not acquire a row just by being looked at, or the table would fill with
-	// rows that record no decision.
+	// rows that record no decision - and it is the absence of a row that makes
+	// the default changeable at all.
 	if h.settings.writes != 0 {
 		t.Errorf("%d writes after a read; a read must not configure anything", h.settings.writes)
+	}
+}
+
+// TestTheDefaultIsTheOnlyThingThatChanged covers §四 and §十六's cases 2 to 4.
+//
+// The phase lowered the default from `manual` to `bypassPermissions`, and the
+// claim that makes that safe is that it reaches *only* projects with no row. So
+// each project here is given a row the way one written before this phase would
+// have been - straight into the store, without going through SetPermissionMode,
+// which is the writer the console uses - and is then read back through the
+// service a launch uses.
+//
+// A test that saved through SetPermissionMode would be testing the writer. The
+// question here is about the reader, and specifically that it prefers a stored
+// row to the default.
+func TestTheDefaultIsTheOnlyThingThatChanged(t *testing.T) {
+	for _, mode := range claude.PermissionModes() {
+		t.Run(string(mode), func(t *testing.T) {
+			h := newSettingsHarness(t)
+			id := h.register(t, "checkout-service")
+
+			// The row an earlier build would have left behind. `manual` is the
+			// one that matters: it was the old default, so it is both the value
+			// most rows hold and the value this phase stopped handing out.
+			h.settings.byID[id] = Settings{
+				ProjectID:      id,
+				PermissionMode: mode,
+				CreatedAt:      time.Now().Add(-time.Hour).UTC(),
+				UpdatedAt:      time.Now().Add(-time.Hour).UTC(),
+			}
+
+			got, err := h.service.Settings(context.Background(), id)
+			if err != nil {
+				t.Fatalf("Settings returned an error: %v", err)
+			}
+			if got.PermissionMode != mode {
+				t.Errorf("permission mode = %q, want the stored %q", got.PermissionMode, mode)
+			}
+
+			// And the same answer on the read the console makes, which folds the
+			// default in for every project at once. The two paths must not
+			// disagree about which projects the default applies to.
+			modes, err := h.service.PermissionModesForProjects(context.Background(), []string{id})
+			if err != nil {
+				t.Fatalf("PermissionModesForProjects returned an error: %v", err)
+			}
+			if modes[id] != mode {
+				t.Errorf("the console reads %q, want the stored %q", modes[id], mode)
+			}
+		})
 	}
 }
 
@@ -333,9 +385,9 @@ func TestPermissionModesForProjectsAnswersForEveryProject(t *testing.T) {
 	}
 	want := map[string]claude.PermissionMode{
 		configured:          claude.PermissionAcceptEdits,
-		untouched:           claude.PermissionManual,
+		untouched:           claude.PermissionBypass,
 		alsoConfigured:      claude.PermissionBypass,
-		"prj_not_a_project": claude.PermissionManual,
+		"prj_not_a_project": claude.PermissionBypass,
 	}
 	if len(modes) != len(want) {
 		t.Fatalf("%d entries; want %d - every id asked about must be answered", len(modes), len(want))

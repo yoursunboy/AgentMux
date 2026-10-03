@@ -428,6 +428,10 @@ export interface AttentionSummary {
  * union of three rather than `string` so that a fourth would be a compile error
  * at every place that switches on it.
  *
+ * A project nobody has configured is on `bypassPermissions`, and the server
+ * says so - it is a value the API reports rather than an absence a client fills
+ * in, so a card never has to know what the default is.
+ *
  * See `docs/PERMISSION_MODE.md`.
  */
 export type PermissionMode = 'manual' | 'acceptEdits' | 'bypassPermissions'

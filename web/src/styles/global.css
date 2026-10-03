@@ -1668,6 +1668,43 @@ code {
   color: var(--danger);
 }
 
+/* The permission control on a touch screen.
+
+   It sits here rather than in the pointer: coarse block the terminal keys use
+   because these rules have to come *after* the ones above. `.permission-menu__
+   button` carries `.button`, whose own min-height is set in that shared block,
+   and the two are equally specific - so which one wins is decided by which
+   comes last in the file, and that is not a thing to leave to a reader to work
+   out. With the component, the order is visible.
+
+   44px is the number §9 of the phase brief names. It is the whole control and
+   not only the button: the three modes are what a thumb actually picks, and a
+   menu whose items are smaller than the thing that opened it has moved the hard
+   part down a level. `min-height` rather than a height, so a longer translation
+   of a mode's meaning grows the target instead of clipping it, and
+   `align-content` so the extra height becomes padding around the pair of lines
+   rather than a gap between them. */
+@media (pointer: coarse) {
+  .permission-menu__button {
+    min-height: 44px;
+  }
+
+  .permission-menu__item {
+    min-height: 44px;
+    align-content: center;
+  }
+}
+@media (pointer: coarse) {
+  .permission-menu__button {
+    min-height: 44px;
+  }
+
+  .permission-menu__item {
+    min-height: 44px;
+    align-content: center;
+  }
+}
+
 /* --- a status badge ------------------------------------------------------ */
 
 .status-badge {

@@ -13,6 +13,11 @@ This document is the long form of a deliberately small feature. §7 and §8 are
 the two sections worth reading if you are about to extend it: they are the
 boundary, and everything else here is inside it.
 
+**The default is `bypassPermissions`.** A project nobody has configured launches
+an agent that does not stop to ask. §5 is where that decision is made and
+argued; §4 is why it is a *launch* setting and not a description of anything
+already running.
+
 ## 1. The problem it answers
 
 Claude Code cycles its permission mode with **Shift+Tab**, inside its own
@@ -62,9 +67,9 @@ const (
 
 | Mode | What Claude does | Why it is offered |
 | --- | --- | --- |
-| `manual` | asks before it acts | the default, and what every launch did before this option existed |
+| `manual` | asks before it acts | what a person who wants to be asked chooses, and what every launch did before this option existed. It is Claude's own default and it is **not** AgentMux's — see §5 |
 | `acceptEdits` | edits files without asking, asks about everything else | "stop asking me about my own project" is a real request, and it is not the same as `bypassPermissions` |
-| `bypassPermissions` | does not ask | a person may genuinely want it for a project they own — which is why the setting is per project and not per installation |
+| `bypassPermissions` | does not ask | **the mode an unconfigured project launches under**, and the mode somebody who wants an agent to work unattended chooses |
 
 The values are the CLI's own spellings, verified against Claude Code 2.1.280 on
 the beta host. They are spelled here exactly as `--permission-mode` takes them
@@ -77,7 +82,10 @@ offered, and offering one would be a product decision this build has not made.
 adding a fourth is a test failure rather than a line somebody adds while passing.
 
 **The mode is per project, never global.** It is precisely the decision that must
-not leak from the project somebody chose it for into the next one they register.
+not leak from the project somebody chose it for into the next one they register —
+one project may be an agent working unattended in a repository nobody minds being
+edited, and the next may be one where every edit wants a second opinion. A single
+setting for the installation would have to answer both with one value.
 
 ## 4. What the setting is, and what it is not
 
@@ -90,6 +98,16 @@ Shift+Tab** — nothing AgentMux can observe reports it. So a mode stored while 
 agent is running has not reached that agent, and the database does not pretend
 otherwise: `migrations/0010_project_settings.sql` has one column for the mode a
 launch will be given and no column for "the mode now".
+
+Two consequences, both of them things a reader should not have to infer:
+
+- **It is startup configuration, not runtime state.** "The permission mode" of a
+  project is a fact about its next launch. "The permission mode" of a *running
+  agent* is a fact AgentMux does not have and does not claim — see §7.
+- **Changing it does not restart anything.** A running Claude keeps running, in
+  the mode it started with, until somebody restarts the agent themselves. §8 is
+  the long form, and it is the section that would change first if that were ever
+  revisited.
 
 That distinction is the whole of §7.
 
@@ -112,8 +130,8 @@ CREATE TABLE IF NOT EXISTS project_settings (
   of them at once — and neither of them is the registry. The migration's own
   header is the long argument.
 - **No row means the default.** A project nobody has configured launches under
-  `manual` and never gets a row until somebody chooses something. Reading does
-  not create one.
+  `bypassPermissions` and never gets a row until somebody chooses something.
+  Reading does not create one.
 - **`permission_mode` is `TEXT` without a `CHECK`.** The vocabulary lives in
   `internal/claude`, and a constraint here would be a second copy of it. It is
   enforced where the row is written. `0009_usage_events.sql` takes the same
@@ -134,9 +152,35 @@ CREATE TABLE IF NOT EXISTS project_settings (
   setting for a project that does not exist is refused, and a project's settings
   go with it.
 
-`DefaultPermissionMode` is `claude.PermissionManual`, and that is the same thing
-as the absence of this feature: a project that has never been configured is not
-a project that has been configured to ask.
+### The default, and why it is this one
+
+`DefaultPermissionMode` is `claude.PermissionBypass`. It is one constant in
+`internal/project/settings.go`, and it is the whole of the default: both reads —
+`Service.Settings` for one project, `PermissionModesForProjects` for a card
+listing — start from it and overlay whatever rows exist.
+
+**It is a product decision rather than the CLI's.** Claude asks before it acts
+unless told otherwise, which is the right answer for a person typing at a
+terminal and the wrong one for a workbench whose purpose is to run agents while
+nobody is watching: a session that stops on a prompt at midnight has done nothing
+by morning. AgentMux is the second thing.
+
+**It is a default, not a policy.** `manual` and `acceptEdits` are still offered
+and still do what they say. Choosing one is how somebody says they want to be
+asked, and nothing about this default overrides that.
+
+**Changing it reaches only projects with no row.** That is not a happy accident
+of the code — it is what the table is shaped for. Nothing stores the default, so
+a project that has chosen a mode has a row and is read from it; a project that
+has not has none and is answered from this constant. Phase 7.5.2 changed this
+value from `manual` to `bypassPermissions` and no existing project moved, which
+is the property `TestTheDefaultIsTheOnlyThingThatChanged` pins for every mode in
+the vocabulary.
+
+**No migration was written for it.** There is nothing to migrate: an unconfigured
+project has no row to change, and inserting one for every project would turn a
+derived default into a stored decision — which is exactly what would stop a
+later phase from changing it again. `0010_project_settings.sql` was not touched.
 
 ## 6. The API
 
@@ -146,7 +190,7 @@ envelope, like every other response in this API.
 ### `GET /api/projects/{id}/settings`
 
 ```json
-{ "settings": { "permissionMode": "manual" } }
+{ "settings": { "permissionMode": "bypassPermissions" } }
 ```
 
 A project that exists and has never been configured is answered with the default
@@ -232,10 +276,20 @@ somebody changed a preference two rows up would be the console deciding that the
 preference mattered more than the work. So the mode is stored, the agent is left
 alone, and the card says in as many words what would apply it.
 
-`permission-mode.mjs` checks this against the world rather than the page: after a
-save, the runtime's own `startedAt` is unchanged, its state is unchanged, the
-tmux session behind it is the same session, and the card still draws it as
-running.
+**Nor does it stop one, start one, or send anything to a terminal.** The three
+are the same refusal, and they are checked at three levels rather than asserted
+once: `internal/httpapi/settings_test.go` writes a setting while a runtime is up
+with output in its scrollback and shows the session was never replaced,
+`web/src/dashboard/PermissionMenu.test.tsx` shows the component makes exactly one
+request and it is the `PATCH`, and `permission-mode.mjs` checks it against the
+world rather than the page: after a save, the runtime's own `startedAt` is
+unchanged, its state is unchanged, the tmux session behind it is the same
+session, and the card still draws it as running.
+
+The API test is the one worth reading, because it is the level where a restart
+would actually be implemented: a restart is a call to the runtime manager, so
+`TestSavingASettingsDoesNotTouchTheRuntime` measures the manager's own answer
+rather than the card's words.
 
 **Any restart prompted by this setting would still go the long way round** —
 Dashboard → Controller API → Runtime Manager. Nothing in the console sends a
@@ -254,10 +308,17 @@ keystroke, and no path added by this phase reaches a terminal at all: a
 - **It is quoted like every other argument.** The line is parsed by a shell
   before anything else sees it, and the rule that every argument is quoted has
   no exceptions to remember.
+- **A default project's launch carries `--permission-mode bypassPermissions`.**
+  The mode comes from the project's settings on every launch, and a project with
+  no settings row is answered with the default — so the flag is on the line, and
+  it says `bypassPermissions`. `TestTheLaunchCarriesTheProjectPermissionMode`
+  checks that this service puts the mode on the launch for all four cases —
+  unconfigured, and each of the three choices.
 - **A launch with no mode is the line it always was.** The option is omitted
-  rather than rendered empty, so the old behaviour is the default rather than
-  something that has to be asked for. `TestALaunchWithNoModeIsTheLineItAlwaysWas`
-  pins the exact string.
+  rather than rendered empty. That case no longer arises from the product — the
+  mode is always read from settings — and it is kept because it is what
+  `LaunchOptions` means when a caller does not set one, and
+  `TestALaunchWithNoModeIsTheLineItAlwaysWas` pins the exact string.
 - **The flag appears once.** A second occurrence would let the later one be the
   one Claude read.
 
@@ -307,6 +368,14 @@ Adding a mode means adding a constant, and a constant cannot carry a payload.
 - After a save the page re-reads the dashboard — `DashboardPage` passes its
   `reload` down — rather than patching the card's own copy of server state. That
   is the console's rule after every write.
+- **On a touch screen the button and all three items are at least 44px tall.**
+  The rule is `@media (pointer: coarse)` in `global.css`, next to the component's
+  other styles because it has to come after them; a menu whose items are smaller
+  than the control that opened it has moved the hard part down a level. Nothing
+  in the menu depends on hover, on a right-click or on a keyboard — that is what
+  the whole feature exists for (§1). `permission-mode.mjs` checks the sizes and
+  the tap in a browser emulating a touch device, after confirming the page
+  really does match `(pointer: coarse)`.
 
 ## 12. Tests
 
@@ -318,17 +387,19 @@ Adding a mode means adding a constant, and a constant cannot carry a payload.
 | the table has four columns and no fifth for "the mode now" | `internal/storage/projectsettings_test.go` |
 | a setting round-trips, and re-saving keeps when it was first configured | `internal/storage/projectsettings_test.go` |
 | a setting belongs to a project, and goes when it does | `internal/storage/projectsettings_test.go` |
-| a project nobody configured launches `manual` | `internal/project/settings_test.go` |
+| a project nobody configured launches `bypassPermissions` | `internal/project/settings_test.go` |
+| changing the default moves nothing that has a row | `internal/project/settings_test.go` |
 | each mode stores and reads back | `internal/project/settings_test.go` |
 | an illegal mode is refused, including injection attempts | `internal/project/settings_test.go` |
 | a storage failure is reported rather than swallowed | `internal/project/settings_test.go` |
+| the launch carries the project's mode, defaulted or chosen | `internal/agent/service_test.go` |
 | an upgraded database has the table and an unconfigured project | `internal/storage/migrate_test.go`, `tasks_test.go` |
 | the card carries the mode, and `available` when it cannot | `internal/controller/*_test.go` |
-| both endpoints, both refusals | `internal/httpapi/*_test.go` |
+| both endpoints: the default, the write, both refusals, and a save that touches no runtime | `internal/httpapi/settings_test.go` |
 | the button, the menu, the save, the notice, no restart | `web/src/dashboard/PermissionMenu.test.tsx` |
 | the card marks the server's mode, and asks the page to re-read | `web/src/dashboard/ProjectPanel.test.tsx` |
 | the request the client makes, and the escaping of the path | `web/src/api/client.test.ts` |
-| the whole of it in a browser, against a live runtime | `web/e2e/suites/permission-mode.mjs` |
+| the whole of it in a browser, against a live runtime, including the 44px targets on an emulated iPad | `web/e2e/suites/permission-mode.mjs` |
 
 ## 13. Related
 

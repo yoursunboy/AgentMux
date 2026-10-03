@@ -95,7 +95,13 @@ type RuntimeOperator interface {
 type AdapterOperator interface {
 	Attach(ctx context.Context, in claude.Attachment) (claude.Attachment, error)
 	Detach(ctx context.Context, runtimeID string) error
-	HookSettings(runtimeID string) ([]byte, error)
+
+	// HookSettings renders the settings document for a runtime. The mode is the
+	// one the launch about to happen will carry, because the document is where
+	// Claude is told that a bypass launch has already been confirmed - see
+	// claude.Adapter.HookSettings.
+	HookSettings(runtimeID string, mode claude.PermissionMode) ([]byte, error)
+
 	Subscribe(ctx context.Context, runtimeID string) (<-chan claude.Event, error)
 }
 
@@ -131,6 +137,12 @@ type SessionOperator interface {
 	CreateSession(ctx context.Context, in task.CreateSessionInput) (*task.AgentSession, error)
 	AttachSessionRuntime(ctx context.Context, sessionID, runtimeID string) (*task.AgentSession, error)
 	UpdateSessionStatus(ctx context.Context, id, to string) (*task.AgentSession, error)
+
+	// OpenSessionForRuntime returns the attempt a runtime still has open, or a
+	// not-found. It is what lets an exit be closed after a restart, when the
+	// binding this package holds is no longer the one the log has - see
+	// Service.AgentExited.
+	OpenSessionForRuntime(ctx context.Context, runtimeID string) (*task.AgentSession, error)
 }
 
 // Options configures a Service. Runtimes, Adapters, Sessions, LaunchSettings
@@ -348,8 +360,11 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 	}
 	u.attached = true
 
-	// 6. The configuration that tells Claude where the receiver is.
-	document, err := s.adapters.HookSettings(runtimeID)
+	// 6. The configuration that tells Claude where the receiver is, and - when
+	// this launch is a bypass one - that the confirmation Claude would
+	// otherwise stop on has already been given. The second half is why the
+	// document is rendered per launch rather than per runtime.
+	document, err := s.adapters.HookSettings(runtimeID, settings.PermissionMode)
 	if err != nil {
 		u.run(ctx)
 		return Result{}, err
@@ -487,6 +502,143 @@ func (s *Service) Stop(ctx context.Context, in StopInput) (Result, error) {
 	}
 	run, attempt := s.end(ctx, projectID, OutcomeCancelled)
 	return Result{Agent: status, Run: run, Session: attempt}, nil
+}
+
+// AgentExited closes an attempt when the runtime watching the agent sees its
+// process end.
+//
+// # Why this exists
+//
+// `SessionEnd` is the signal `watch` follows, and the two ways an agent usually
+// goes are the two ways it is not sent. A process that is killed sends no hook,
+// because there is no shutdown to run one in; a process that is interrupted and
+// declines the interrupt leaves `Stop` returning early, by design, with the
+// attempt open. In both cases an attempt that is over stayed RUNNING - in the
+// projection the dashboard draws, in its task, and in the event log - for as
+// long as the server ran. The runtime's own watcher has always known the moment
+// it happened; this is the half that was missing, and it is the whole reason
+// session.AgentExitObserver exists.
+//
+// # What it does not do
+//
+// It does not relaunch, and it does not stop the runtime. The terminal is still
+// up with a shell in it, which is what an agent ending has always left behind -
+// §十 of the phase brief: the runtime is RUNNING and the agent is not, and the
+// two are different layers saying different true things.
+//
+// # The two cases, and why the second one is here
+//
+// When this process started the agent, the attempt is bound in memory and
+// closing it is the same work `Stop` and `Release` do.
+//
+// When it did not - an AgentMux restart adopted the runtime, and the binding
+// lived in the process that went away - there is no attempt here to close, and
+// there is very likely one in the log: an attempt left RUNNING by the server
+// that died. Nothing else will ever close it, because the only things that
+// close an attempt are a person, a hook the dead process cannot send, and this.
+// So the attempt is looked up by the runtime it ran in, and closed the same way.
+// The lookup answers "nothing" once the attempt is already terminal, which is
+// what makes the second case safe to run after the first.
+func (s *Service) AgentExited(ctx context.Context, exit session.AgentExit) {
+	projectID := strings.TrimSpace(exit.ProjectID)
+	if projectID == "" {
+		return
+	}
+
+	lock := s.lockFor(projectID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// The exit names a project and the runtime the agent ran in, and those two
+	// cannot disagree: a runtime is named after its project and hosts one
+	// project's agent, which is why the runtime manager reads both out of the
+	// same record. A report where they do disagree is not one this build
+	// produces, and acting on either half of it would be a guess - and the half
+	// that would win is the runtime, because that is what the lookup below is
+	// by, so the guess could close another project's attempt under this
+	// project's lock.
+	if want := project.SessionNameFor(projectID); exit.RuntimeID != want {
+		s.log.Warn("an agent exit names a runtime that is not its project's",
+			"projectId", projectID, "runtimeId", exit.RuntimeID, "want", want)
+		return
+	}
+
+	// Whether anything asked decides what this was, and it is the one fact the
+	// process table cannot supply. An agent that went after being asked to is a
+	// cancellation - which is what `Stop` records when the interrupt is taken,
+	// and what it could not record when the interrupt was declined and the
+	// agent left later. An agent that went with nothing having asked is a
+	// failure: it did not run to its own end, because a run to its own end
+	// would have sent `SessionEnd`.
+	outcome := OutcomeFailed
+	if exit.Asked {
+		outcome = OutcomeCancelled
+	}
+
+	if _, bound := s.Run(projectID); bound {
+		s.log.Info("claude agent ended without a session end",
+			"projectId", projectID, "runtimeId", exit.RuntimeID, "agent", exit.AgentType,
+			"pid", exit.PID, "asked", exit.Asked, "outcome", outcome)
+
+		run, attempt := s.end(ctx, projectID, outcome)
+		if run == nil {
+			return
+		}
+		if attempt != nil {
+			s.log.Info("the attempt it was running was closed",
+				"agentSessionId", attempt.ID, "status", attempt.Status)
+		}
+		return
+	}
+
+	s.closeAdoptedAttempt(ctx, projectID, exit, outcome)
+}
+
+// closeAdoptedAttempt closes an attempt this process never bound.
+//
+// It is the restart case, and it is deliberately its own function: what it does
+// is one read and one write, and the read is the whole of the difference between
+// it and the bound path above.
+//
+// A project with no open attempt is the ordinary answer, not a failure. An agent
+// started by hand has no attempt at all; one whose attempt was closed by
+// `agent/stop`, or by a `SessionEnd` that arrived before the process did, has
+// none open. In every one of those the runtime has already recorded the exit
+// against its own state, so nothing is lost by finding nothing here.
+func (s *Service) closeAdoptedAttempt(ctx context.Context, projectID string, exit session.AgentExit, outcome Outcome) {
+	attempt, err := s.sessions.OpenSessionForRuntime(ctx, exit.RuntimeID)
+	if err != nil {
+		// A not-found is the answer, not an error. Anything else is reported and
+		// left: the attempt stays RUNNING, which is wrong, and saying so is
+		// better than a retry this call has no way to make.
+		if !task.IsCode(err, task.CodeSessionNotFound) {
+			s.log.Warn("could not find the attempt an ended agent was running",
+				"projectId", projectID, "runtimeId", exit.RuntimeID, "error", err)
+		} else {
+			s.log.Debug("an agent ended in a runtime with no open attempt",
+				"projectId", projectID, "runtimeId", exit.RuntimeID,
+				"agent", exit.AgentType, "pid", exit.PID, "asked", exit.Asked)
+		}
+		return
+	}
+
+	s.log.Info("claude agent ended without a session end",
+		"projectId", projectID, "runtimeId", exit.RuntimeID, "agent", exit.AgentType,
+		"pid", exit.PID, "asked", exit.Asked, "outcome", outcome,
+		"agentSessionId", attempt.ID, "adopted", true)
+
+	// This process is not following the attempt, so there is no watcher and no
+	// adapter subscription to take down - `end` is not called and must not be:
+	// it would detach a receiver belonging to a runtime that is still up and
+	// still being watched. Closing the attempt is the whole of the work.
+	closed, err := s.sessions.UpdateSessionStatus(ctx, attempt.ID, taskStatusFor(outcome))
+	if err != nil {
+		s.log.Warn("could not close the attempt an ended agent was running",
+			"agentSessionId", attempt.ID, "outcome", outcome, "error", err)
+		return
+	}
+	s.log.Info("the attempt it was running was closed",
+		"agentSessionId", closed.ID, "status", closed.Status)
 }
 
 // Release ends observation of a project's agent without touching the agent.

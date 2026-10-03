@@ -372,6 +372,15 @@ func run(args []string) error {
 		return err
 	}
 
+	// The runtime manager watches its agents' processes, and when one ends it has
+	// to tell the coordinator - but the coordinator is built after it, because it
+	// is built on top of it. This is the same cycle as the project bridge above
+	// and it is broken the same way, with a pointer filled in on the next screen
+	// of code. Before that happens the bridge answers nothing, and the runtime
+	// manager's own record of the exit - which is what the terminal and the
+	// per-project runtime read - is written either way.
+	agentExits := &agentExitBridge{}
+
 	runtimes, err := session.NewManager(session.ManagerOptions{
 		Backends:      backends,
 		Sockets:       backends.Sockets(),
@@ -384,6 +393,7 @@ func run(args []string) error {
 		HistoryChunks: cfg.Terminal.HistoryChunks,
 		HistoryBytes:  cfg.Terminal.HistoryBytes,
 		Agent:         agentSpecs{agents},
+		AgentExits:    agentExits,
 		Logger:        runtimeLog,
 	})
 	if err != nil {
@@ -423,6 +433,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The other half of the bridge left open above. From here on, an agent that
+	// ends without sending a `SessionEnd` - killed, or interrupted and gone
+	// later - closes the attempt it was running instead of leaving it RUNNING in
+	// the projection for as long as the server is up.
+	agentExits.service = agentService
 	// Registered after the runtime manager's own defer, so it runs before it:
 	// every hook receiver is detached, and every settings document describing
 	// one, before the runtime manager closes the terminals those sessions run
@@ -644,6 +659,32 @@ func loadConfig(args []string) (*config.Config, error) {
 			ClaudeBinary:  *claudeBinary,
 		},
 	})
+}
+
+// agentExitBridge lets the runtime manager tell the coordinator that an agent's
+// process ended.
+//
+// The direction is the awkward one: the runtime manager is built first and
+// cannot name the coordinator's type, so it is handed this instead - the
+// interface it declares (`session.AgentExitObserver`), satisfied by a pointer
+// that is filled in once the coordinator exists. That is the same shape as
+// runtimeBridge above and for the same reason: each constructor takes exactly
+// what it needs, and the order they happen to be built in stays out of both.
+//
+// It is nil-safe in the only way that matters here. Before the coordinator
+// exists there is nothing that could have an attempt open - nothing has been
+// launched yet - and the exit is recorded by the runtime either way, so an
+// observation arriving in that window is dropped rather than lost.
+type agentExitBridge struct {
+	service *agent.Service
+}
+
+// AgentExited implements session.AgentExitObserver.
+func (b *agentExitBridge) AgentExited(ctx context.Context, exit session.AgentExit) {
+	if b.service == nil {
+		return
+	}
+	b.service.AgentExited(ctx, exit)
 }
 
 // runtimeBridge lets the project service ask the runtime manager for a

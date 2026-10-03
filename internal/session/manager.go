@@ -113,6 +113,12 @@ type ManagerOptions struct {
 	// means AgentDefaultStopGrace.
 	AgentStopGrace time.Duration
 
+	// AgentExits is told when a runtime observes its agent's process end. Nil
+	// means nobody is told, which is a legitimate configuration - the runtime
+	// records the exit either way - and is how every test that predates the
+	// observer builds a manager.
+	AgentExits AgentExitObserver
+
 	// Logger receives runtime lifecycle events. Nil means slog.Default.
 	Logger *slog.Logger
 
@@ -153,6 +159,7 @@ type Manager struct {
 	agentPoll         time.Duration
 	agentStartTimeout time.Duration
 	agentStopGrace    time.Duration
+	agentExits        AgentExitObserver
 
 	// ctx is the lifetime of every subscription this manager opens. It is
 	// deliberately not a request's context: a subscription that died with the
@@ -208,6 +215,7 @@ func NewManager(o ManagerOptions) (*Manager, error) {
 		agentPoll:         o.AgentPoll,
 		agentStartTimeout: o.AgentStartTimeout,
 		agentStopGrace:    o.AgentStopGrace,
+		agentExits:        o.AgentExits,
 		ctx:               ctx,
 		cancel:            cancel,
 		runs:              make(map[string]*runtime),
@@ -712,13 +720,19 @@ func (r *runtime) noteAgentInterruptIgnored(at time.Time) {
 		"it may need a second one, or it may be waiting for a decision of its own"
 }
 
-// noteAgentEnded records that the agent's process is gone.
+// noteAgentEnded records that the agent's process is gone, and reports whether
+// anything had asked it to stop.
 //
 // Whether that is reported as a stop or as an unexplained exit is decided by
 // the record of whether anything asked it to stop. The two are
 // indistinguishable from the process table, and guessing "crash" for a Ctrl-C
 // somebody typed into the terminal would be inventing a cause.
-func (r *runtime) noteAgentEnded(at time.Time) {
+//
+// The answer is returned rather than left for the caller to read back, because
+// the caller has to tell the same story to whoever is following the attempt,
+// and a second read of a field this call has just set is a second chance to
+// disagree with it.
+func (r *runtime) noteAgentEnded(at time.Time) (asked bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -728,13 +742,23 @@ func (r *runtime) noteAgentEnded(at time.Time) {
 		r.agent.reason = ""
 	} else {
 		r.agent.state = AgentExited
-		r.agent.reason = "the agent exited and AgentMux did not ask it to"
+		r.agent.reason = agentExitedUnexplained
 	}
 	r.agent.pid = 0
 	r.agent.dir = ""
 	r.agent.ended = at
 	r.agent.watched = false
+	return requested
 }
+
+// agentExitedUnexplained is what a status says about an agent that went away
+// with nothing having asked it to.
+//
+// It is a constant because two readers report it: the record, when the watcher
+// writes it, and agentStatus, when a reading finds the process gone before the
+// watcher has been round. A person comparing the two must not be able to tell
+// which of them answered, so it is written once.
+const agentExitedUnexplained = "the agent exited and AgentMux did not ask it to"
 
 // noteAgentGone records that a stop was requested for an agent that had already
 // ended on its own.
@@ -744,7 +768,7 @@ func (r *runtime) noteAgentGone(at time.Time) {
 	if r.agent.state == AgentRunning || r.agent.state == AgentStarting {
 		r.agent.state = AgentExited
 		r.agent.asked = false
-		r.agent.reason = "the agent exited and AgentMux did not ask it to"
+		r.agent.reason = agentExitedUnexplained
 		r.agent.ended = at
 	}
 	r.agent.pid = 0
@@ -1823,6 +1847,11 @@ func (m *Manager) reconcileProject(ctx context.Context, p *project.Project, rec 
 		report.Running = append(report.Running, p.ID)
 		m.log.Info("runtime rediscovered", "projectId", p.ID, "session", session.Name,
 			"socket", socketPath, "dir", session.Dir)
+
+		// The terminal survived; the agent inside it may have too, and if it did
+		// it needs the watcher this process has not got around to starting.
+		// Nothing is launched and nothing fails here - see adoptSurvivingAgent.
+		m.adoptSurvivingAgent(ctx, rt)
 
 	case recorded:
 		// Case B: the record exists, the session does not. Report it stopped

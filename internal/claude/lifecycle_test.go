@@ -112,7 +112,7 @@ func TestStopTakesTheAddressWithIt(t *testing.T) {
 	if got := adapter.HookURL(); got != "" {
 		t.Errorf("HookURL after Stop = %q; want empty", got)
 	}
-	if _, err := adapter.HookSettings(); !IsCode(err, CodeNotStarted) {
+	if _, err := adapter.HookSettings(PermissionManual); !IsCode(err, CodeNotStarted) {
 		t.Errorf("HookSettings after Stop = %v; want %q", err, CodeNotStarted)
 	}
 }
@@ -381,7 +381,7 @@ func TestHookURLAndSettingsNeedARunningAdapter(t *testing.T) {
 	if got := adapter.HookURL(); got != "" {
 		t.Errorf("HookURL before Start = %q; want empty", got)
 	}
-	if _, err := adapter.HookSettings(); !IsCode(err, CodeNotStarted) {
+	if _, err := adapter.HookSettings(PermissionManual); !IsCode(err, CodeNotStarted) {
 		t.Errorf("HookSettings before Start = %v; want %q", err, CodeNotStarted)
 	}
 }
@@ -476,7 +476,7 @@ func TestHookSettingsUseACommandForSessionStartAndHTTPForTheRest(t *testing.T) {
 	// SessionStart, and the configuration that declares one anyway fails
 	// silently. The asymmetry is the point of this test.
 	h := newHarness(t)
-	raw, err := h.adapter.HookSettings()
+	raw, err := h.adapter.HookSettings(PermissionManual)
 	if err != nil {
 		t.Fatalf("HookSettings: %v", err)
 	}
@@ -536,13 +536,92 @@ func TestHookSettingsUseACommandForSessionStartAndHTTPForTheRest(t *testing.T) {
 	}
 }
 
+// TestHookSettingsAnswerOnlyTheBypassDialog is Phase 7.5.3 §二, §四 and §十七.
+//
+// A bypass launch stops on Claude's own warning and waits for a person, and
+// nothing AgentMux can do in the terminal answers it without guessing at a UI.
+// The document this adapter renders is passed to Claude with `--settings`, and
+// the key below is Claude's own record of that confirmation - so the dialog is
+// answered by configuration.
+//
+// The three modes are checked together because the claim is not "the key is
+// written" but "the key is written for the one launch that asked for it": a
+// document that carried it for a manual launch would be consent nobody gave.
+func TestHookSettingsAnswerOnlyTheBypassDialog(t *testing.T) {
+	h := newHarness(t)
+
+	// The key's own name, spelled out rather than read from the constant: a
+	// test that imported it would keep passing if the constant were changed to
+	// a key Claude Code does not read.
+	const key = "skipDangerousModePermissionPrompt"
+
+	cases := map[PermissionMode]bool{
+		PermissionManual:      false,
+		PermissionAcceptEdits: false,
+		PermissionBypass:      true,
+	}
+	for mode, want := range cases {
+		t.Run(string(mode), func(t *testing.T) {
+			raw, err := h.adapter.HookSettings(mode)
+			if err != nil {
+				t.Fatalf("HookSettings(%s): %v", mode, err)
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(raw, &doc); err != nil {
+				t.Fatalf("the document is not JSON: %v", err)
+			}
+			got, present := doc[key]
+			if present != want {
+				t.Fatalf("HookSettings(%s) writes %s = %v, present = %v; want present = %v",
+					mode, key, got, present, want)
+			}
+			if want && got != true {
+				t.Errorf("HookSettings(%s) writes %s = %v; want true", mode, key, got)
+			}
+		})
+	}
+}
+
+// TestHookSettingsStillPointEveryHookAtTheReceiver is the guard on the change
+// above: the consent key is an addition to the document, and the hooks it was
+// written for must be untouched by it.
+func TestHookSettingsStillPointEveryHookAtTheReceiver(t *testing.T) {
+	h := newHarness(t)
+
+	plain, err := h.adapter.HookSettings(PermissionManual)
+	if err != nil {
+		t.Fatalf("HookSettings: %v", err)
+	}
+	var withConsent map[string]any
+	if raw, err := h.adapter.HookSettings(PermissionBypass); err != nil {
+		t.Fatalf("HookSettings: %v", err)
+	} else if err := json.Unmarshal(raw, &withConsent); err != nil {
+		t.Fatalf("the document is not JSON: %v", err)
+	}
+
+	var without map[string]any
+	if err := json.Unmarshal(plain, &without); err != nil {
+		t.Fatalf("the document is not JSON: %v", err)
+	}
+	delete(withConsent, "skipDangerousModePermissionPrompt")
+
+	// Comparing the two as values rather than as bytes is what makes this a
+	// statement about the document: key order in the encoding is not a fact
+	// about what Claude is told.
+	a, _ := json.Marshal(without)
+	b, _ := json.Marshal(withConsent)
+	if string(a) != string(b) {
+		t.Errorf("the bypass document differs from the manual one by more than the consent key:\n%s\n%s", a, b)
+	}
+}
+
 func TestHookSettingsNameNothingButTheReceiver(t *testing.T) {
 	// The document is written into a Claude configuration. Nothing in it may
 	// name a credential, and every URL in it must be the receiver this adapter
 	// opened - a settings file that pointed a hook somewhere else would be
 	// sending a session's events to a stranger.
 	h := newHarness(t)
-	raw, err := h.adapter.HookSettings()
+	raw, err := h.adapter.HookSettings(PermissionManual)
 	if err != nil {
 		t.Fatalf("HookSettings: %v", err)
 	}

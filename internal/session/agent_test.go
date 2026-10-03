@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -159,6 +160,18 @@ func agentTestManager(t *testing.T, store RuntimeStore, provider AgentProvider,
 func agentTestManagerOn(t *testing.T, socketDir string, store RuntimeStore, provider AgentProvider,
 	stopGrace time.Duration, projects ...*project.Project) (*Manager, *ProjectRuntimes) {
 	t.Helper()
+	return agentTestManagerObserving(t, socketDir, store, provider, stopGrace, nil, projects...)
+}
+
+// agentTestManagerObserving builds the same manager with somebody following the
+// exits it finds.
+//
+// It is a separate helper rather than a parameter on the one above because only
+// two tests care, and the other twenty-odd would have to say "and nobody is
+// watching" to say what they mean.
+func agentTestManagerObserving(t *testing.T, socketDir string, store RuntimeStore, provider AgentProvider,
+	stopGrace time.Duration, exits AgentExitObserver, projects ...*project.Project) (*Manager, *ProjectRuntimes) {
+	t.Helper()
 
 	runtimes := testRuntimes(t, socketDir)
 	m, err := NewManager(ManagerOptions{
@@ -167,6 +180,7 @@ func agentTestManagerOn(t *testing.T, socketDir string, store RuntimeStore, prov
 		Projects:          newFakeProjects(projects...),
 		Store:             store,
 		Agent:             provider,
+		AgentExits:        exits,
 		AgentPoll:         testAgentPoll,
 		AgentStartTimeout: testAgentStartTimeout,
 		AgentStopGrace:    stopGrace,
@@ -940,6 +954,214 @@ func TestAgentSurvivesAServerRestart(t *testing.T) {
 	if found := paneProcesses(t, runtimes, p, spec.Executable); len(found) != 0 {
 		t.Errorf("%d agents survived being stopped through the restarted server", len(found))
 	}
+}
+
+// TestAgentThatIsSignalledIsReportedAsGone is the abrupt ending.
+//
+// `StopAgent` interrupts, which is what Ctrl-C in the terminal does, and a
+// program that handles it may refuse. A signal is the other way an agent goes:
+// nothing about it is polite, no hook follows it, and the runtime's only notice
+// is that the process is not there any more.
+func TestAgentThatIsSignalledIsReportedAsGone(t *testing.T) {
+	ctx := context.Background()
+	sleep := requireSleep(t)
+
+	p := agentTestProject(t, "p_agent_signalled")
+	spec := sleep.spec(300)
+	m, _ := agentTestManager(t, newFakeStore(), &fakeAgent{spec: spec}, p)
+
+	if _, err := m.Start(ctx, p.ID); err != nil {
+		t.Fatalf("could not start the runtime: %v", err)
+	}
+	started, err := m.StartAgent(ctx, p.ID, AgentLaunch{})
+	if err != nil {
+		t.Fatalf("StartAgent returned an error: %v", err)
+	}
+	if started.State != AgentRunning {
+		t.Fatalf("the agent is %q straight after starting, want %q", started.State, AgentRunning)
+	}
+
+	if err := signalProcess(t, started.PID, syscall.SIGTERM); err != nil {
+		t.Fatalf("could not signal the agent: %v", err)
+	}
+
+	status := waitForAgentState(t, m, p.ID, AgentExited, testAgentStopGrace)
+	if status.Requested {
+		t.Error("a signalled agent records that AgentMux asked it to stop")
+	}
+	if status.Running {
+		t.Error("a signalled agent is still reported running")
+	}
+	if status.PID != 0 {
+		t.Errorf("a signalled agent still reports pid %d", status.PID)
+	}
+	if processIsRunning(t, started.PID, spec.Executable) {
+		t.Errorf("pid %d is still running the agent after it was signalled", started.PID)
+	}
+
+	// The terminal is a different layer. It is still up, and a shell is still in
+	// it - which is what the next command typed at the project would land in.
+	rt, err := m.Runtime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Runtime returned an error: %v", err)
+	}
+	if rt.State != StateRunning {
+		t.Errorf("the runtime is %q after its agent was signalled, want %q", rt.State, StateRunning)
+	}
+}
+
+// TestAnAdoptedAgentThatEndsIsReported is §六 question 2 and §八 together.
+//
+// A server that comes back to a running agent has to watch it. Without a watcher
+// nothing notices the agent end - reading the status would say so, but reading
+// is not something anything does on its own, and the projection the dashboard
+// draws only moves when an event is written. So the agent ends, the attempt it
+// was running stays RUNNING, and the dashboard goes on saying so.
+//
+// Nothing here reads the runtime after the signal. That is the point: the
+// notification has to come from the watcher Reconcile started, not from a read
+// this test could have made itself.
+func TestAnAdoptedAgentThatEndsIsReported(t *testing.T) {
+	ctx := context.Background()
+	sleep := requireSleep(t)
+
+	p := agentTestProject(t, "p_agent_adopted_exit")
+	spec := sleep.spec(300)
+	store := newFakeStore()
+	socketDir := uniqueSocketDir(t)
+
+	first, runtimes := agentTestManagerOn(t, socketDir, store, &fakeAgent{spec: spec}, testAgentStopGrace, p)
+	if _, err := first.Start(ctx, p.ID); err != nil {
+		t.Fatalf("could not start the runtime: %v", err)
+	}
+	started, err := first.StartAgent(ctx, p.ID, AgentLaunch{})
+	if err != nil {
+		t.Fatalf("StartAgent returned an error: %v", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("could not close the first manager: %v", err)
+	}
+
+	// The agent outlived the server that started it.
+	if found := paneProcesses(t, runtimes, p, spec.Executable); len(found) != 1 {
+		t.Fatalf("the agent did not survive the server stopping: %d processes found", len(found))
+	}
+
+	exits := newExitRecorder()
+	second, _ := agentTestManagerObserving(t, socketDir, store, &fakeAgent{spec: spec},
+		testAgentStopGrace, exits, p)
+	if _, err := second.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile returned an error: %v", err)
+	}
+
+	adopted, err := second.Agent(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Agent returned an error after the restart: %v", err)
+	}
+	if adopted.State != AgentRunning {
+		t.Fatalf("the agent is %q after the restart, want %q (message %q)",
+			adopted.State, AgentRunning, adopted.Message)
+	}
+	if adopted.PID != started.PID {
+		t.Errorf("the adopted agent has pid %d, want the original %d", adopted.PID, started.PID)
+	}
+
+	// Now it goes, with nothing watching but the watcher the restart gave it.
+	if err := signalProcess(t, started.PID, syscall.SIGTERM); err != nil {
+		t.Fatalf("could not signal the agent: %v", err)
+	}
+
+	exit := exits.await(t, testAgentStopGrace)
+	if exit.ProjectID != p.ID {
+		t.Errorf("the exit names project %q, want %q", exit.ProjectID, p.ID)
+	}
+	if exit.RuntimeID != p.SessionName() {
+		t.Errorf("the exit names runtime %q, want %q", exit.RuntimeID, p.SessionName())
+	}
+	if exit.PID != started.PID {
+		t.Errorf("the exit names pid %d, want %d", exit.PID, started.PID)
+	}
+	if exit.Asked {
+		t.Error("nothing asked this agent to stop, so the exit must not say anything did")
+	}
+	if exit.AgentType == "" {
+		t.Error("the exit names no agent type")
+	}
+	if exit.At.IsZero() {
+		t.Error("the exit carries no time")
+	}
+
+	status, err := second.Agent(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Agent returned an error after the exit: %v", err)
+	}
+	if status.State != AgentExited {
+		t.Errorf("the agent is %q after it was signalled, want %q", status.State, AgentExited)
+	}
+	if status.Running {
+		t.Error("the agent is still reported running after it was signalled")
+	}
+	if status.PID != 0 {
+		t.Errorf("the agent still reports pid %d after it was signalled", status.PID)
+	}
+
+	// §十, from the other side: the adopted runtime is still RUNNING, and the
+	// agent inside it is not. The two are different layers and neither is wrong.
+	rt, err := second.Runtime(ctx, p.ID)
+	if err != nil {
+		t.Fatalf("Runtime returned an error: %v", err)
+	}
+	if rt.State != StateRunning {
+		t.Errorf("the runtime is %q after its adopted agent ended, want %q", rt.State, StateRunning)
+	}
+}
+
+// exitRecorder collects the exits a manager reports.
+//
+// The channel is buffered and the send is non-blocking: the reporter is the
+// watcher goroutine, and a test that has stopped listening must not be able to
+// wedge a manager in its own shutdown.
+type exitRecorder struct {
+	exits chan AgentExit
+}
+
+func newExitRecorder() *exitRecorder {
+	return &exitRecorder{exits: make(chan AgentExit, 8)}
+}
+
+func (r *exitRecorder) AgentExited(_ context.Context, exit AgentExit) {
+	select {
+	case r.exits <- exit:
+	default:
+	}
+}
+
+// await waits for one reported exit.
+func (r *exitRecorder) await(t *testing.T, wait time.Duration) AgentExit {
+	t.Helper()
+	select {
+	case exit := <-r.exits:
+		return exit
+	case <-time.After(wait):
+		t.Fatalf("no exit was reported within %s", wait)
+		return AgentExit{}
+	}
+}
+
+// signalProcess delivers a signal to a pid.
+//
+// It goes through os.Process rather than syscall.Kill because this file is also
+// compiled on a Windows host - the suite skips there, but it still has to build,
+// and syscall.Kill has no Windows spelling. Signal exists on both and answers
+// "not supported" on Windows, which is a failure these tests never reach: tmux
+// is what skips them, and it skips them first.
+func signalProcess(t *testing.T, pid int, sig syscall.Signal) error {
+	t.Helper()
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	return proc.Signal(sig)
 }
 
 // TestAgentsAreIsolatedBetweenProjects checks that one project's agent is not

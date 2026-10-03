@@ -11,8 +11,12 @@ in an installation guide.
 
 Nothing in this document adds a feature. Phase 7.5 changed no behaviour of the product: it added a
 configuration file, a systemd unit that already existed and was extended, one health route under the
-API's prefix, one read-only diagnostic, and an opt-in counter. If a scenario below fails, it is
-either a deployment mistake or a real bug, and it is never "the beta half is not finished".
+API's prefix, one read-only diagnostic, and an opt-in counter. Phase 7.5.3 changed exactly one
+behaviour and this document records it in §2 and §9: the launch document AgentMux already wrote for
+each runtime now also answers Claude's bypass-permissions warning, and an agent that AgentMux
+inherits from a previous server process is now watched the same way a freshly started one is. If a
+scenario below fails, it is either a deployment mistake or a real bug, and it is never "the beta half
+is not finished".
 
 ---
 
@@ -133,17 +137,107 @@ nothing. There is no error to find, because nothing went wrong.
 * **The bypass-permissions warning** — *"WARNING: Claude Code running in Bypass Permissions mode…
   By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions
   mode."* It appears whenever a launch carries `--permission-mode bypassPermissions`, and since
-  Phase 7.5.2 that is the default for a project nobody has configured — so on a beta installed after
-  that phase, **this is the first dialog of the three a new project meets**. The highlighted default
-  is `No, exit`; down-arrow to `Yes, I accept`, then Enter.
+  Phase 7.5.2 that is the default for a project nobody has configured.
+
+  **AgentMux answers this one itself, since Phase 7.5.3, and you should not see it.** The next
+  subsection is how, and why it is the only one of the three that is answered this way. If you do
+  see it on a project whose launch carries bypass permissions, that is a regression worth reporting,
+  and the old manual answer still works: the highlighted default is `No, exit`; down-arrow to
+  `Yes, I accept`, then Enter.
 
   Which of the two you pick changes what happens next, and only one of them looks like an error.
   `No, exit` ends Claude on the spot, and the console then says the agent `EXITED` with *"the agent
   exited and AgentMux did not ask it to"* — which is a truthful reading of what happened rather than
-  a fault, and is worth recognising before going looking for one. Answering it is observed here as
-  once per account on this build: the beta host met it on the first bypass launch and not on the
-  launches after it. It is the same shape as the two above — the pane is yours, the runtime is up,
-  and nothing in AgentMux is broken.
+  a fault, and is worth recognising before going looking for one.
+
+  **Where it sits in the order was measured, not assumed, and the answer is second.** On a directory
+  Claude has never seen, the workspace trust prompt is shown first and this one only after it has
+  been answered. On a directory that is already trusted this one is the only dialog left, and since
+  Phase 7.5.3 it does not appear either — which is the case a restart and a re-launch meet. What a
+  brand-new project meets is therefore the trust prompt, unchanged, and a person has to answer it
+  once; the subsection after this one says why that half is not automated and should not be.
+
+#### Why this dialog and not the other two
+
+Claude Code has a settings key that means "the user has already accepted the bypass permissions
+mode dialog". Its name is `skipDangerousModePermissionPrompt`, its own description in Claude Code's
+schema is *"Whether the user has accepted the bypass permissions mode dialog"*, and Claude Code
+honours it from any of its settings sources — user, project, local, **flag** and policy.
+
+AgentMux already writes a settings document for every runtime it launches, and already passes it as
+`--settings <path>`, which is the *flag* source. Since Phase 7.5.3 that document carries
+`skipDangerousModePermissionPrompt: true` **when, and only when, the launch mode is
+bypassPermissions**. The consent is therefore a key in a file, written by name, read by Claude —
+not a keystroke sent at a menu.
+
+That distinction is the whole of the security argument, and it is why the other two dialogs are
+still answered by hand:
+
+* nothing is typed into a pane, so nothing can be typed into the wrong pane — an administrator's own
+  tmux session is not reachable by this path, and no `send-keys` exists anywhere in the codebase;
+* nothing is inferred from what the screen looks like, so a Claude Code UI change cannot turn an
+  answer into a `y` sent at whatever happens to be highlighted;
+* the file is per-runtime, under `/var/lib/agentmux/claude/amx-<project-id>/`, and exists only while
+  that launch does, so the consent reaches exactly the launches AgentMux started.
+
+This phase investigated the bypass dialog and only the bypass dialog, and found the key above. The
+workspace trust prompt and the API key prompt were **not** re-investigated in the same way: what this
+document already records about them is where their answers live — Claude's own state file
+(`hasTrustDialogAccepted` per project, `customApiKeyResponses.approved` globally) rather than a
+settings key. **This is a finding, not an omission**, and it is what §12 asks you to report if it
+bites.
+
+#### How that was established, so it can be re-established
+
+It is worth writing down as a procedure rather than as a conclusion, because the conclusion is a
+claim about a program that can change under it. The whole test is one difference between two runs,
+and the beta host's own account is enough to run it:
+
+```bash
+# A scratch config dir, so nothing here touches the account's real answers. Its
+# settings.json is the account's own with skipDangerousModePermissionPrompt
+# removed; its .claude.json keeps only the fields a first run would otherwise
+# stop on (onboarding, its version, the API key answer).
+CFG=/tmp/ab/cfg; WORK=/tmp/ab/work; SOCK=/tmp/ab/sock; mkdir -p "$CFG" "$WORK"
+
+# Two runs into the same scratch tmux session, identical but for the document:
+#   --settings '{}'                                        -> the WARNING, waiting
+#   --settings '{"skipDangerousModePermissionPrompt":true}' -> the Claude prompt
+```
+
+**Both runs must answer the workspace trust prompt first**, because it is shown before the bypass
+warning and hides it until it is answered: down-arrow to `Yes, I trust this folder`, then Enter. Clear
+`projects` from the scratch `.claude.json` between the runs, or the second inherits the first one's
+answer and the comparison is no longer one difference. Use a scratch socket and remove it with
+`kill-server` on that socket — never the default one, and never `pkill tmux`.
+
+Measured on the beta host, Claude Code 2.1.280: the run without the key stopped on the warning, and
+the run with it reached `⏵⏵ bypass permissions on`. That is the evidence for the claim above, and it
+is the shape any re-check should take.
+
+#### What a new project still stops on, and why that is not automated
+
+Creating a project through the console makes a directory Claude has never seen, so the **trust
+prompt** is what a first launch meets — and AgentMux does not answer it.
+
+There is a mechanism, and it was measured too: writing
+`projects["<dir>"].hasTrustDialogAccepted: true` into the Claude config's `.claude.json` before the
+launch makes Claude go straight to the prompt with no dialog at all. It is deliberately **not** used.
+That file is Claude's record of *the user's own* decision about *their own* folder, and writing it is
+not answering a confirmation dialog — it is a program recording, in another program's voice, that a
+person reviewed a directory and trusts it. A mux that filled that in would be trusting folders on the
+user's behalf, which is the same category of act as auto-approving the commands that follow. §8 of
+`docs/CLAUDE_RUNTIME.md` says the same about permission prompts, and the reasoning does not change
+because the field is in a JSON file rather than behind a keystroke.
+
+So the honest state of the chain is:
+
+> New Project → Start Agent → Claude → **workspace trust prompt, answered once by a person** →
+> bypass confirmation, answered by AgentMux → the Claude prompt.
+
+Per project that is one dialog, once, on the first launch, and never again for that folder. Whether
+that is the right trade is a product decision and not this phase's to make; it is written down here
+so that it is made deliberately rather than discovered.
 
 Onboarding itself — the theme picker and the survey behind it — can be skipped rather than answered.
 Seeding `/home/agentmux/.claude.json` with `hasCompletedOnboarding: true` and a
@@ -485,6 +579,88 @@ journalctl -u agentmux -n 100 | grep -i orphan
 socket path under `/var/lib/agentmux/tmux/` and a session name starting `amx-`, and remove it
 afterwards by name — never with `kill-server` on the default socket.
 
+### Case D — an agent that outlives the server
+
+This is Case A with a Claude process still running inside the session, and it is the case Phase
+7.5.3 fixed.
+
+**What you should see:** after `sudo systemctl restart agentmux`, the project is `RUNNING`, the
+console's Agent row says `RUNNING` with the pid it had before, and **the agent is the same agent** —
+same process, same conversation, still able to be typed at. Then, when that Claude process ends —
+you type `/exit` at its prompt, or it is signalled — the console stops saying `RUNNING` within a
+second or two, and the pid goes away. A short delay is expected and correct; the state travels
+process → watcher → event log → console, and the console reads on a poll. What is *not* correct, and
+what this phase removed, is a console that keeps saying `RUNNING` hours after the process died.
+
+```bash
+# $PROJECT_ID is the project's id, as in §5. Both reads are printed with the
+# same one-liner so the two answers can be compared line by line.
+
+# after a restart, with claude live in the pane:
+curl -s "http://127.0.0.1:8787/api/projects/$PROJECT_ID/runtime" | python3 -c '
+import json,sys
+a = json.load(sys.stdin)["runtime"]["agent"]
+print("runtime read:  running=%s pid=%s state=%s" % (a["running"], a["pid"], a["state"]))'
+
+curl -s http://127.0.0.1:8787/api/controller | python3 -c '
+import json,sys,os
+p = [p for p in json.load(sys.stdin)["projects"] if p["id"] == os.environ["PROJECT_ID"]][0]
+a = p.get("agent") or {}
+print("controller read: status=%s lastEvent=%s" % (a.get("status"), a.get("lastEvent")))'
+# runtime read:  running=True pid=NNNN state=RUNNING      <- the live process, read per request
+# controller read: status=RUNNING lastEvent=agent.*       <- the console's projection
+
+# now end that Claude process -- /exit at its prompt, or by hand:
+sudo tmux -S /var/lib/agentmux/tmux/$PROJECT_ID.sock send-keys -t amx-$PROJECT_ID '/exit' Enter
+sleep 2
+# run both reads again:
+# runtime read:  running=False pid=0, and a state that is not RUNNING
+# controller read: a status that is not RUNNING
+```
+
+Both one-liners need `PROJECT_ID` in the environment for the second one, so export it once
+(`export PROJECT_ID=...`) before running them. If the controller read is still `RUNNING` after a few
+seconds, give it one more moment and read again — the state travels process → watcher → event log →
+console, and the console reads on a poll.
+
+Before Phase 7.5.3 the second read kept saying `RUNNING` forever in this case, and the reason is
+worth knowing because it explains the shape of the fix. An agent AgentMux **starts** is watched: the
+server holds the process, waits on it, and writes an event when it ends. An agent AgentMux
+**inherits** from a previous server process — which is exactly what Case A leaves behind — had
+nothing watching it, so when its process died nothing wrote anything, and the console went on
+showing the last thing it had been told. The fix has two halves, and both are in the code rather
+than in this document: a surviving runtime is now re-adopted along with its agent, so an inherited
+agent gets the watcher a started one already had; and the attempt that agent was running is closed
+by its runtime when the exit is noticed, so the event log is written to as well as the process
+table.
+
+**Nothing is polled to do this.** The wait is `process.Wait()` on the process AgentMux found, not a
+`ps` on a timer, and there is no `pgrep` anywhere in the server. That matters on a beta: a
+per-second sweep of the process table is a cost that grows with the number of projects and is one
+more thing to explain to whoever runs the machine.
+
+### Case E — the two layers, when they disagree
+
+`/api/projects/{id}/runtime` and `/api/controller` are not the same question, and a beta tester
+should read them as two:
+
+* **the runtime** is the tmux session. It is answered by looking at the process table *at the moment
+  you ask*, so it is never stale, and a session with a process in it is `running: true` whether that
+  process is a Claude, a shell, or a `sleep`.
+* **the agent** is what the console shows, and it is a projection of the event log — the record of
+  what happened, in order. It is what lets the console say *"this agent exited at 14:22"*, which a
+  process table cannot.
+
+So a tmux session that survived a restart while its Claude died is `running: true` on the first read
+and not `RUNNING` on the second, and **that is the two layers working, not a bug**. What Phase 7.5.3
+guarantees is that the second one catches up on its own, and Case D is how you watch it do so.
+
+One caveat that is worth stating plainly, because it is the honest limit of this phase:
+`POST /api/projects/{id}/runtime/agent/stop` **interrupts** the agent, it does not terminate it. It
+is a Ctrl-C, not a `kill`. A console button named "Restart Agent" that did a stop-then-start would
+therefore not be a restart — the old process would still be there — and this phase did not add one
+and did not change what the existing endpoint means.
+
 ---
 
 ## 10. What the beta records, and how to read it
@@ -612,6 +788,16 @@ yours to check.
 
 That is also why the four commands above are the ones named: they are the whole diagnostic surface,
 and none of them shows the screen.
+
+Two signatures from Phase 7.5.3 are worth recognising on sight, because both look like nothing at
+all and both are real:
+
+* **The bypass-permissions warning appears on a project whose launch carries bypass permissions.**
+  §2 says AgentMux answers it, so seeing it means the settings document did not reach Claude — a
+  regression, and `journalctl -u agentmux | grep -i settings` is the first place to look.
+* **The console says `RUNNING` for an agent whose process is gone.** §9's Case D is the test. The
+  two reads there are what tell you which half is stale: `running: false` on the runtime read with
+  `RUNNING` on the controller read means the process table knew and the event log did not.
 
 ---
 

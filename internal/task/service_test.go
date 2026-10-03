@@ -211,6 +211,28 @@ func (r *memoryRepo) ListSessions(_ context.Context, query SessionQuery) ([]*Age
 	return out, nil
 }
 
+func (r *memoryRepo) OpenSessionForRuntime(_ context.Context, runtimeID string) (*AgentSession, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fail != nil {
+		return nil, r.fail
+	}
+	var newest *AgentSession
+	for _, stored := range r.sessions {
+		if stored.RuntimeID != runtimeID || SessionTerminal(stored.Status) {
+			continue
+		}
+		if newest == nil || stored.CreatedAt.After(newest.CreatedAt) ||
+			(stored.CreatedAt.Equal(newest.CreatedAt) && stored.ID > newest.ID) {
+			newest = stored
+		}
+	}
+	if newest == nil {
+		return nil, ErrSessionNotFound
+	}
+	return newest.Clone(), nil
+}
+
 func (r *memoryRepo) UpdateSessionStatus(_ context.Context, id string, change SessionStatusChange) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1360,6 +1382,49 @@ func TestListSessionsRequiresAnExistingTask(t *testing.T) {
 	_, err = h.service.ListSessions(context.Background(), ListSessionsInput{})
 	if !IsCode(err, CodeInvalidInput) {
 		t.Fatalf("ListSessions with no task returned %v; want %q", err, CodeInvalidInput)
+	}
+}
+
+// TestOpenSessionForRuntimeAnswersByRuntime is the lookup the coordinator makes
+// after a restart, at the layer that owns the rows.
+//
+// The window it exists for is narrow and the answer has to be exact: the attempt
+// that is still open in a runtime, found by the runtime alone, because the
+// process that bound it is gone.
+func TestOpenSessionForRuntimeAnswersByRuntime(t *testing.T) {
+	h := newHarness(t)
+	tk := h.createTask(t, "p_alpha", "Fix the viewer")
+
+	const runtimeID = runtimeIDForTest
+	first := h.createSession(t, tk.ID)
+	if _, err := h.service.AttachSessionRuntime(context.Background(), first.ID, runtimeID); err != nil {
+		t.Fatalf("AttachSessionRuntime: %v", err)
+	}
+	if _, err := h.service.UpdateSessionStatus(context.Background(), first.ID, StatusSessionRunning); err != nil {
+		t.Fatalf("UpdateSessionStatus: %v", err)
+	}
+
+	got, err := h.service.OpenSessionForRuntime(context.Background(), runtimeID)
+	if err != nil {
+		t.Fatalf("OpenSessionForRuntime: %v", err)
+	}
+	if got.ID != first.ID {
+		t.Errorf("OpenSessionForRuntime returned %s; want %s", got.ID, first.ID)
+	}
+
+	// Once the attempt is over it is not open any more, and a second exit report
+	// must find nothing rather than close it again.
+	if _, err := h.service.UpdateSessionStatus(context.Background(), first.ID, StatusSessionFailed); err != nil {
+		t.Fatalf("UpdateSessionStatus: %v", err)
+	}
+	if _, err := h.service.OpenSessionForRuntime(context.Background(), runtimeID); !IsCode(err, CodeSessionNotFound) {
+		t.Errorf("OpenSessionForRuntime after the attempt ended = %v; want %q", err, CodeSessionNotFound)
+	}
+
+	// A runtime id that is not one is refused before the read, because there is
+	// no query that could answer it.
+	if _, err := h.service.OpenSessionForRuntime(context.Background(), "not-a-runtime"); !IsCode(err, CodeInvalidInput) {
+		t.Errorf("OpenSessionForRuntime with a malformed runtime = %v; want %q", err, CodeInvalidInput)
 	}
 }
 

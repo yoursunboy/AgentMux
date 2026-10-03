@@ -229,7 +229,12 @@ func (m *Manager) Attachments() []Attachment {
 // It delegates to the adapter's own renderer rather than rebuilding the
 // document here, so that the shape Claude's settings file has to take remains
 // known to exactly one file. This manager handles an address and nothing else.
-func (m *Manager) HookSettings(runtimeID string) ([]byte, error) {
+//
+// `mode` is the mode the caller is about to launch with, and it is passed
+// through rather than remembered: a mode belongs to a launch, and a manager
+// that stored one would be answering for a launch it was not asked about. See
+// the renderer for what the document does with it.
+func (m *Manager) HookSettings(runtimeID string, mode PermissionMode) ([]byte, error) {
 	m.mu.Lock()
 	adapter := m.adapters[runtimeID]
 	m.mu.Unlock()
@@ -237,7 +242,7 @@ func (m *Manager) HookSettings(runtimeID string) ([]byte, error) {
 		return nil, newError(CodeNotStarted,
 			"no adapter is observing runtime %s, so it has no hooks to describe", runtimeID)
 	}
-	return adapter.HookSettings()
+	return adapter.HookSettings(mode)
 }
 
 // Subscribe returns a channel of every observation made about a runtime.

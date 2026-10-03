@@ -59,6 +59,13 @@
  * claim is that a permission request from a live agent reaches the queue - not
  * that the first delivery happened to arrive after the last hook. Only the
  * stimulus is retried; the assertion is not.
+ *
+ * # What Phase 7.5.3 added
+ *
+ * One check, in episode B, on the same read of the same document: that the
+ * launch document records the bypass first-run dialog as answered. Nothing was
+ * rewritten and no episode was added - the document was already being read for
+ * its URL, and the phase made a second fact about that document worth pinning.
  */
 import { chromium } from 'playwright'
 
@@ -546,9 +553,33 @@ async function permissionEpisode(page, agentSessionID) {
 
   await waitFor(() => readDocument().includes('allowedHttpHookUrls'), 10_000)
 
+  let document = {}
+  try {
+    document = JSON.parse(readDocument())
+  } catch {
+    document = {}
+  }
+
+  // Phase 7.5.3, and the reason this is read from the same document as the URL:
+  // a bypass launch is told here that the first-run confirmation has already
+  // been given, which is what stops Claude opening its dialog and waiting for a
+  // keystroke nobody is there to send. The fixture's project is unconfigured and
+  // an unconfigured project launches in `bypassPermissions`, so a live launch is
+  // a bypass one and the key must be in the file the launch was given.
+  //
+  // What this does not claim: that Claude honoured it. That is a claim about a
+  // process's first-run behaviour and it belongs to the Linux verification - see
+  // docs/BETA_TEST.md. What is checked here is that the product wrote it, which
+  // is the half that can silently stop being true.
+  report.check(
+    'the launch document records that the bypass dialog was answered',
+    document.skipDangerousModePermissionPrompt === true,
+    `skipDangerousModePermissionPrompt: ${JSON.stringify(document.skipDangerousModePermissionPrompt)}`,
+  )
+
   let url = ''
   try {
-    url = JSON.parse(readDocument()).allowedHttpHookUrls?.[0] ?? ''
+    url = document.allowedHttpHookUrls?.[0] ?? ''
   } catch {
     url = ''
   }

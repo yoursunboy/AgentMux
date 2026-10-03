@@ -252,7 +252,26 @@ func (a *Adapter) HookURL() string {
 // anyway is a configuration that fails *silently* - the hook simply never
 // arrives - so the asymmetry is written here, once, rather than left to
 // whoever writes a settings file by hand.
-func (a *Adapter) HookSettings() ([]byte, error) {
+//
+// # The bypass confirmation, and why it is answered here
+//
+// A launch carrying `--permission-mode bypassPermissions` stops on a warning
+// with `No, exit` preselected, and waits for a person. Nothing AgentMux does in
+// the terminal can answer it: writing a keystroke would be guessing at a UI
+// that changes between releases, which is the guess Phase 7.5.3 forbids and the
+// one `agentproc.go` already refuses to make about the process table.
+//
+// Claude Code has an official setting for it instead. `mode` is the mode the
+// caller is about to launch with, and when it is PermissionBypass the consent
+// Claude's own dialog records is written into the document - so the dialog is
+// answered by configuration rather than by a keystroke, and only for the one
+// dialog this build has verified. See docs/BETA_TEST.md §2 for the measurement.
+//
+// The key is written only for that mode. It is consent to run without asking,
+// and a launch that is going to ask has not asked for it; writing it
+// unconditionally would put a claim into a user's session that nothing
+// requested.
+func (a *Adapter) HookSettings(mode PermissionMode) ([]byte, error) {
 	a.mu.Lock()
 	url := a.url
 	a.mu.Unlock()
@@ -279,12 +298,30 @@ func (a *Adapter) HookSettings() ([]byte, error) {
 			string(KindSessionEnd):        []any{hookEntry(map[string]any{"type": "http", "url": url})},
 		},
 	}
+
+	// The one dialog this build answers, and it is answered by name rather than
+	// by keystroke. Claude Code reads this key from any of its settings sources
+	// - user, project, local, flag and policy - and `--settings` is the flag
+	// one, so a document written here is consent for exactly the launches that
+	// read it: the ones AgentMux starts, in sessions AgentMux created.
+	if mode == PermissionBypass {
+		settings[skipBypassPromptKey] = true
+	}
+
 	encoded, err := json.MarshalIndent(settings, "", "  ")
 	if err != nil {
 		return nil, wrapError(err, CodeInvalidConfig, "could not render the hook settings document")
 	}
 	return encoded, nil
 }
+
+// skipBypassPromptKey is the settings key that records the bypass-permissions
+// confirmation.
+//
+// The name is Claude Code's, and the description in its own schema is
+// "Whether the user has accepted the bypass permissions mode dialog". It is
+// declared once, here, beside the only writer of it.
+const skipBypassPromptKey = "skipDangerousModePermissionPrompt"
 
 // hookEntry wraps one handler in the matcher object the settings schema
 // expects.

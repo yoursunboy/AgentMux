@@ -267,6 +267,27 @@ func (r *TaskStore) GetSession(ctx context.Context, id string) (*task.AgentSessi
 	return s, err
 }
 
+// OpenSessionForRuntime returns the attempt a runtime still has open.
+//
+// The two statuses are spelled out in the statement rather than passed in,
+// because they are what "open" means and there is no second reading of it in
+// this build: a session is done when SessionTerminal says so, and those are the
+// other three. Writing the list here keeps a caller from having to know the
+// vocabulary to ask the question.
+func (r *TaskStore) OpenSessionForRuntime(ctx context.Context, runtimeID string) (*task.AgentSession, error) {
+	row := r.db.QueryRowContext(ctx,
+		`SELECT `+sessionColumns+` FROM agent_sessions
+		WHERE runtime_id = ? AND status IN (?, ?)
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1`,
+		runtimeID, task.StatusSessionCreated, task.StatusSessionRunning)
+	s, err := scanSession(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, task.ErrSessionNotFound
+	}
+	return s, err
+}
+
 // ListSessions returns one task's attempts, newest first.
 func (r *TaskStore) ListSessions(ctx context.Context, query task.SessionQuery) ([]*task.AgentSession, error) {
 	if strings.TrimSpace(query.TaskID) == "" {

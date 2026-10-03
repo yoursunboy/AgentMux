@@ -146,6 +146,22 @@ type Repository interface {
 	// ListSessions returns one task's sessions, newest first.
 	ListSessions(ctx context.Context, query SessionQuery) ([]*AgentSession, error)
 
+	// OpenSessionForRuntime returns the attempt a runtime still has open, or
+	// ErrSessionNotFound.
+	//
+	// "Still open" means not terminal: CREATED or RUNNING. There is at most one
+	// by construction - a runtime runs one attempt at a time and an attempt is
+	// bound to one runtime - so the query takes the newest and the caller does
+	// not have to choose.
+	//
+	// It exists for one caller: the coordinator, when a runtime reports that the
+	// agent in it ended and this process has no attempt bound to that runtime.
+	// That is what an AgentMux restart leaves behind - the runtime is adopted,
+	// the binding was in memory, and the attempt would otherwise stay RUNNING
+	// for as long as the attempt's own row survives. See internal/agent's
+	// Service.AgentExited.
+	OpenSessionForRuntime(ctx context.Context, runtimeID string) (*AgentSession, error)
+
 	// UpdateSessionStatus applies a status change, but only while the stored
 	// row still holds change.From. It returns ErrStatusConflict when it does
 	// not.

@@ -739,6 +739,46 @@ func TestTwoAttemptsAtOneTask(t *testing.T) {
 	}
 }
 
+// TestOpenSessionForRuntimeFindsOnlyTheOpenAttempt is the read the coordinator
+// makes when a runtime reports that its agent ended and nothing is bound here.
+//
+// It has to answer with the attempt a restart left RUNNING and nothing else: a
+// terminal attempt is a record of something already over, and closing it again
+// would write a second transition for an event that has already been recorded.
+func TestOpenSessionForRuntimeFindsOnlyTheOpenAttempt(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	registerProject(t, store, "p_0123456789abcdef0123")
+	createTaskForSession(t, store, "task_0123456789abcdef01234567", "p_0123456789abcdef0123")
+
+	const runtimeID = "amx-p_0123456789abcdef0123"
+	done := testSession("sess_000000000000000000000001", "task_0123456789abcdef01234567", at(2026, time.September, 20, 9))
+	done.RuntimeID = runtimeID
+	done.Status = task.StatusSessionCompleted
+	open := testSession("sess_000000000000000000000002", "task_0123456789abcdef01234567", at(2026, time.September, 20, 10))
+	open.RuntimeID = runtimeID
+	open.Status = task.StatusSessionRunning
+	for _, s := range []*task.AgentSession{done, open} {
+		if err := store.Tasks().CreateSession(ctx, s); err != nil {
+			t.Fatalf("CreateSession returned an error: %v", err)
+		}
+	}
+
+	got, err := store.Tasks().OpenSessionForRuntime(ctx, runtimeID)
+	if err != nil {
+		t.Fatalf("OpenSessionForRuntime returned an error: %v", err)
+	}
+	if got.ID != open.ID {
+		t.Errorf("OpenSessionForRuntime returned %s, want the open attempt %s", got.ID, open.ID)
+	}
+
+	// A runtime nothing was ever recorded against is a not-found rather than an
+	// error: there is no attempt, and saying so is the answer.
+	if _, err := store.Tasks().OpenSessionForRuntime(ctx, "amx-p_ffffffffffffffffffff"); !errors.Is(err, task.ErrSessionNotFound) {
+		t.Errorf("OpenSessionForRuntime for an unknown runtime = %v, want ErrSessionNotFound", err)
+	}
+}
+
 func TestSessionListRefusesToGuessAScope(t *testing.T) {
 	store := newTestStore(t)
 

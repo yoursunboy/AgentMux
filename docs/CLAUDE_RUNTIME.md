@@ -269,6 +269,17 @@ Nothing about the agent is stored to be restored. There is no serialised agent s
 schema change: liveness is read live from the process table, because a record of a running process is
 a stale answer waiting to happen.
 
+**Phase 7.5.3 made the adopted agent watched as well as reported.** Rediscovering the process was
+only half of what a restart owes an agent: an agent AgentMux *starts* is followed by a watcher that
+waits on the process and reports when it goes, and an agent inherited from a previous server process
+had no such watcher, because a watcher is a goroutine and goroutines do not survive a restart. Its
+exit was therefore invisible — the process table was right the next time anybody asked, but nothing
+asked on the agent's behalf, and the event log the console reads was never written to. Reconcile now
+re-adopts the agent it finds in a surviving pane, so an inherited agent gets the same watcher a
+started one has, and its exit closes the attempt it was running. The runtime read and the console
+read are still two layers and may still differ for a moment; §9 of `docs/BETA_TEST.md` is how to
+watch them agree.
+
 ## 8. Permissions
 
 **Claude Code's interactive permission model is preserved exactly as it is.**
@@ -296,6 +307,21 @@ The real-integration test `TestRealClaudeAnswersAPrompt` therefore asserts only 
 still running and that the terminal produced output; whether a file appeared is **logged**, not
 asserted, because whether a tool call is auto-approved is the user's configuration and not AgentMux's
 to require.
+
+**Phase 7.5.3 answers one dialog, and it is not a permission prompt.** Claude Code refuses to start
+in `bypassPermissions` until somebody accepts a warning about what that mode means — *"By proceeding,
+you accept all responsibility for actions taken while running in Bypass Permissions mode"* — and that
+consent is a **settings key**, `skipDangerousModePermissionPrompt`, which Claude Code honours from its
+flag settings source. The launch document AgentMux already writes for every runtime is passed as
+`--settings`, so that document now carries the key, and only when the launch mode is
+`bypassPermissions`. Nothing is typed into a pane and nothing is read off a screen.
+
+The distinction §8 draws is unchanged and is worth stating in one line: this is consent to *a mode
+the user already chose*, given once, in a file, before the process starts. It is not an answer to any
+question Claude asks while running. A tool-permission prompt still reaches the user's terminal and is
+still answered by the user, and a request that would need a keystroke sent on somebody's behalf still
+gets none. `docs/BETA_TEST.md` §2 records what was verified about this on the beta host and what was
+not.
 
 ## 9. Real integration tests
 

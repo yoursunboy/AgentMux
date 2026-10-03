@@ -499,8 +499,30 @@ func (m *Manager) agentStatus(ctx context.Context, rt *runtime) AgentStatus {
 	// The process is asked again here rather than trusted from the record. The
 	// record is what AgentMux last decided; the process table is what is true
 	// now, and after a server restart those are different things.
-	if status.Available {
-		if ref, found, err := m.observeAgent(ctx, rt, spec); err == nil && found {
+	//
+	// A reading that succeeds and finds nothing therefore overrides a record
+	// that says the agent was running. That is the whole of §八: a record that
+	// still says RUNNING is a memory of a process this reading has just failed
+	// to find, and falling back to it would report the past as the present - for
+	// as long as the record survived, which is the life of the server. The two
+	// cases the record knows about are kept, so a status and a record cannot
+	// disagree about *why* the agent is gone: either something asked it to stop,
+	// or nothing did.
+	//
+	// It overrides that record and no other. A runtime with a spec but a record
+	// that never said RUNNING - a project nothing has started an agent in, a
+	// start that failed, a second stop after the first one took - has nothing
+	// for this reading to have found gone, and the record is reported as it
+	// stands. Reading "no process" as "an agent exited" there would invent an
+	// exit out of an absence, which is the same mistake in the other direction.
+	//
+	// A reading that fails concludes nothing either way, and the record is
+	// reported as it stands. "Could not look" is not "is not there", and
+	// reporting an agent stopped because the process table was unreadable would
+	// be inventing an exit.
+	if status.Available && strings.TrimSpace(spec.Executable) != "" {
+		ref, found, err := m.observeAgent(ctx, rt, spec)
+		if err == nil && found {
 			status.State = AgentRunning
 			status.Running = true
 			status.PID = ref.PID
@@ -517,6 +539,33 @@ func (m *Manager) agentStatus(ctx context.Context, rt *runtime) AgentStatus {
 			if !asked {
 				status.Message = ""
 			}
+			return status
+		}
+		if err == nil && state == AgentRunning {
+			status.State = AgentExited
+			status.Running = false
+			status.PID = 0
+			status.Dir = ""
+			status.Requested = asked
+			if asked {
+				status.State = AgentStopped
+				status.Message = ""
+			} else {
+				status.Message = agentExitedUnexplained
+			}
+			// The moment is the record's when the watcher got there first, and
+			// this reading's when it did not. A read that reported a moment it
+			// did not have would have to invent one, and the record is the
+			// watcher's to write: this call observes, and does not take the
+			// watcher's job from it.
+			at := ended
+			if at.IsZero() {
+				at = m.now()
+			}
+			status.ExitedAt = timePtr(at)
+			// The start time is deliberately not reported. A process that is
+			// not there has no start time to report, and the one the record
+			// kept belongs to the process that has gone.
 			return status
 		}
 	}
@@ -711,6 +760,56 @@ func (m *Manager) adoptAgent(rt *runtime, spec AgentSpec, ref processRef) {
 	m.trackAgent(rt, spec, ref)
 }
 
+// adoptSurvivingAgent gives an inherited agent the watcher a started one has.
+//
+// It is called by Reconcile, for a session this server has just reattached to,
+// and it is what makes the promise in adoptAgent's comment true rather than
+// aspirational: until this existed, the only way an inherited agent acquired a
+// watcher was for somebody to call StartAgent, and a server that came back to a
+// running agent nobody touched had nobody watching it.
+//
+// What that cost is the whole of §八 of the phase brief. Nothing read the agent,
+// so nothing noticed it end, so nothing closed the attempt it was running: the
+// row stayed RUNNING and the dashboard went on drawing it that way. Reading the
+// status re-observes the process table and would have reported the truth, but a
+// dashboard polls the projection, and the projection only moves on an event.
+//
+// Nothing is launched here and nothing fails the reconcile. The runtime is up,
+// which is what the caller asked about; an agent that could not be recognised is
+// reported and left, and the next call that looks - a start, a status read -
+// will recognise it.
+func (m *Manager) adoptSurvivingAgent(ctx context.Context, rt *runtime) {
+	if m.agent == nil {
+		return
+	}
+	// The launch is the zero value: this is asking what is running, not asking
+	// for something to be started, so it names no session and no settings.
+	spec, err := m.agent.Spec(ctx, AgentLaunch{})
+	if err != nil {
+		m.log.Debug("no agent can be recognised in a surviving runtime",
+			"projectId", rt.projectID, "error", err)
+		return
+	}
+	pane, err := m.paneProcess(ctx, rt)
+	if err != nil {
+		m.log.Warn("could not read the pane of a surviving runtime",
+			"projectId", rt.projectID, "error", err)
+		return
+	}
+	ref, found, err := findProcessRunning(pane.PID, spec.Executable)
+	if err != nil {
+		m.log.Warn("could not look for an agent in a surviving runtime",
+			"projectId", rt.projectID, "error", err)
+		return
+	}
+	if !found {
+		return
+	}
+	m.adoptAgent(rt, spec, ref)
+	m.log.Info("agent rediscovered",
+		"projectId", rt.projectID, "session", rt.session, "agent", spec.Type, "pid", ref.PID)
+}
+
 // untrackAgent stops watching a runtime's agent.
 func (m *Manager) untrackAgent(rt *runtime) {
 	rt.mu.Lock()
@@ -721,6 +820,80 @@ func (m *Manager) untrackAgent(rt *runtime) {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// AgentExit is a runtime's report that an agent it was watching has ended.
+//
+// It is a value rather than a callback argument list because it is what a
+// caller needs to decide what the end meant, and a caller that had to be handed
+// six arguments would be a caller that could be given them in the wrong order.
+// Nothing here is read from the terminal: it is the process table's answer and
+// the record of whether anything asked.
+type AgentExit struct {
+	// ProjectID is the project whose runtime hosted the agent.
+	ProjectID string
+
+	// RuntimeID is the runtime the agent was running in. It is the runtime's
+	// session name, which is what every other layer names a runtime by.
+	RuntimeID string
+
+	// AgentType is what was running, as the provider named it. It is here so
+	// that a reader does not have to ask the runtime manager what it used to
+	// be: by the time this is delivered, the agent is already gone.
+	AgentType string
+
+	// PID is the process that ended. It is the last one observed alive, and it
+	// is carried so that a log line and a decision can name the same process.
+	PID int
+
+	// Asked reports whether AgentMux had asked the agent to stop before it
+	// went. It is the one thing the process table cannot say: an interrupt and
+	// a crash look identical from /proc, and the difference decides whether an
+	// attempt was cancelled or lost.
+	Asked bool
+
+	// At is when the end was observed.
+	At time.Time
+}
+
+// AgentExitObserver is told when a runtime observes its agent's process end.
+//
+// # Why the runtime reports this rather than acting on it
+//
+// The runtime knows the process is gone - it is the only thing in the build
+// that watches one - and it does not know what an attempt is. Closing an
+// attempt, writing an event and failing a task are all decisions about work,
+// and this layer owns a terminal. So it reports the observation and lets the
+// layer that owns the attempt decide what it meant.
+//
+// # Why nothing is required of the answer
+//
+// The method returns nothing, for the reason EventRecorder's does: the agent is
+// already gone whatever the receiver does next, and a runtime whose watcher
+// could be stopped by a failed write would make the history a precondition of
+// the terminal. A receiver that cannot record what it was told logs it.
+type AgentExitObserver interface {
+	AgentExited(ctx context.Context, exit AgentExit)
+}
+
+// noteAgentExit hands an observed exit to the observer, if there is one.
+//
+// A nil observer means nothing is told, which is a legitimate configuration
+// rather than a degraded one: the watcher records the exit on the runtime
+// either way, and every test in this package that predates the observer builds
+// a manager without one.
+func (m *Manager) noteAgentExit(ctx context.Context, rt *runtime, spec AgentSpec, pid int, asked bool) {
+	if m.agentExits == nil {
+		return
+	}
+	m.agentExits.AgentExited(ctx, AgentExit{
+		ProjectID: rt.projectID,
+		RuntimeID: rt.session,
+		AgentType: spec.Type,
+		PID:       pid,
+		Asked:     asked,
+		At:        m.now(),
+	})
 }
 
 // watchAgent notices when a running agent goes away.
@@ -749,10 +922,18 @@ func (m *Manager) watchAgent(ctx context.Context, rt *runtime, spec AgentSpec, p
 			// It ended. Whether that was a crash or somebody pressing Ctrl-C in
 			// the terminal is not something this side can tell, so the record
 			// says only whether AgentMux had asked it to stop.
-			m.untrackAgent(rt)
-			rt.noteAgentEnded(m.now())
+			asked := rt.noteAgentEnded(m.now())
 			m.log.Info("agent is no longer running",
 				"projectId", rt.projectID, "session", rt.session, "agent", spec.Type, "pid", pid)
+
+			// Whoever is following the attempt is told before the watcher is
+			// torn down, because tearing it down cancels the context this is
+			// delivered on. A notification sent after it would be sent on a
+			// context that is already over, and the write it causes would be
+			// refused for a reason that has nothing to do with the agent.
+			m.noteAgentExit(ctx, rt, spec, pid, asked)
+
+			m.untrackAgent(rt)
 			return
 		}
 		rt.noteAgentSeen(ref)

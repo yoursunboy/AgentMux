@@ -637,6 +637,62 @@ func TestTheSettingsDocumentNamesTheListeningReceiver(t *testing.T) {
 	}
 }
 
+// TestTheSettingsDocumentAnswersTheBypassDialog is the join between the two
+// halves of §四: the mode a project chose, and the document Claude is handed
+// with `--settings`.
+//
+// internal/claude tests that a bypass document carries the confirmation, and
+// internal/project tests that an unconfigured project launches in bypass. What
+// neither covers is this chain reading the mode and rendering the document for
+// it - and a break here leaves a launch stopped on a dialog that waits for a
+// person, with both of those suites still green.
+//
+// The unconfigured row is the one that matters most, for the reason the launch
+// test gives: nothing was written for that project, so a document carrying the
+// key can only have come from the default answered through this chain.
+func TestTheSettingsDocumentAnswersTheBypassDialog(t *testing.T) {
+	// The key's name is written out rather than imported, so that renaming the
+	// constant cannot make this test agree with a document Claude ignores.
+	const key = "skipDangerousModePermissionPrompt"
+
+	for _, tc := range []struct {
+		name string
+		// configured is what somebody chose, or "" for a project nobody has.
+		configured claude.PermissionMode
+		want       bool
+	}{
+		{"nobody has configured it", "", true},
+		{"configured to bypass", claude.PermissionBypass, true},
+		{"configured to ask", claude.PermissionManual, false},
+		{"configured to accept edits", claude.PermissionAcceptEdits, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Options{})
+			p := h.registerProject("checkout-service")
+			if tc.configured != "" {
+				if _, err := h.projects.SetPermissionMode(context.Background(), p.ID,
+					tc.configured); err != nil {
+					t.Fatalf("SetPermissionMode returned an error: %v", err)
+				}
+			}
+
+			if _, err := h.service.Start(context.Background(), startInput(p, nil)); err != nil {
+				t.Fatalf("Start returned an error: %v", err)
+			}
+
+			_, body := h.settingsFor(project.SessionNameFor(p.ID))
+			var doc map[string]any
+			if err := json.Unmarshal(body, &doc); err != nil {
+				t.Fatalf("the settings document is not JSON: %v", err)
+			}
+			if _, present := doc[key]; present != tc.want {
+				t.Errorf("a %s launch wrote %s present = %v; want %v\ndocument:\n%s",
+					tc.name, key, present, tc.want, body)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 2. Session binding, end to end through a real hook
 // ---------------------------------------------------------------------------
@@ -1226,7 +1282,290 @@ func TestTwoProjectsAreBoundIndependently(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 9. Construction
+// 9. The agent's process ends
+// ---------------------------------------------------------------------------
+
+// TestAnAgentThatEndedClosesItsAttempt is the bound case: this process started
+// the agent, so the attempt is in memory and the exit closes it here.
+//
+// It is §八 of the phase brief. `SessionEnd` is the hook that normally closes an
+// attempt, and a killed process never sends one - so without this the attempt,
+// its task and the projection the dashboard draws all went on saying RUNNING for
+// as long as the server was up.
+func TestAnAgentThatEndedClosesItsAttempt(t *testing.T) {
+	h := newHarness(t, Options{})
+	p := h.registerProject("checkout-service")
+	tk := h.createTask(p.ID, "Fix the viewer")
+	runtimeID := project.SessionNameFor(p.ID)
+
+	started, err := h.service.Start(context.Background(), startInput(p, tk))
+	if err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+	// Case A, on the way past: a launch that worked leaves the attempt RUNNING
+	// and the agent observed as running, which is what the exit below is the end
+	// of.
+	if started.Session.Status != task.StatusSessionRunning {
+		t.Fatalf("the attempt is %s right after a launch; want RUNNING", started.Session.Status)
+	}
+	if !started.Agent.Running {
+		t.Fatalf("the agent is not reported running right after a launch: %+v", started.Agent)
+	}
+
+	// Nothing asked it to go, so this is a failure and not a cancellation.
+	h.service.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: p.ID,
+		RuntimeID: runtimeID,
+		AgentType: claude.Type,
+		PID:       4242,
+		Asked:     false,
+		At:        fixedNow(),
+	})
+
+	attempts := h.sessionsOf(tk.ID)
+	if len(attempts) != 1 {
+		t.Fatalf("the task has %d attempt(s); want 1", len(attempts))
+	}
+	if attempts[0].Status != task.StatusSessionFailed {
+		t.Errorf("the attempt is %s after its agent ended unasked; want FAILED",
+			attempts[0].Status)
+	}
+	if attempts[0].EndedAt == nil {
+		t.Error("the attempt has no end time")
+	}
+
+	// The projection the dashboard reads is fed by this event, and it is the
+	// only thing that will ever move the card off RUNNING.
+	changes := h.eventsOfType(p.ID, task.TypeSessionStatusChanged)
+	if len(changes) == 0 {
+		t.Fatal("no session.status_changed was recorded, so nothing can settle the agent state")
+	}
+	if got := string(changes[0].Payload); !strings.Contains(got, `"to":"FAILED"`) {
+		t.Errorf("the last status change reads %s; want it to say FAILED", got)
+	}
+
+	// Nothing is bound any more, and the receiver and the document that pointed
+	// Claude at it are gone with it - the same cleanup a stop does.
+	if _, bound := h.service.Run(p.ID); bound {
+		t.Error("an attempt is still bound to the project after its agent ended")
+	}
+	if _, attached := h.adapters.Attachment(runtimeID); attached {
+		t.Error("the adapter outlived the agent it was observing")
+	}
+	if _, err := os.Stat(filepath.Join(h.settings.Dir(), runtimeID, "settings.json")); err == nil {
+		t.Error("the settings document outlived the agent it launched")
+	}
+
+	// §十: the runtime is a different layer and is unaffected. The terminal is
+	// still up with a shell in it.
+	rt, err := h.runtimes.Runtime(context.Background(), p.ID)
+	if err != nil {
+		t.Fatalf("Runtime returned an error: %v", err)
+	}
+	if rt.State != session.StateRunning {
+		t.Errorf("the runtime is %q after its agent ended; want %q",
+			rt.State, session.StateRunning)
+	}
+}
+
+// TestAnAgentThatEndedAfterBeingAskedIsACancellation is the second half of the
+// bound case, and it is the one `Stop` cannot write itself.
+//
+// `Stop` interrupts and waits, and a program that declines the interrupt leaves
+// the attempt RUNNING by design - the request said "stop", and it had not. When
+// that program goes a moment later, the only thing that knows anything asked is
+// the runtime's own record, which is what `Asked` carries.
+func TestAnAgentThatEndedAfterBeingAskedIsACancellation(t *testing.T) {
+	h := newHarness(t, Options{})
+	p := h.registerProject("checkout-service")
+	tk := h.createTask(p.ID, "Fix the viewer")
+
+	if _, err := h.service.Start(context.Background(), startInput(p, tk)); err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+
+	h.service.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: p.ID,
+		RuntimeID: project.SessionNameFor(p.ID),
+		AgentType: claude.Type,
+		PID:       4242,
+		Asked:     true,
+		At:        fixedNow(),
+	})
+
+	attempts := h.sessionsOf(tk.ID)
+	if len(attempts) != 1 {
+		t.Fatalf("the task has %d attempt(s); want 1", len(attempts))
+	}
+	if attempts[0].Status != task.StatusSessionCancelled {
+		t.Errorf("the attempt is %s after an agent it had asked to stop ended; want CANCELLED",
+			attempts[0].Status)
+	}
+}
+
+// TestAnAttemptLeftByAnEarlierServerIsClosedWhenItsAgentEnds is the adopted
+// case, and it is the one the beta server was found in.
+//
+// An AgentMux restart adopts the runtime - the terminal and the agent in it both
+// survived - but the binding lived in the process that went away. When that
+// adopted agent ends, nothing in memory can close the attempt, and the row stays
+// RUNNING for as long as it exists. This builds a second coordinator over the
+// same store, which is what a restart produces, and ends the agent through it.
+func TestAnAttemptLeftByAnEarlierServerIsClosedWhenItsAgentEnds(t *testing.T) {
+	h := newHarness(t, Options{})
+	p := h.registerProject("checkout-service")
+	tk := h.createTask(p.ID, "Fix the viewer")
+	runtimeID := project.SessionNameFor(p.ID)
+
+	started, err := h.service.Start(context.Background(), startInput(p, tk))
+	if err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+	if started.Session.Status != task.StatusSessionRunning {
+		t.Fatalf("the attempt is %s right after a launch; want RUNNING", started.Session.Status)
+	}
+
+	// The server restarts. Same database, same projects, and a coordinator that
+	// has never seen this runtime.
+	restarted, err := NewService(Options{
+		Runtimes:       h.runtimes,
+		Adapters:       h.adapters,
+		Sessions:       h.sessions,
+		Settings:       h.settings,
+		LaunchSettings: h.projects,
+		Logger:         discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewService returned an error: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close(context.Background()) })
+
+	if _, bound := restarted.Run(p.ID); bound {
+		t.Fatal("the restarted coordinator has a binding it cannot have: the map is in memory")
+	}
+
+	// The adopted agent ends with nothing having asked it to.
+	restarted.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: p.ID,
+		RuntimeID: runtimeID,
+		AgentType: claude.Type,
+		PID:       4242,
+		Asked:     false,
+		At:        fixedNow(),
+	})
+
+	attempts := h.sessionsOf(tk.ID)
+	if len(attempts) != 1 {
+		t.Fatalf("the task has %d attempt(s); want 1", len(attempts))
+	}
+	if attempts[0].Status != task.StatusSessionFailed {
+		t.Errorf("the attempt is %s after its adopted agent ended; want FAILED - "+
+			"nothing else will ever close it", attempts[0].Status)
+	}
+	if got := len(h.eventsOfType(p.ID, task.TypeSessionStatusChanged)); got < 2 {
+		t.Errorf("the project recorded %d status change(s); want the launch's and the "+
+			"exit's, because the projection only moves on the event", got)
+	}
+
+	// The handler for a runtime with no open attempt is not the same as the
+	// handler for a live one: the second call finds nothing and says so rather
+	// than writing a second transition.
+	restarted.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: p.ID,
+		RuntimeID: runtimeID,
+		AgentType: claude.Type,
+		PID:       4242,
+		Asked:     false,
+		At:        fixedNow(),
+	})
+	if again := h.sessionsOf(tk.ID); len(again) != 1 || again[0].Status != task.StatusSessionFailed {
+		t.Errorf("a second exit report changed the attempt: %+v", again)
+	}
+}
+
+// TestAnAdoptedExitLeavesTheReceiverAlone is the boundary between the two
+// layers, and it is why the adopted path does not call `end`.
+//
+// The runtime is up and still being watched by whoever adopted it. Detaching
+// the receiver and deleting the settings document would take the observation of
+// a live runtime apart to close a record, which is a cure worse than the thing
+// it treats.
+func TestAnAdoptedExitLeavesTheReceiverAlone(t *testing.T) {
+	h := newHarness(t, Options{})
+	p := h.registerProject("checkout-service")
+	tk := h.createTask(p.ID, "Fix the viewer")
+	runtimeID := project.SessionNameFor(p.ID)
+
+	if _, err := h.service.Start(context.Background(), startInput(p, tk)); err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+	before, attached := h.adapters.Attachment(runtimeID)
+	if !attached {
+		t.Fatal("no receiver was attached by the launch")
+	}
+
+	restarted, err := NewService(Options{
+		Runtimes:       h.runtimes,
+		Adapters:       h.adapters,
+		Sessions:       h.sessions,
+		Settings:       h.settings,
+		LaunchSettings: h.projects,
+		Logger:         discardLogger(),
+	})
+	if err != nil {
+		t.Fatalf("NewService returned an error: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Close(context.Background()) })
+
+	restarted.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: p.ID, RuntimeID: runtimeID, AgentType: claude.Type, PID: 4242,
+	})
+
+	after, attached := h.adapters.Attachment(runtimeID)
+	if !attached {
+		t.Fatal("the receiver was detached to close an attempt the restarted server never bound")
+	}
+	if after.HookURL != before.HookURL {
+		t.Errorf("the receiver moved from %q to %q", before.HookURL, after.HookURL)
+	}
+	if _, err := os.Stat(filepath.Join(h.settings.Dir(), runtimeID, "settings.json")); err != nil {
+		t.Errorf("the settings document was removed for a runtime that is still up: %v", err)
+	}
+}
+
+// TestAnExitFromAnotherProjectIsIgnored is the isolation rule applied to this
+// entry point.
+//
+// The exit carries a project id the runtime manager read from its own record,
+// so this is a guard rather than a suspicion - but the lookup it would otherwise
+// make is by runtime alone, and a runtime id that belonged to another project
+// would close that project's attempt through this project's lock.
+func TestAnExitFromAnotherProjectIsIgnored(t *testing.T) {
+	h := newHarness(t, Options{})
+	alpha := h.registerProject("alpha")
+	bravo := h.registerProject("bravo")
+	bravoTask := h.createTask(bravo.ID, "Fix bravo")
+
+	if _, err := h.service.Start(context.Background(), startInput(bravo, bravoTask)); err != nil {
+		t.Fatalf("Start returned an error: %v", err)
+	}
+
+	// An exit reported for alpha carrying bravo's runtime.
+	h.service.AgentExited(context.Background(), session.AgentExit{
+		ProjectID: alpha.ID,
+		RuntimeID: project.SessionNameFor(bravo.ID),
+		AgentType: claude.Type,
+		PID:       4242,
+	})
+
+	if attempts := h.sessionsOf(bravoTask.ID); len(attempts) != 1 ||
+		attempts[0].Status != task.StatusSessionRunning {
+		t.Errorf("bravo's attempt is %+v; an exit reported under alpha must not touch it", attempts)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 10. Construction
 // ---------------------------------------------------------------------------
 
 func TestNewServiceRefusesAnIncompleteChain(t *testing.T) {
@@ -1261,7 +1600,9 @@ func (fakeAdapters) Attach(context.Context, claude.Attachment) (claude.Attachmen
 	return claude.Attachment{}, nil
 }
 func (fakeAdapters) Detach(context.Context, string) error { return nil }
-func (fakeAdapters) HookSettings(string) ([]byte, error)  { return nil, nil }
+func (fakeAdapters) HookSettings(string, claude.PermissionMode) ([]byte, error) {
+	return nil, nil
+}
 func (fakeAdapters) Subscribe(context.Context, string) (<-chan claude.Event, error) {
 	return nil, nil
 }
@@ -1277,6 +1618,9 @@ func (fakeSessions) AttachSessionRuntime(context.Context, string, string) (*task
 	return nil, nil
 }
 func (fakeSessions) UpdateSessionStatus(context.Context, string, string) (*task.AgentSession, error) {
+	return nil, nil
+}
+func (fakeSessions) OpenSessionForRuntime(context.Context, string) (*task.AgentSession, error) {
 	return nil, nil
 }
 

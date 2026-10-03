@@ -145,7 +145,7 @@ func TestDetachIsIdempotent(t *testing.T) {
 func TestHookSettingsNeedsAnAttachedRuntime(t *testing.T) {
 	m := testManager(t, newRecorder(t))
 
-	if _, err := m.HookSettings("amx-p_absent"); !IsCode(err, CodeNotStarted) {
+	if _, err := m.HookSettings("amx-p_absent", PermissionManual); !IsCode(err, CodeNotStarted) {
 		t.Errorf("HookSettings for an unattached runtime = %v; want %q", err, CodeNotStarted)
 	}
 	if _, err := m.Subscribe(context.Background(), "amx-p_absent"); !IsCode(err, CodeNotStarted) {
@@ -157,7 +157,7 @@ func TestHookSettingsNeedsAnAttachedRuntime(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Attach returned an error: %v", err)
 	}
-	doc, err := m.HookSettings("amx-p_one")
+	doc, err := m.HookSettings("amx-p_one", PermissionManual)
 	if err != nil {
 		t.Fatalf("HookSettings returned an error: %v", err)
 	}

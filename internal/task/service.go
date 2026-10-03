@@ -450,6 +450,41 @@ func (s *Service) GetSession(ctx context.Context, id string) (*AgentSession, err
 	return sess, nil
 }
 
+// OpenSessionForRuntime returns the attempt a runtime still has open.
+//
+// A runtime that has no open attempt answers with the same not-found an unknown
+// id does, and that is the honest answer rather than a gap: there is no attempt
+// to name. The caller that asks - the coordinator, when a runtime says its agent
+// ended - is asking a question whose "no" is as ordinary as its "yes".
+//
+// The runtime id is checked for shape before the read. It is not a foreign key -
+// the runtime record can be gone while the attempt remains - so the shape rule
+// is the only validation there is, and it is the project model's own rather than
+// a second copy of it.
+func (s *Service) OpenSessionForRuntime(ctx context.Context, runtimeID string) (*AgentSession, error) {
+	runtimeID = strings.TrimSpace(runtimeID)
+	if !project.ValidRuntimeID(runtimeID) {
+		return nil, newError(CodeInvalidInput,
+			"%q is not a runtime identifier; a runtime id is its session name, "+
+				"which is %q followed by a project id",
+			runtimeID, project.SessionPrefix).
+			withDetail("field", "runtimeId")
+	}
+	sess, err := s.repo.OpenSessionForRuntime(ctx, runtimeID)
+	if err != nil {
+		if errors.Is(err, ErrSessionNotFound) {
+			// Spelled out rather than routed through mapSessionNotFound: that
+			// one answers "no agent session with id <the id you gave>", and here
+			// the id given was a runtime. A caller reading that message would go
+			// looking for an attempt named after a terminal.
+			return nil, newError(CodeSessionNotFound,
+				"no agent session is open in runtime %q", runtimeID)
+		}
+		return nil, classify(err)
+	}
+	return sess, nil
+}
+
 // ListSessionsInput narrows a session listing.
 type ListSessionsInput struct {
 	// TaskID selects one task's sessions. Required.

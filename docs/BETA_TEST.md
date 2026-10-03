@@ -103,13 +103,13 @@ Scenarios 2–4 are about the console, the keyboard and the iPad, and none of th
 they are worth running either way. An agent that is installed and logged in is what makes a runtime
 show `type: claude` rather than `none`.
 
-### The first launch stops on two dialogs, and neither is AgentMux's
+### The first launch stops on three dialogs, and none of them is AgentMux's
 
-The first time the service account's Claude Code runs in a project, it stops on two questions before
-it reaches its prompt. AgentMux cannot answer either of them, and the way that fails is worth
-knowing in advance: the runtime reports `RUNNING` with a live pid the whole time, because a tmux
-session with a process in it *is* running. The console looks healthy and the agent is sitting on a
-menu doing nothing. There is no error to find, because nothing went wrong.
+The first time the service account's Claude Code runs in a project, it stops on questions before it
+reaches its prompt. AgentMux cannot answer any of them, and the way that fails is worth knowing in
+advance: the runtime reports `RUNNING` with a live pid the whole time, because a tmux session with a
+process in it *is* running. The console looks healthy and the agent is sitting on a menu doing
+nothing. There is no error to find, because nothing went wrong.
 
 * **The workspace trust prompt** — *"Is this a project you created or one you trust?"*. Once per
   project directory. Answer it at the terminal; the runtime is up and the pane is yours:
@@ -129,6 +129,21 @@ menu doing nothing. There is no error to find, because nothing went wrong.
   then Enter. The answer is recorded once, globally, in `/home/agentmux/.claude.json` under
   `customApiKeyResponses.approved` as the key's last 20 characters — the same field your own account
   keeps its answer in, which is what to diff if the two accounts ever disagree.
+
+* **The bypass-permissions warning** — *"WARNING: Claude Code running in Bypass Permissions mode…
+  By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions
+  mode."* It appears whenever a launch carries `--permission-mode bypassPermissions`, and since
+  Phase 7.5.2 that is the default for a project nobody has configured — so on a beta installed after
+  that phase, **this is the first dialog of the three a new project meets**. The highlighted default
+  is `No, exit`; down-arrow to `Yes, I accept`, then Enter.
+
+  Which of the two you pick changes what happens next, and only one of them looks like an error.
+  `No, exit` ends Claude on the spot, and the console then says the agent `EXITED` with *"the agent
+  exited and AgentMux did not ask it to"* — which is a truthful reading of what happened rather than
+  a fault, and is worth recognising before going looking for one. Answering it is observed here as
+  once per account on this build: the beta host met it on the first bypass launch and not on the
+  launches after it. It is the same shape as the two above — the pane is yours, the runtime is up,
+  and nothing in AgentMux is broken.
 
 Onboarding itself — the theme picker and the survey behind it — can be skipped rather than answered.
 Seeding `/home/agentmux/.claude.json` with `hasCompletedOnboarding: true` and a

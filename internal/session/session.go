@@ -244,6 +244,22 @@ const (
 	// CodeAgentStopFailed means the agent could not be interrupted.
 	CodeAgentStopFailed = "agent_stop_failed"
 
+	// CodeAgentStopTimeout means the agent was interrupted and was still running
+	// when the grace ran out.
+	//
+	// It is separate from CodeAgentStopFailed because the two are different
+	// events with different next steps. A failed stop is an interrupt that could
+	// not be delivered, and the fault is the server's or the terminal's. A
+	// timed-out stop is an interrupt that was delivered and declined: the
+	// process is still there, it may take a second one, and it may be waiting on
+	// a decision of its own. Reporting them as one code would tell a caller to
+	// retry the first and to look at the second.
+	//
+	// It is a failure and not a status, which is the decision this phase makes.
+	// "Asked to stop" and "stopped" are different answers, and a caller handed
+	// the first as a success has been told the agent is gone when it is not.
+	CodeAgentStopTimeout = "agent_stop_timeout"
+
 	// CodeAgentWrongDirectory means the terminal, or the agent in it, is not in
 	// the project's own directory. It is a refusal, not a warning: an agent
 	// running in a directory nobody chose is the failure this whole design

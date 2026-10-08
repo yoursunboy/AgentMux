@@ -50,6 +50,17 @@ const (
 	// report it as an agent that never appeared - the opposite of what happened.
 	agentStartTimeout = 60 * time.Second
 	agentStopTimeout  = 30 * time.Second
+
+	// Restarting an agent is a stop and a start in one request, so its budget is
+	// the two of them together rather than a third number chosen beside them.
+	// Both halves are spent inside this one request and each already has a bound
+	// that was chosen for what it does - the stop waits out the runtime manager's
+	// whole grace for the process to actually go, which is the point of the call,
+	// and the start may have to bring a terminal up as well. A budget the sum did
+	// not fit in would abandon a restart that was proceeding normally and report
+	// it as a failure, which is the one reading of this call that must never be
+	// wrong.
+	agentRestartTimeout = agentStopTimeout + agentStartTimeout
 )
 
 // runtimeResponse is the body of the endpoints that return a runtime.
@@ -189,6 +200,15 @@ type agentResponse struct {
 	// Session is the attempt this start created, when the caller named a task.
 	// It is absent otherwise, and absent after a stop that closed nothing.
 	Session *task.AgentSession `json:"session,omitempty"`
+
+	// Retired is the attempt a restart closed on its way to the new one.
+	//
+	// It is reported because a restart is one request that ends one attempt and
+	// begins another, and a caller that could only see the new one would have no
+	// way to know what became of the agent it replaced - or whether there was
+	// one to replace. Absent for every request that is not a restart, and absent
+	// from a restart in which there was nothing open to retire.
+	Retired *task.AgentSession `json:"retired,omitempty"`
 }
 
 // handleGetAgent implements GET /api/projects/{id}/runtime/agent.
@@ -296,8 +316,90 @@ func (s *Server) handleStopAgent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// requireAgentCoordinator checks the runtime environment and the coordinator.
+// restartAgentRequest is the body of
+// POST /api/projects/{id}/runtime/agent/restart.
 //
+// It is startAgentRequest, and it is a separate type rather than a shared one
+// because the two are separate contracts: a field added for a restart and read
+// by a start would be a change to the start endpoint nobody asked for. Both are
+// one optional field today, and that is a coincidence of the current shape
+// rather than a rule.
+type restartAgentRequest struct {
+	// TaskID is the task the *new* attempt is at. It means what it means on a
+	// start, and it says nothing about the attempt being retired: that one keeps
+	// the task it was already recorded against.
+	TaskID string `json:"taskId"`
+}
+
+// handleRestartAgent implements POST /api/projects/{id}/runtime/agent/restart.
+//
+// # Why this is one request and not two
+//
+// A restart is a stop and a start, and the client could have made both calls.
+// It must not, and this endpoint exists so that it does not have to.
+//
+// The two calls would not be one operation. Between them the project has no
+// agent, which is a state a concurrent reader sees and a concurrent writer can
+// act on - a Start arriving in that gap launches an agent the restart then
+// launches over, and the project ends with two Claudes in it, which is the one
+// arrangement this whole design exists to prevent. The gap is also where the
+// stop's answer gets lost: a stop that timed out is a 409, and a client that
+// then started anyway would be starting a second agent beside one that never
+// went. Made here, both halves are one critical section, and the stop's answer
+// is this request's answer.
+//
+// It is not a runtime restart. The terminal is not torn down, the session is
+// not recreated and the scrollback is not lost - §六 of the phase brief - and
+// the runtime keeps its name, so every client already following it carries on.
+//
+// # The budget
+//
+// It has to cover a stop that is allowed its whole grace and a start that may
+// have to bring a terminal up as well, so it is the start's budget plus the
+// stop's. A restart that is going to time out has to be reported as a timeout
+// rather than as a request that ran out of time, for the same reason the
+// individual endpoints have bounds of their own.
+func (s *Server) handleRestartAgent(w http.ResponseWriter, r *http.Request) {
+	if !s.requireAgentCoordinator(w, r) {
+		return
+	}
+	ctx, cancel := s.contextWithTimeout(r, agentRestartTimeout)
+	defer cancel()
+
+	var req restartAgentRequest
+	if err := decodeJSON(w, r, &req); err != nil && !errors.Is(err, errEmptyBody) {
+		writeError(w, http.StatusBadRequest, CodeInvalidRequest, err.Error(), nil)
+		return
+	}
+
+	result, err := s.agents.Restart(ctx, agent.RestartInput{
+		ProjectID: r.PathValue("id"),
+		TaskID:    req.TaskID,
+	})
+	if err != nil {
+		// The retired attempt is reported even here. A restart that stopped the
+		// agent and could not start a new one has still changed the project, and
+		// a caller told only that the request failed would not know that - or
+		// which record to look at for what used to be running.
+		if result.Retired != nil {
+			writeServiceErrorDetailed(w, s.log, err, map[string]any{
+				"retired": map[string]any{
+					"agentSessionId": result.Retired.ID,
+					"status":         result.Retired.Status,
+				},
+			})
+			return
+		}
+		writeServiceError(w, s.log, err)
+		return
+	}
+	writeJSON(w, s.log, http.StatusOK, agentResponse{
+		Agent:   result.Agent,
+		Session: result.Session,
+		Retired: result.Retired,
+	})
+}
+
 // The order matters: a server on a host that cannot run a terminal is told so
 // first, because that is the answer the user can act on. "This server was
 // started without an agent coordinator" is a wiring fact about one process, and

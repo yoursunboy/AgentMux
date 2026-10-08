@@ -328,6 +328,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/projects/{id}/runtime/agent", s.handleGetAgent)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/start", s.handleStartAgent)
 	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/stop", s.handleStopAgent)
+	// Restart is one request rather than a stop and a start, and it is one
+	// because two would not be the same operation: a client making both leaves a
+	// window in which the project has no agent, and a concurrent request that
+	// acted in it would be the second agent this design exists to prevent. See
+	// handleRestartAgent.
+	mux.HandleFunc("POST /api/projects/{id}/runtime/agent/restart", s.handleRestartAgent)
 
 	// What happened, as opposed to what is true now. The runtime resource above
 	// answers the second question; these two answer the first, and the two are

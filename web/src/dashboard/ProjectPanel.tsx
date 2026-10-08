@@ -1,12 +1,20 @@
 import type { ProjectCard as ProjectCardData } from '../api/types'
 import { pendingSentence } from '../actions/actionStyle'
 import { useTerminalSession } from '../terminal/useTerminal'
+import { AgentControls } from './AgentControls'
 import { ModeSwitch } from './ModeSwitch'
 import { PermissionMenu } from './PermissionMenu'
 import { StatusBadge } from './StatusBadge'
 import { TerminalViewer } from './TerminalViewer'
 import { ACTIONS_PATH } from './route'
-import { absentStyle, agentStyle, attentionStyle, runtimeStyle, unavailableStyle } from './status'
+import {
+  absentStyle,
+  agentIsRunning,
+  agentStyle,
+  attentionStyle,
+  runtimeStyle,
+  unavailableStyle,
+} from './status'
 
 /**
  * One project, as a card.
@@ -46,21 +54,53 @@ import { absentStyle, agentStyle, attentionStyle, runtimeStyle, unavailableStyle
  * either to match the other would make the card claim that a keystroke is a
  * setting or that a setting takes effect the moment it is saved. See
  * `PermissionMenu`, and `docs/PERMISSION_MODE.md` for the long form.
+ *
+ * # And the three that are not controls like those
+ *
+ * The Agent row carries Start, Stop and Restart, which are not keystrokes and
+ * not settings: each one is a request to the server about the process in this
+ * project's terminal. They are drawn from the agent's state - Stop and Restart
+ * beside a running agent, Start beside one that is not - and the permission
+ * mode they belong with is the one `Permission` chooses, because a restart is
+ * what makes a changed mode take effect. `AgentControls` is the long form.
  */
 export interface ProjectPanelProps {
   card: ProjectCardData
+
   /**
-   * Called after this card changes the project's launch settings, so the page
-   * can re-read the dashboard rather than let one card hold a newer truth than
-   * its neighbours.
+   * Called after this card writes anything, so the page can re-read the
+   * dashboard rather than let one card hold a newer truth than its neighbours.
+   *
+   * It covers both a launch setting that was saved and a lifecycle request that
+   * came back - including one that failed, which is the case that most needs
+   * re-reading, since a stop that timed out leaves an agent running that this
+   * card would otherwise draw as stopped.
    *
    * It is optional because a card renders without a page behind it - the unit
-   * tests mount one - and a card whose setting changed is still a correct card.
+   * tests mount one - and a card whose write finished is still a correct card.
    */
-  onSettingsChanged?: (() => void) | undefined
+  onChanged?: (() => void) | undefined
+
+  /**
+   * Whether this server can run a terminal at all.
+   *
+   * False means no lifecycle control is drawn: `agent/start` on such a host
+   * answers `runtime_unavailable`, and §16's rule - the console does not offer
+   * to start a terminal on a machine that cannot host one - applies to an agent
+   * for the same reason it applies to a runtime.
+   *
+   * It is optional and defaults to true, which is the assumption a card mounted
+   * on its own has nothing to contradict. The page always passes the server's
+   * own answer; see `DashboardPage`.
+   */
+  runtimeAvailable?: boolean | undefined
 }
 
-export function ProjectPanel({ card, onSettingsChanged }: ProjectPanelProps) {
+export function ProjectPanel({
+  card,
+  onChanged,
+  runtimeAvailable = true,
+}: ProjectPanelProps) {
   const runtime = runtimeStyle(card.runtime.status)
 
   const agent = !card.agent
@@ -68,6 +108,13 @@ export function ProjectPanel({ card, onSettingsChanged }: ProjectPanelProps) {
     : card.agent.available
       ? agentStyle(card.agent.status ?? '')
       : unavailableStyle('agent state projection')
+
+  // Whether there is a process here to stop. It is read off the projection
+  // rather than guessed at, and a project that has never run an agent - or one
+  // whose server cannot answer - is firmly "not running", which is the answer
+  // that offers Start: the request that brings an agent up is also the request
+  // that adopts one already there.
+  const agentRunning = card.agent?.available === true && agentIsRunning(card.agent.status)
 
   const attention = !card.attention
     ? absentStyle('level of attention')
@@ -111,7 +158,7 @@ export function ProjectPanel({ card, onSettingsChanged }: ProjectPanelProps) {
           projectId={card.id}
           mode={card.settings.permissionMode}
           available={card.settings.available}
-          onChanged={onSettingsChanged}
+          onChanged={onChanged}
         />
       </div>
 
@@ -130,6 +177,17 @@ export function ProjectPanel({ card, onSettingsChanged }: ProjectPanelProps) {
         <dt className="project-card__term">Agent</dt>
         <dd className="project-card__value">
           <StatusBadge status={agent} />
+          {/* The three lifecycle requests, beside the state they are about.
+              They are drawn only where a terminal can run at all, for the
+              reason the mode switch above is drawn only where there is a
+              terminal to send it to. */}
+          {runtimeAvailable && (
+            <AgentControls
+              projectId={card.id}
+              running={agentRunning}
+              onChanged={onChanged}
+            />
+          )}
         </dd>
       </dl>
 

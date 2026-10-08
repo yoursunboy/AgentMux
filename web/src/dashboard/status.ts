@@ -118,6 +118,39 @@ export function agentStyle(status: string): StatusStyle {
 }
 
 /**
+ * agentIsRunning says whether the agent projection describes a live process.
+ *
+ * # Why it is a question about a status rather than a flag
+ *
+ * The card is given what the agent is *doing* - the projection's vocabulary,
+ * which has no `starting` and no `stopping` because those are intervals of a
+ * request rather than things an agent does. So "is there a process to stop" is
+ * read off the states that only a live process can be in: `RUNNING` and the two
+ * ways it can be waiting. `CREATED` is an attempt that was recorded and never
+ * launched, and the three terminal states are attempts that are over.
+ *
+ * # What it is not
+ *
+ * It is not the authority on whether a second Claude would be started. That is
+ * the server's, and it is the answer this file must not try to duplicate: a
+ * status this build does not recognise reads as "not running", and the Start
+ * button it draws is safe precisely because `agent/start` adopts a process that
+ * is already there instead of launching beside it. A client's guess about a
+ * server's process table can be wrong; the server's cannot, and this is written
+ * so that being wrong costs a request rather than a second agent.
+ */
+export function agentIsRunning(status: string | undefined): boolean {
+  switch (status) {
+    case 'RUNNING':
+    case 'WAITING_INPUT':
+    case 'WAITING_PERMISSION':
+      return true
+    default:
+      return false
+  }
+}
+
+/**
  * attentionStyle reads the attention projection's vocabulary.
  *
  * `ACTION_REQUIRED` is the only level that means nothing progresses without a

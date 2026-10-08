@@ -383,15 +383,31 @@ func (m *Manager) StartAgent(ctx context.Context, projectID string, launch Agent
 	return status, nil
 }
 
-// StopAgent interrupts a project's agent.
+// StopAgent interrupts a project's agent and waits for it to go.
 //
 // It is the terminal equivalent of Ctrl-C: the agent is interrupted, and the
 // runtime, its shell and its scrollback are left alone. Nothing is escalated to
 // a signal the agent cannot handle - an agent killed outright is an agent whose
 // work is lost, and "stop the agent" does not mean that.
 //
-// If the interrupt does not end the agent the status says so rather than
-// reporting a stop that did not happen.
+// # It waits, and it says so when the wait runs out
+//
+// The interrupt is delivered and then the process table is read until the agent
+// is gone or the grace expires. A stop that returned as soon as the keystroke
+// was sent would be a stop that reported success for an agent that was still
+// working, which is the one thing this call must not do.
+//
+// When the grace expires the agent is still running, and that is returned as an
+// error rather than as a status. It is a deliberate departure from how this
+// package reports everything else, and the reason is that the two readings are
+// not equally useful: an interrupt is *usually* taken, so a caller that ignored
+// a status saying otherwise would be right most of the time and wrong exactly
+// when it mattered. A caller cannot ignore an error, and a caller that wants to
+// report the state anyway still has the status beside it.
+//
+// Nothing here is escalated. §八 of the phase brief: a graceful stop that times
+// out is reported, and what to do next is the user's decision rather than this
+// function's.
 func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus, error) {
 	if m.agent == nil {
 		return AgentStatus{}, newError(CodeAgentUnavailable, "this build cannot host a coding agent")
@@ -412,6 +428,11 @@ func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus,
 			"no coding agent can be stopped: %v", err)
 	}
 
+	// One stop at a time, for one runtime. A second request arriving while the
+	// first is still waiting does not send a second interrupt: it waits here and
+	// then finds the process already gone, which is the idempotent answer §五
+	// asks for. §五's "do not start a second stop" is this lock, and it is why
+	// the state a caller can read while waiting is STOPPING rather than RUNNING.
 	rt.opMu.Lock()
 	defer rt.opMu.Unlock()
 
@@ -425,11 +446,32 @@ func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus,
 			"could not tell whether %s is running in project %s", spec.Type, projectID)
 	}
 	if !found {
+		// Nothing is running. Asked to stop an agent that has already stopped is
+		// not a mistake and not an error: it is the state the caller wanted.
 		rt.noteAgentGone(m.now())
 		return m.agentStatus(ctx, rt), nil
 	}
 
-	rt.noteAgentStopRequested(m.now())
+	// The record and the process table have just been asked the same question and
+	// the process table is the one that answered "yes". When the record disagrees
+	// it is out of date rather than wrong about anything that matters: an agent is
+	// running in this runtime and the record has not been told, which is what a
+	// `claude` typed at the project's own terminal looks like - the same thing the
+	// dashboard's Start would have typed, arriving by another route.
+	//
+	// So the record is brought up to date before the request is made. Asking a
+	// record that still says STOPPED to move to STOPPING is refused, and the
+	// refusal would go nowhere: the interrupt would be delivered with nothing
+	// having asked for it, and the exit it caused would be reported as one
+	// AgentMux did not cause. Adopting first is also what gives this process the
+	// watcher every other running agent has, so the exit is noticed either way.
+	if !rt.noteAgentStopRequested(m.now()) {
+		m.adoptAgent(rt, spec, ref)
+		rt.noteAgentStopRequested(m.now())
+	}
+	m.log.Info("agent stopping", "projectId", projectID, "session", rt.session,
+		"agent", spec.Type, "pid", ref.PID, "grace", m.agentStopGrace)
+
 	backend, err := m.backendFor(projectID)
 	if err != nil {
 		return AgentStatus{}, err
@@ -450,6 +492,10 @@ func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus,
 			return m.agentStatus(ctx, rt), nil
 		}
 		if !sleepContext(ctx, m.agentPoll) {
+			// The caller went away. The interrupt was delivered and the process
+			// is still there, so the honest answer is the same one the deadline
+			// would have given: it did not stop. Reporting a cancellation as a
+			// successful stop would be worse than reporting it as a timeout.
 			break
 		}
 	}
@@ -457,7 +503,14 @@ func (m *Manager) StopAgent(ctx context.Context, projectID string) (AgentStatus,
 	// Still there. The interrupt was delivered and the agent did not take it,
 	// which is a real answer and is reported as one.
 	rt.noteAgentInterruptIgnored(m.now())
-	return m.agentStatus(ctx, rt), nil
+	m.log.Warn("agent did not stop", "projectId", projectID, "session", rt.session,
+		"agent", spec.Type, "pid", ref.PID, "grace", m.agentStopGrace)
+
+	return m.agentStatus(ctx, rt), wrapError(nil, CodeAgentStopTimeout,
+		"%s in project %s was interrupted and is still running after %s",
+		spec.Type, projectID, m.agentStopGrace).
+		withDetail("pid", ref.PID).
+		withDetail("timeout", m.agentStopGrace.String())
 }
 
 // agentStatus builds the API view of a project's agent.
@@ -523,7 +576,24 @@ func (m *Manager) agentStatus(ctx context.Context, rt *runtime) AgentStatus {
 	if status.Available && strings.TrimSpace(spec.Executable) != "" {
 		ref, found, err := m.observeAgent(ctx, rt, spec)
 		if err == nil && found {
-			status.State = AgentRunning
+			// A stop still in flight is reported as one.
+			//
+			// The process being there is half of what a stop means - it has not
+			// gone yet - and the other half is that somebody has asked it to,
+			// which only the record knows. Reporting RUNNING here would make
+			// "a stop is under way" and "the stop was declined" the same answer,
+			// and a dashboard drawing the second as the first would offer a
+			// Stop button for a stop already running. The state is the record's
+			// and the process is the table's, and this is where the two are
+			// combined rather than where one is thrown away.
+			//
+			// It is not a claim that the agent stopped: Running stays true and
+			// the pid stays the process's, because that process is still there.
+			if state == AgentStopping {
+				status.State = AgentStopping
+			} else {
+				status.State = AgentRunning
+			}
 			status.Running = true
 			status.PID = ref.PID
 			status.Dir = ref.Dir
@@ -933,6 +1003,24 @@ func (m *Manager) watchAgent(ctx context.Context, rt *runtime, spec AgentSpec, p
 			// refused for a reason that has nothing to do with the agent.
 			m.noteAgentExit(ctx, rt, spec, pid, asked)
 
+			// This watcher clears the runtime's watch only if it is still the
+			// runtime's own.
+			//
+			// It often is not. Delivering the exit above can block for as long
+			// as whoever is following the attempt holds the project - and a
+			// restart holds it across stopping this process and starting the
+			// next one, which means it can still be held when the replacement is
+			// already tracked and watched. Untracking then would cancel the new
+			// watcher, and the new agent's exit would never be noticed: the
+			// attempt would stay RUNNING for as long as the server did.
+			//
+			// A cancelled context is what tells the two apart. Nothing cancels
+			// this one except the runtime's own untrack - a start, a stop, a
+			// teardown - or the manager shutting down, and in the ordinary case
+			// where the agent simply exits, none of those has happened.
+			if ctx.Err() != nil {
+				return
+			}
 			m.untrackAgent(rt)
 			return
 		}

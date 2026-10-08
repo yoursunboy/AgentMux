@@ -212,7 +212,11 @@ describe('DashboardPage', () => {
     renderWithTerminal(<DashboardPage pollMs={20} />)
     expect(await screen.findByRole('article')).toBeInTheDocument()
 
-    expect(await screen.findByText(/Not current/)).toBeInTheDocument()
+    // The wait is generous on purpose. This asserts *that* a failed poll shows
+    // the strip, not how quickly: the poll is a real 20ms timer and the whole
+    // suite runs its files in parallel, so a loaded machine can push the tick
+    // past the default second without anything being wrong.
+    expect(await screen.findByText(/Not current/, undefined, { timeout: 5000 })).toBeInTheDocument()
     // The card is still on screen, which is the point of the whole state.
     expect(screen.getAllByRole('article')).toHaveLength(1)
   })

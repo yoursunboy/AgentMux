@@ -185,6 +185,15 @@ export function shortenPath(path: string, maxLength = 48): string {
  * The server sends a stable code and a message written for humans; this adds
  * the guidance the message cannot carry on its own, and never falls back to a
  * bare "something went wrong".
+ *
+ * # The one thing added outside the switch
+ *
+ * A failed restart carries the attempt it retired, and that is not a detail of
+ * the failure - it is a change to the project that happened *before* it. A
+ * caller told only that the request failed would read a project that has no
+ * agent in it as one that still has the agent it started with, so the note is
+ * appended whatever the code was, because the half that failed is not the half
+ * that changed anything.
  */
 export function describeError(error: unknown): string {
   if (!(error instanceof ApiError)) {
@@ -193,7 +202,31 @@ export function describeError(error: unknown): string {
   if (error.isNetworkFailure) {
     return 'Could not reach the AgentMux server. Check that it is running, then retry.'
   }
+  return `${describeCoded(error)}${describeRetired(error.details)}`
+}
 
+/**
+ * describeRetired reports the attempt a failed restart closed on its way to
+ * failing.
+ *
+ * An empty string is the ordinary case: every failure that is not a restart
+ * carries no `retired`, and neither does a restart that failed before it
+ * stopped anything.
+ */
+function describeRetired(details: Record<string, unknown>): string {
+  const retired = details.retired
+  if (typeof retired !== 'object' || retired === null) return ''
+
+  const { status } = retired as { status?: unknown }
+  const how = typeof status === 'string' && status !== '' ? ` as ${status.toLowerCase()}` : ''
+  return (
+    ` The attempt that was running was closed${how}, and the new one did not start, so this ` +
+    'project has no agent in it now. Start one again when you are ready.'
+  )
+}
+
+/** describeCoded is the per-code guidance, for a failure that reached the server. */
+function describeCoded(error: ApiError): string {
   switch (error.code) {
     case ErrorCodes.alreadyRegistered: {
       const path = error.details.hostPath
@@ -241,6 +274,31 @@ export function describeError(error: unknown): string {
     case ErrorCodes.runtimeStopFailed:
     case ErrorCodes.runtimeDestroyFailed:
       return `${error.message} The session may still be running; check the server log.`
+    // The agent lifecycle's refusals. Each carries the server's own sentence,
+    // which is the actionable half - "the shell in this terminal is not in the
+    // project's directory" says what to do in a way no generic wording can.
+    case ErrorCodes.agentUnavailable:
+    case ErrorCodes.agentLaunchFailed:
+    case ErrorCodes.agentStopFailed:
+    case ErrorCodes.agentTerminalBusy:
+    case ErrorCodes.agentWrongDirectory:
+      return error.message
+    case ErrorCodes.agentStopTimeout: {
+      // Read rather than reported, because it is not a failure of the request:
+      // the interrupt was delivered, the agent declined it, and the state the
+      // card shows next has to be "still running". The pid and the grace are
+      // the server's own details, and they are the two facts that make the
+      // sentence checkable rather than reassuring.
+      const pid = error.details.pid
+      const grace = error.details.timeout
+      const which = typeof pid === 'number' ? ` (process ${pid})` : ''
+      const within = typeof grace === 'string' ? ` within ${grace}` : ''
+      return (
+        `Claude did not stop${within}${which}, so it is still running and nothing was started ` +
+        'in its place. It may be handling the interrupt itself, or waiting on something of ' +
+        'its own; stop it again once it is idle.'
+      )
+    }
     case ErrorCodes.storageFailure:
       return 'The AgentMux metadata store could not complete the request. Check the server log.'
     case ErrorCodes.internal:

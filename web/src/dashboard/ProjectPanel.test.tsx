@@ -243,7 +243,7 @@ describe('ProjectPanel', () => {
   // a mode types nothing into the terminal and subscribes to nothing new, so
   // the agent on screen is left exactly as it was.
   it('asks the page to re-read after the setting is saved, and touches no terminal doing it', async () => {
-    const onSettingsChanged = vi.fn()
+    const onChanged = vi.fn()
     vi.stubGlobal(
       'fetch',
       vi.fn(() =>
@@ -257,12 +257,99 @@ describe('ProjectPanel', () => {
     )
 
     const { terminal } = renderWithTerminal(
-      <ProjectPanel card={makeProjectCard()} onSettingsChanged={onSettingsChanged} />,
+      <ProjectPanel card={makeProjectCard()} onChanged={onChanged} />,
     )
     act(() => screen.getByRole('button', { name: 'Permission' }).click())
     act(() => screen.getByRole('menuitemradio', { name: /^acceptEdits/ }).click())
 
-    await waitFor(() => expect(onSettingsChanged).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1))
+    expect(terminal.current()?.input).not.toHaveBeenCalled()
+    expect(terminal.subscribes).toHaveLength(1)
+    vi.unstubAllGlobals()
+  })
+
+  // §九: the three lifecycle requests, drawn from what the agent is actually
+  // doing. The pair is chosen by the projection and never by the runtime - a
+  // project whose terminal is up with a shell in it has no agent to stop, and
+  // one whose agent is working has one whatever the terminal row says.
+  it('offers Stop and Restart to a working agent, and Start to one that is not', () => {
+    const working = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ agent: { available: true, status: 'RUNNING' } })} />,
+    )
+    expect(within(row(working.container, 'Agent')).getByRole('button', { name: 'Stop' })).toBeVisible()
+    expect(within(row(working.container, 'Agent')).getByRole('button', { name: 'Restart' })).toBeVisible()
+    expect(within(row(working.container, 'Agent')).queryByRole('button', { name: 'Start' })).toBeNull()
+    working.unmount()
+
+    // Waiting for permission is a working agent: it is blocked, not finished,
+    // and the thing it is blocked on may well be worth stopping.
+    const waiting = renderWithTerminal(
+      <ProjectPanel
+        card={makeProjectCard({ agent: { available: true, status: 'WAITING_PERMISSION' } })}
+      />,
+    )
+    expect(within(row(waiting.container, 'Agent')).getByRole('button', { name: 'Stop' })).toBeVisible()
+    waiting.unmount()
+
+    const stopped = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ agent: { available: true, status: 'STOPPED' } })} />,
+    )
+    expect(within(row(stopped.container, 'Agent')).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(within(row(stopped.container, 'Agent')).queryByRole('button', { name: 'Stop' })).toBeNull()
+  })
+
+  // A project no agent has ever run in is the ordinary case for a fresh
+  // installation, and Start is exactly what it should offer.
+  it('offers Start on a project nothing has ever run in', () => {
+    const { container } = renderWithTerminal(<ProjectPanel card={makeQuietProjectCard()} />)
+
+    expect(within(row(container, 'Agent')).getByRole('button', { name: 'Start' })).toBeVisible()
+  })
+
+  // And when the server cannot read the projection at all, the card still
+  // offers Start - which is the safe half of being wrong. The server adopts a
+  // process that is already running rather than launching a second one, so a
+  // Start that was not needed costs a request; a Stop that was not needed
+  // would cost the terminal's own bytes.
+  it('offers the safe half when the server cannot say what the agent is doing', () => {
+    const { container } = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard({ agent: { available: false } })} />,
+    )
+
+    expect(within(row(container, 'Agent')).getByRole('button', { name: 'Start' })).toBeVisible()
+    expect(within(row(container, 'Agent')).queryByRole('button', { name: 'Stop' })).toBeNull()
+  })
+
+  // §16's rule about offering to start a terminal on a machine that cannot host
+  // one applies to an agent for the same reason: `agent/start` there answers
+  // `runtime_unavailable`, and a button that could only do that is a button
+  // offering nothing.
+  it('draws no lifecycle controls where a terminal cannot run', () => {
+    const { container } = renderWithTerminal(
+      <ProjectPanel card={makeProjectCard()} runtimeAvailable={false} />,
+    )
+
+    expect(within(row(container, 'Agent')).queryByRole('button')).toBeNull()
+    expect(row(container, 'Agent')).toHaveTextContent('running')
+  })
+
+  // The claim §九 makes in the negative: these buttons are requests to the
+  // server, not keystrokes. A Stop that reached the agent by typing Ctrl+C at
+  // the pty would put a byte into whatever the person at the terminal was
+  // doing, and would report success for a shell that happened to exit.
+  it('drives the lifecycle through the endpoint and never through the terminal', async () => {
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const card = makeProjectCard({ agent: { available: true, status: 'RUNNING' } })
+    const { container, terminal } = renderWithTerminal(<ProjectPanel card={card} />)
+    act(() => within(row(container, 'Agent')).getByRole('button', { name: 'Stop' }).click())
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/projects/${card.id}/runtime/agent/stop`,
+      expect.objectContaining({ method: 'POST' }),
+    )
     expect(terminal.current()?.input).not.toHaveBeenCalled()
     expect(terminal.subscribes).toHaveLength(1)
     vi.unstubAllGlobals()

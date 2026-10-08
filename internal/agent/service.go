@@ -271,12 +271,20 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 		return Result{}, newError(CodeInvalidInput, "an agent must be started in a named project").
 			withDetail("field", "projectId")
 	}
-	taskID := strings.TrimSpace(in.TaskID)
 
 	lock := s.lockFor(projectID)
 	lock.Lock()
 	defer lock.Unlock()
 
+	return s.start(ctx, projectID, strings.TrimSpace(in.TaskID))
+}
+
+// start is the chain itself, for a caller that already holds the project's lock.
+//
+// The split is what makes a restart possible without either chaining two
+// requests together or inventing a second lock: a restart is a stop, whatever
+// closing that implies, and then exactly this. See Service.Restart.
+func (s *Service) start(ctx context.Context, projectID, taskID string) (Result, error) {
 	runtimeID := project.SessionNameFor(projectID)
 
 	// 0. What this project's launch is configured with, before anything has
@@ -418,6 +426,7 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 		RuntimeID:      runtimeID,
 		AgentSessionID: agentSessionID,
 		SessionID:      sessionID,
+		PID:            status.PID,
 		StartedAt:      s.now().UTC(),
 	}
 	s.remember(run)
@@ -427,6 +436,7 @@ func (s *Service) Start(ctx context.Context, in StartInput) (Result, error) {
 		"projectId", projectID,
 		"runtimeId", runtimeID,
 		"agentSessionId", agentSessionID,
+		"pid", status.PID,
 		"runtimeStarted", u.startedRuntime)
 
 	return Result{
@@ -472,6 +482,17 @@ func (s *Service) adopt(projectID, taskID string, status session.AgentStatus) (R
 // It is the `agent/stop` path: the agent is interrupted and the runtime is left
 // alone, which is what Ctrl-C at the terminal does. Ending the runtime as well
 // is the runtime's own stop, and removing the terminal is DELETE on the runtime.
+//
+// # A stop that did not happen is not reported as one
+//
+// The runtime manager waits for the process to actually go, and says so when it
+// does not: an interrupt that was declined - a program handling Ctrl-C itself,
+// or one waiting on a decision of its own - comes back as an error. When that
+// happens nothing is closed and nothing is detached. Closing the attempt would
+// record that a session ended while it is still going, and detaching would stop
+// observing a process that is still there to be observed. The agent's state is
+// returned beside the error so a caller can say what it is doing, and the
+// attempt is left exactly as it was found.
 func (s *Service) Stop(ctx context.Context, in StopInput) (Result, error) {
 	projectID := strings.TrimSpace(in.ProjectID)
 	if projectID == "" {
@@ -485,23 +506,160 @@ func (s *Service) Stop(ctx context.Context, in StopInput) (Result, error) {
 
 	status, err := s.runtimes.StopAgent(ctx, projectID)
 	if err != nil {
-		return Result{}, err
-	}
-	// The interrupt can be declined: a program that handles Ctrl-C itself, or a
-	// process that ignores it, is still running when StopAgent returns. Closing
-	// the attempt then would record that a session ended while it is still
-	// going, and detaching would stop observing it - so nothing is closed and
-	// the runtime's own explanation is passed back instead.
-	if status.Running {
 		run, bound := s.Run(projectID)
 		res := Result{Agent: status}
 		if bound {
 			res.Run = &run
 		}
-		return res, nil
+		return res, err
 	}
 	run, attempt := s.end(ctx, projectID, OutcomeCancelled)
 	return Result{Agent: status, Run: run, Session: attempt}, nil
+}
+
+// Restart replaces a project's agent with a new one.
+//
+// # What it is, and what it is not
+//
+// It is a stop followed by a start, and it is neither of those spelled twice at
+// some other layer. Both halves run under this project's one lock, so no other
+// operation on this project can see the moment between them: a caller that asked
+// for a restart is never handed a stopped agent because a second request slipped
+// into the gap, and two restarts arriving together produce one new agent rather
+// than two.
+//
+// What it is not is a runtime restart. §六 of the phase brief: the runtime and
+// the agent are different layers, and this operates on the agent. The terminal
+// is not torn down, the session is not recreated and the scrollback is not lost,
+// and the runtime keeps its name throughout - so nothing downstream has to be
+// told that the thing it was following is a different one. That is also why a
+// project whose runtime is down is refused rather than quietly promoted into a
+// start: bringing a terminal up is the runtime's own Start, and a restart that
+// did it would make the two the same request with no way to ask for one.
+//
+// # The two attempts
+//
+// The attempt that was running is closed as cancelled - it was asked to stop,
+// which is what cancelled means here - and a new one is created for the new
+// process. The old id is never reused: an attempt is the record of one agent's
+// run, and a record that continued across two processes would make the second
+// one's events indistinguishable from the first's.
+//
+// The new attempt is not created until the old process is gone. That ordering is
+// the point of the whole call. Two Claudes in one project is the arrangement
+// this design exists to prevent, and a start that ran before the stop had been
+// confirmed would produce exactly that whenever the interrupt was declined.
+//
+// # Failing
+//
+// A stop that was declined ends the restart with the old agent still running and
+// nothing started, which is the one outcome that must never be traded away for
+// the appearance of success. A restart that stops the agent and then fails to
+// start a new one leaves the project RUNNING with no agent in it - the state a
+// stop leaves - and both attempts are kept: the retired one as cancelled and the
+// new one, if it was created, as failed by the start chain's own undo. The error
+// is the start's own, so a caller can tell which half went wrong from the same
+// code it would have got from asking for that half on its own.
+func (s *Service) Restart(ctx context.Context, in RestartInput) (Result, error) {
+	projectID := strings.TrimSpace(in.ProjectID)
+	if projectID == "" {
+		return Result{}, newError(CodeInvalidInput, "an agent must be restarted in a named project").
+			withDetail("field", "projectId")
+	}
+	taskID := strings.TrimSpace(in.TaskID)
+
+	lock := s.lockFor(projectID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	runtimeID := project.SessionNameFor(projectID)
+
+	// 0. There has to be a terminal to put the new agent in, and this call does
+	// not make one.
+	rt, err := s.runtimes.Runtime(ctx, projectID)
+	if err != nil {
+		return Result{}, err
+	}
+	if rt.State != session.StateRunning {
+		return Result{}, newError(session.CodeNotRunning,
+			"project %s has no running terminal, so there is no agent to restart; "+
+				"start the terminal and start an agent in it", projectID).
+			withDetail("field", "projectId")
+	}
+
+	// 1. What is there now, before anything is asked to stop. It is read rather
+	// than assumed, because a restart asked for on a runtime whose agent has
+	// already exited is a start, and both halves below have to know which of the
+	// two they are in.
+	oldPID := 0
+	oldType := ""
+	running := false
+	if rt.Agent != nil {
+		oldPID = rt.Agent.PID
+		oldType = rt.Agent.Type
+		running = rt.Agent.Running
+	}
+
+	// 2. Stop it, and wait for the process table to agree that it has gone.
+	//
+	// The waiting is the whole of "confirm the old process has exited": the
+	// runtime manager polls until the agent is no longer in the process table and
+	// reports how that went, so a stop that was declined arrives here as an error
+	// rather than as a state to be interpreted. Nothing here reads the terminal,
+	// sends a signal of its own, or escalates to one the agent cannot handle.
+	if running {
+		status, err := s.runtimes.StopAgent(ctx, projectID)
+		if err != nil {
+			s.log.Warn("could not stop the agent being restarted",
+				"projectId", projectID, "runtimeId", runtimeID, "pid", oldPID, "error", err)
+			return Result{Agent: status}, err
+		}
+	}
+
+	// 3. Close whatever was open for that process, so the new attempt starts from
+	// a record that has nothing running against it.
+	retired := s.retire(ctx, projectID, runtimeID, oldType, oldPID)
+
+	// 4. The new agent, by exactly the chain a start uses - the same order, the
+	// same undo, the same single binding.
+	result, err := s.start(ctx, projectID, taskID)
+	result.Retired = retired
+	if err != nil {
+		s.log.Warn("a restart stopped the agent and could not start a new one",
+			"projectId", projectID, "runtimeId", runtimeID, "oldPid", oldPID, "error", err)
+		return result, err
+	}
+	s.log.Info("claude agent restarted",
+		"projectId", projectID, "runtimeId", runtimeID,
+		"oldPid", oldPID, "pid", result.Agent.PID)
+	return result, nil
+}
+
+// retire closes the attempt open for a runtime, and reports it.
+//
+// It is the two ways an attempt can be open, in the order they can be told
+// apart. When this process holds the binding it started the agent, and `end` is
+// the same work Stop and Release do. When nothing is bound there is either no
+// attempt at all or one this process never bound - a server restart adopted a
+// terminal that was already running an agent, and the binding lived in the
+// process that went away - and the lookup answers "nothing" for the first and
+// for an attempt that is already terminal.
+//
+// A nil answer means there was nothing to close, which is the ordinary outcome
+// rather than a failure.
+func (s *Service) retire(ctx context.Context, projectID, runtimeID, agentType string, pid int) *task.AgentSession {
+	if _, bound := s.Run(projectID); bound {
+		_, attempt := s.end(ctx, projectID, OutcomeCancelled)
+		return attempt
+	}
+	return s.closeAdoptedAttempt(ctx, projectID, session.AgentExit{
+		ProjectID: projectID,
+		RuntimeID: runtimeID,
+		AgentType: agentType,
+		PID:       pid,
+		Asked:     true,
+		At:        s.now(),
+	}, OutcomeCancelled)
 }
 
 // AgentExited closes an attempt when the runtime watching the agent sees its
@@ -575,7 +733,27 @@ func (s *Service) AgentExited(ctx context.Context, exit session.AgentExit) {
 		outcome = OutcomeCancelled
 	}
 
-	if _, bound := s.Run(projectID); bound {
+	if run, bound := s.Run(projectID); bound {
+		// The binding is for a process, and this is a report about a process.
+		// When they are different ones the report is about something that has
+		// already been replaced, and closing what is bound now would close an
+		// attempt that had only just been opened.
+		//
+		// This is the restart's own shadow. A restart stops an agent and starts
+		// another in the same runtime, and the watcher following the old process
+		// observes it end before the restart is finished - so it queues on the
+		// project lock the restart is holding and arrives after the new binding
+		// exists. Nothing else in the build produces an exit for a process that
+		// is not the bound one, which is why the guard is a comparison and not a
+		// policy: a binding with no pid recorded is one this build did not make,
+		// and it is left to the path below rather than guessed about.
+		if run.PID != 0 && exit.PID != 0 && run.PID != exit.PID {
+			s.log.Debug("an agent exit names a process that is not the bound one",
+				"projectId", projectID, "runtimeId", exit.RuntimeID,
+				"exitedPid", exit.PID, "boundPid", run.PID)
+			return
+		}
+
 		s.log.Info("claude agent ended without a session end",
 			"projectId", projectID, "runtimeId", exit.RuntimeID, "agent", exit.AgentType,
 			"pid", exit.PID, "asked", exit.Asked, "outcome", outcome)
@@ -605,7 +783,11 @@ func (s *Service) AgentExited(ctx context.Context, exit session.AgentExit) {
 // `agent/stop`, or by a `SessionEnd` that arrived before the process did, has
 // none open. In every one of those the runtime has already recorded the exit
 // against its own state, so nothing is lost by finding nothing here.
-func (s *Service) closeAdoptedAttempt(ctx context.Context, projectID string, exit session.AgentExit, outcome Outcome) {
+//
+// It returns the attempt it closed, or nil when there was none, because a
+// restart has to report which record it retired and a second lookup would be a
+// second chance to disagree with this one.
+func (s *Service) closeAdoptedAttempt(ctx context.Context, projectID string, exit session.AgentExit, outcome Outcome) *task.AgentSession {
 	attempt, err := s.sessions.OpenSessionForRuntime(ctx, exit.RuntimeID)
 	if err != nil {
 		// A not-found is the answer, not an error. Anything else is reported and
@@ -619,7 +801,7 @@ func (s *Service) closeAdoptedAttempt(ctx context.Context, projectID string, exi
 				"projectId", projectID, "runtimeId", exit.RuntimeID,
 				"agent", exit.AgentType, "pid", exit.PID, "asked", exit.Asked)
 		}
-		return
+		return nil
 	}
 
 	s.log.Info("claude agent ended without a session end",
@@ -635,10 +817,11 @@ func (s *Service) closeAdoptedAttempt(ctx context.Context, projectID string, exi
 	if err != nil {
 		s.log.Warn("could not close the attempt an ended agent was running",
 			"agentSessionId", attempt.ID, "outcome", outcome, "error", err)
-		return
+		return nil
 	}
 	s.log.Info("the attempt it was running was closed",
 		"agentSessionId", closed.ID, "status", closed.Status)
+	return closed
 }
 
 // Release ends observation of a project's agent without touching the agent.

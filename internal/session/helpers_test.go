@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -382,4 +383,23 @@ func waitForFile(t *testing.T, path string, wait time.Duration, ready func([]byt
 func shellCommand(t *testing.T, b *TmuxBackend, name string) string {
 	t.Helper()
 	return paneCommand(t, b, name)
+}
+
+// detailsOfError returns the structured context a coded error carries, and fails
+// the test when there is none.
+//
+// It is a helper rather than four lines at each call site because the assertion
+// it supports is always the same one: an error that reports a timeout has to name
+// the process that declined it and the grace it was given, and an error without
+// either is an error a caller cannot act on.
+func detailsOfError(t *testing.T, err error) map[string]any {
+	t.Helper()
+	var target *Error
+	if !errors.As(err, &target) {
+		t.Fatalf("the error %v carries no structured detail", err)
+	}
+	if len(target.Details) == 0 {
+		t.Fatalf("the error %v carries no structured detail", err)
+	}
+	return target.Details
 }

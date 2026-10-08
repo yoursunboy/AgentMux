@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   absentStyle,
+  agentIsRunning,
   agentStyle,
   attentionStyle,
   runtimeStyle,
@@ -75,5 +76,29 @@ describe('the status mappings', () => {
     expect(runtimeStyle('RUNNING').label).toBe('RUNNING')
     expect(agentStyle('running').label).toBe('running')
     expect(attentionStyle('running').label).toBe('running')
+  })
+
+  // Which agent states have a process behind them, which is the question the
+  // lifecycle buttons are drawn from. It is the agent's vocabulary and not the
+  // runtime's: "running" is a terminal that is up, "RUNNING" is Claude working
+  // in one, and the two are different layers saying different true things.
+  it('says which agent states have a process to stop', () => {
+    expect(agentIsRunning('RUNNING')).toBe(true)
+    expect(agentIsRunning('WAITING_INPUT')).toBe(true)
+    expect(agentIsRunning('WAITING_PERMISSION')).toBe(true)
+
+    // CREATED is an attempt that was recorded and never launched; the rest are
+    // attempts that are over.
+    expect(agentIsRunning('CREATED')).toBe(false)
+    expect(agentIsRunning('COMPLETED')).toBe(false)
+    expect(agentIsRunning('FAILED')).toBe(false)
+    expect(agentIsRunning('STOPPED')).toBe(false)
+
+    // A project nothing has ever run in, and a status from a newer build. Both
+    // read as "not running", which draws Start - and Start is the safe half of
+    // being wrong, because the server adopts a process that is already there
+    // rather than launching a second one beside it.
+    expect(agentIsRunning(undefined)).toBe(false)
+    expect(agentIsRunning('SUMMONING')).toBe(false)
   })
 })

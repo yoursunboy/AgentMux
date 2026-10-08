@@ -37,10 +37,22 @@ export interface ProjectGridProps {
    * one answer for all of them, and a per-card handler would be the same
    * function stored N times.
    */
-  onSettingsChanged?: (() => void) | undefined
+  onChanged?: (() => void) | undefined
+  /**
+   * Whether this server can run a terminal at all, passed to every card.
+   *
+   * It is one fact about the machine, so it is answered once by the page and
+   * handed down, rather than each card asking a different endpoint for it.
+   */
+  runtimeAvailable: boolean
 }
 
-export function ProjectGrid({ cards, columns, onSettingsChanged }: ProjectGridProps) {
+export function ProjectGrid({
+  cards,
+  columns,
+  onChanged,
+  runtimeAvailable,
+}: ProjectGridProps) {
   if (cards.length === 0) {
     return (
       // Not a live region. The message is static content, and a page that
@@ -57,7 +69,12 @@ export function ProjectGrid({ cards, columns, onSettingsChanged }: ProjectGridPr
       style={{ '--columns': columns } as CSSProperties}
     >
       {cards.map((card) => (
-        <ProjectPanel key={card.id} card={card} onSettingsChanged={onSettingsChanged} />
+        <ProjectPanel
+          key={card.id}
+          card={card}
+          onChanged={onChanged}
+          runtimeAvailable={runtimeAvailable}
+        />
       ))}
     </div>
   )

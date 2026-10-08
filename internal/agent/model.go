@@ -64,6 +64,16 @@ type Run struct {
 	// publish, and it is never written to the event log.
 	SessionID string
 
+	// PID is the process this binding is for, as the launch reported it.
+	//
+	// It exists because a runtime outlives the agents that run in it, and a
+	// restart replaces one with another inside the same terminal. An exit that
+	// arrives after that replacement describes the process that has gone, and
+	// without something to compare it against it would be indistinguishable from
+	// an exit of the process that is there now - and would close an attempt that
+	// had only just been opened. See Service.AgentExited.
+	PID int
+
 	// StartedAt is when the launch was requested.
 	StartedAt time.Time
 }
@@ -117,6 +127,20 @@ type StopInput struct {
 	ProjectID string
 }
 
+// RestartInput is a request to replace a project's agent with a new one.
+type RestartInput struct {
+	// ProjectID is the project whose agent should be restarted. Required.
+	ProjectID string
+
+	// TaskID is the task the *new* attempt is at, when the caller wants one
+	// recorded. It has the same meaning and the same optionality as
+	// StartInput.TaskID, and it is deliberately a separate field from anything
+	// about the attempt being retired: a restart names the work the new agent is
+	// being started for, and the attempt that is ending keeps the task it was
+	// already recorded against.
+	TaskID string
+}
+
 // Result is what a start or stop produced.
 //
 // It carries the runtime manager's own report rather than a summary of it, so
@@ -141,4 +165,14 @@ type Result struct {
 	// RuntimeStarted reports that this call started the runtime, which it does
 	// only when it found none running.
 	RuntimeStarted bool
+
+	// Retired is the attempt a restart closed on its way to the new one.
+	//
+	// It is here rather than in a second response because a restart is one
+	// request that ends one attempt and begins another, and a caller that had to
+	// make a second call to learn what happened to the first would be a caller
+	// that could see the two moments disagree. It is nil for every outcome that
+	// is not a restart, including a restart in which there was nothing to
+	// retire.
+	Retired *task.AgentSession
 }

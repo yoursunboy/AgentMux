@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -166,6 +167,11 @@ func TestAgentEndpointsAreRefusedWhereRuntimesCannotRun(t *testing.T) {
 	h.wantError(t, h.call(http.MethodPost, base+"/start", ""),
 		http.StatusServiceUnavailable, session.CodeUnavailable)
 	h.wantError(t, h.call(http.MethodPost, base+"/stop", ""),
+		http.StatusServiceUnavailable, session.CodeUnavailable)
+	// A restart is a stop and a start in one request, so it is refused here for
+	// the same reason both halves are: there is no terminal on this host for
+	// either of them to be about.
+	h.wantError(t, h.call(http.MethodPost, base+"/restart", ""),
 		http.StatusServiceUnavailable, session.CodeUnavailable)
 }
 
@@ -542,10 +548,145 @@ func TestAgentErrorCodesCarryTheStatusAClientActsOn(t *testing.T) {
 			"the server said it would start something and did not"},
 		{session.CodeAgentStopFailed, http.StatusInternalServerError,
 			"the server said it would interrupt something and could not"},
+		{session.CodeAgentStopTimeout, http.StatusConflict,
+			"the interrupt was delivered and declined; the agent is still running, which is an answer and not a failure"},
+		{session.CodeNotRunning, http.StatusConflict,
+			"there is no terminal in the state the call needs, which is a state and not a bad request; " +
+				"a restart on a stopped runtime is refused with this"},
 	}
 	for _, tc := range cases {
 		if got := statusForCode(tc.code); got != tc.want {
 			t.Errorf("statusForCode(%q) = %d, want %d: %s", tc.code, got, tc.want, tc.why)
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Restarting the agent
+// ---------------------------------------------------------------------------
+
+// TestRestartingAnAgentOnAStoppedRuntimeIsRefused covers §六 of the phase brief
+// from the side a client can reach.
+//
+// A restart replaces the agent inside a terminal. It is not a way to get a
+// terminal, and a caller who has none is not asking for a restart - they are
+// asking for a start, which is a request that exists and does something
+// different. Refusing here is what keeps the two apart, and the refusal is a
+// conflict rather than a bad request because nothing about the request is
+// wrong: the project is simply not in a state where there is an agent to
+// replace.
+func TestRestartingAnAgentOnAStoppedRuntimeIsRefused(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{
+		agent:            pinnedAgent{spec: testAgentSpec},
+		runtimeAvailable: true,
+	})
+	projectID, _ := h.registerProject(t, "checkout-service")
+
+	recorder := h.call(http.MethodPost, "/api/projects/"+projectID+"/runtime/agent/restart", "")
+	body := h.wantError(t, recorder, http.StatusConflict, session.CodeNotRunning)
+	if !strings.Contains(body.Error.Message, "terminal") {
+		t.Errorf("the refusal does not say what is missing: %q", body.Error.Message)
+	}
+
+	// The terminal a refused restart was told it lacks is not quietly built for
+	// it. A restart that started a runtime would be a start wearing a restart's
+	// name, and the scrollback it produced would be one nobody asked for.
+	if created := h.backend.createdCount(); created != 0 {
+		t.Errorf("a refused restart created %d runtime(s); want none: "+
+			"a restart operates on an agent and never on a terminal", created)
+	}
+}
+
+// TestRestartingAnAgentLaunchesThroughTheSameChainAsAStart pins the half of a
+// restart that is not a stop.
+//
+// The launch here fails, because the pinned agent names an executable no
+// machine has - which is the point: the evidence is not the outcome but the
+// *sequence*. A restart that reached the launch typed the command into the
+// terminal, and it typed it into the terminal that was already there rather
+// than into one it made. A handler that had quietly chained a stop and a start
+// over HTTP would show the same log lines, and one that never reached the
+// launch at all would show neither.
+func TestRestartingAnAgentLaunchesThroughTheSameChainAsAStart(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{
+		agent:             pinnedAgent{spec: testAgentSpec},
+		runtimeAvailable:  true,
+		shell:             "/bin/bash",
+		agentStartTimeout: 300 * time.Millisecond,
+		agentPoll:         25 * time.Millisecond,
+	})
+	projectID, _ := h.registerProject(t, "checkout-service")
+	h.startRuntime(t, projectID)
+	h.backend.setPane(session.PaneProcess{
+		PID:     4242,
+		Command: "bash",
+		Dir:     h.projectRuntimePath(t, projectID),
+	})
+
+	recorder := h.call(http.MethodPost, "/api/projects/"+projectID+"/runtime/agent/restart", "")
+	h.wantError(t, recorder, http.StatusInternalServerError, session.CodeAgentLaunchFailed)
+
+	sessionName := project.SessionNameFor(projectID)
+	h.backend.mu.Lock()
+	launched := append([]string(nil), h.backend.launched[sessionName]...)
+	h.backend.mu.Unlock()
+	if len(launched) != 1 || launched[0] != testAgentSpec.Command {
+		t.Errorf("the restart typed %q, want exactly [%q]", launched, testAgentSpec.Command)
+	}
+
+	// §六 from the other side: the terminal survived the restart. It is the same
+	// session, still running, with its scrollback where it was.
+	rt := h.runtimeState(t, projectID)
+	if rt.State != session.StateRunning {
+		t.Errorf("runtime state after a failed restart = %q, want %q",
+			rt.State, session.StateRunning)
+	}
+	if !rt.SessionAlive {
+		t.Error("the restart ended the session; the terminal and its scrollback are gone")
+	}
+}
+
+// TestARestartRefusesAProjectThatIsNotHere is the ordinary missing-resource
+// answer, asserted for the new route so that it is not the one endpoint in the
+// family that answers differently.
+func TestARestartRefusesAProjectThatIsNotHere(t *testing.T) {
+	h := newHarnessOpts(t, harnessOptions{
+		agent:            pinnedAgent{spec: testAgentSpec},
+		runtimeAvailable: true,
+	})
+
+	recorder := h.call(http.MethodPost, "/api/projects/"+project.IDPrefix+"0000000000/runtime/agent/restart", "")
+	h.wantError(t, recorder, http.StatusNotFound, project.CodeNotFound)
+}
+
+// TestTheStopTimeoutReachesAClientWithWhatItCouldNotStop covers the transport of
+// the one lifecycle answer a client has to act on differently from the others.
+//
+// §四 asks for a stop that times out to say which process declined and how long
+// it was given. Those are `details` rather than a sentence, because a client
+// decides with them: the pid is what a person looks for in a process list, and
+// the timeout is what says a retry is worth trying. A test that checked only the
+// code would pass on a handler that dropped both, which is exactly what a
+// mapping table cannot see.
+func TestTheStopTimeoutReachesAClientWithWhatItCouldNotStop(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writeServiceError(recorder, nil, &session.Error{
+		Code:    session.CodeAgentStopTimeout,
+		Message: "claude in project p was interrupted and is still running after 10s",
+		Details: map[string]any{"pid": 4242, "timeout": "10s"},
+	})
+
+	if recorder.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusConflict)
+	}
+	body := decode[errorResponse](t, recorder)
+	if body.Error.Code != session.CodeAgentStopTimeout {
+		t.Fatalf("code = %q, want %q", body.Error.Code, session.CodeAgentStopTimeout)
+	}
+	if got := body.Error.Details["pid"]; got != float64(4242) {
+		t.Errorf("details.pid = %v, want 4242", got)
+	}
+	if got := body.Error.Details["timeout"]; got != "10s" {
+		t.Errorf("details.timeout = %v, want \"10s\"", got)
 	}
 }

@@ -88,6 +88,23 @@ export const ErrorCodes = {
   runtimeResizeFailed: 'runtime_resize_failed',
   runtimeBackendFailure: 'runtime_backend_failure',
   invalidTerminalSize: 'invalid_terminal_size',
+
+  // Agent lifecycle codes. They are the runtime's answer about the process
+  // inside a terminal, which is a different question from the terminal's own.
+  agentUnavailable: 'agent_unavailable',
+  agentLaunchFailed: 'agent_launch_failed',
+  agentStopFailed: 'agent_stop_failed',
+  agentTerminalBusy: 'agent_terminal_busy',
+  agentWrongDirectory: 'agent_wrong_directory',
+  /**
+   * The interrupt was delivered and the agent is still running.
+   *
+   * It is the one lifecycle failure a client has to read rather than report:
+   * the agent did not stop, which is a state and not a bug, and `details`
+   * carries the pid and the grace it was given. A client that treated it as a
+   * plain failure would offer a Stop button for a stop that just happened.
+   */
+  agentStopTimeout: 'agent_stop_timeout',
 } as const
 
 /** The JSON envelope a failing response carries. */
@@ -355,6 +372,67 @@ export async function setPinnedSlot(
  */
 export async function startAgent(projectId: string, signal?: AbortSignal): Promise<void> {
   await request<unknown>(`/projects/${encodeURIComponent(projectId)}/runtime/agent/start`, {
+    method: 'POST',
+    signal: signal ?? null,
+  })
+}
+
+/**
+ * Stop the coding agent in a project's runtime.
+ *
+ * It waits. The server delivers the interrupt and then watches the process
+ * table until the agent is gone or the grace runs out, and a stop that ran out
+ * of grace is reported as `agent_stop_timeout` - a 409 rather than a success -
+ * because an agent that ignored the interrupt is still working, and a client
+ * told otherwise would start a second one beside it.
+ *
+ * The terminal is not touched: the session, its scrollback and its shell are
+ * exactly where they were. That is what makes this different from destroying a
+ * runtime, and why it does not ask before it happens.
+ */
+export async function stopAgent(projectId: string, signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/projects/${encodeURIComponent(projectId)}/runtime/agent/stop`, {
+    method: 'POST',
+    signal: signal ?? null,
+  })
+}
+
+/**
+ * One attempt's identity, as a lifecycle answer reports it.
+ *
+ * It carries an identifier and a status and nothing else: the server decides
+ * what crosses to a client, and an attempt's transcript or prompt is not part
+ * of any lifecycle answer.
+ */
+export interface RetiredAttempt {
+  id: string
+  status: string
+}
+
+/**
+ * Restart the coding agent in a project's runtime.
+ *
+ * # Why one call rather than a stop and a start
+ *
+ * Between a separate stop and start the project has no agent, and that gap is a
+ * state a concurrent client can act on: a Start arriving in it launches an
+ * agent the restart then launches over, which leaves two Claudes in one
+ * project. Made as one request, the two halves are one critical section on the
+ * server, and the stop's answer is this request's answer - a restart whose stop
+ * was declined fails here rather than starting a second agent.
+ *
+ * It is not a runtime restart. The terminal is not torn down, the session is
+ * not recreated and the scrollback is not lost; the project's terminal keeps
+ * its name, so anything already following it carries on.
+ *
+ * The attempt that was running is retired - cancelled - and a new one is
+ * created, so an attempt id never names two different processes. A restart that
+ * stops the agent and cannot start a new one throws an ApiError whose `details`
+ * carry the retired attempt, because a caller that only knew the request failed
+ * would not know the project is now running no agent at all.
+ */
+export async function restartAgent(projectId: string, signal?: AbortSignal): Promise<void> {
+  await request<unknown>(`/projects/${encodeURIComponent(projectId)}/runtime/agent/restart`, {
     method: 'POST',
     signal: signal ?? null,
   })

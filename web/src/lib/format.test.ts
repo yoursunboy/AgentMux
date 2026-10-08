@@ -208,6 +208,52 @@ describe('describeError', () => {
   it('handles a non-API error without swallowing it', () => {
     expect(describeError(new Error('plain failure'))).toBe('plain failure')
   })
+
+  // §九's one lifecycle answer that is read rather than reported. It is not a
+  // failure of the request: the interrupt was delivered, the agent declined it,
+  // and the state the card shows next has to be "still running". The pid and
+  // the grace are the server's own details, and they are what make the sentence
+  // checkable rather than reassuring.
+  it('reads a stop timeout as a state, with the two facts the server measured', () => {
+    const message = describeError(
+      new ApiError(409, ErrorCodes.agentStopTimeout, 'claude in project p_x is still running', {
+        pid: 4242,
+        timeout: '10s',
+      }),
+    )
+    expect(message).toContain('did not stop within 10s (process 4242)')
+    expect(message).toContain('still running')
+    expect(message).toContain('nothing was started in its place')
+  })
+
+  it('reads a stop timeout whose details are missing rather than printing holes', () => {
+    const message = describeError(new ApiError(409, ErrorCodes.agentStopTimeout, 'still running'))
+    expect(message).toContain('did not stop, so it is still running')
+    expect(message).not.toContain('undefined')
+  })
+
+  // A restart that stopped the agent and could not start a new one has still
+  // changed the project. The retired attempt is reported whatever the code was,
+  // because the half that failed is not the half that changed anything - and a
+  // caller told only "the request failed" would read a project holding an agent
+  // it no longer has.
+  it('says a failed restart left the project with no agent, whatever the code', () => {
+    const message = describeError(
+      new ApiError(500, ErrorCodes.agentLaunchFailed, 'could not launch claude', {
+        retired: { agentSessionId: 'sess_abc', status: 'CANCELLED' },
+      }),
+    )
+    expect(message).toContain('could not launch claude')
+    expect(message).toContain('closed as cancelled')
+    expect(message).toContain('no agent in it now')
+  })
+
+  it('says nothing about a retired attempt when there was not one', () => {
+    const message = describeError(
+      new ApiError(500, ErrorCodes.agentLaunchFailed, 'could not launch claude'),
+    )
+    expect(message).toBe('could not launch claude')
+  })
 })
 
 describe('small helpers', () => {

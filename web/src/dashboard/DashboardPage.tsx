@@ -86,16 +86,25 @@ export function DashboardPage({ pollMs }: DashboardPageProps = {}) {
           )}
 
           <main className="dashboard__body">
-            {/* A card that changes a project's launch settings re-reads the
-                dashboard rather than patching its own copy of the card. The
-                response to a settings write is the settings, not the console -
-                so the only way this page can be sure the badge it is showing is
-                the one the server holds is to ask again. It is also the rule
-                the workspace follows after every write. */}
+            {/* A card that writes re-reads the dashboard rather than patching
+                its own copy of the card. The response to a settings write is
+                the settings, and the response to a lifecycle request is the
+                agent - not the console - so the only way this page can be sure
+                the badge it is showing is the one the server holds is to ask
+                again. It is also the rule the workspace follows after every
+                write.
+
+                `runtimeAvailable` is the server's own answer about the machine,
+                and it comes from the same response as the cards. It gates the
+                lifecycle buttons: §16's rule that a console must not offer to
+                start a terminal on a host that cannot host one applies to an
+                agent too, and a Start button that could only answer
+                `runtime_unavailable` would be offering exactly that. */}
             <ProjectGrid
               cards={data.projects}
               columns={columns}
-              onSettingsChanged={reload}
+              onChanged={reload}
+              runtimeAvailable={data.server.runtimeAvailable}
             />
           </main>
         </>

@@ -718,6 +718,18 @@ func interruptIgnorer(t *testing.T, shell agentProgram, dir string) AgentSpec {
 // has to survive the observation that the process is running - those are two
 // facts and not one - or a client is told that nobody asked, which is the
 // opposite of what happened.
+//
+// # Why this is an error
+//
+// The interrupt was delivered and the process did not go, so the call did not do
+// what it said it would. A status saying "still running" beside a nil error is a
+// success to every caller that checks only the error, and this is the one place
+// where that reading is most expensive: a client that believed the agent had
+// stopped would start another one, and two Claudes in one project is the
+// arrangement this whole design exists to prevent.
+//
+// The status is still returned beside it, so a caller that wants to say what the
+// agent is doing has the runtime's own words for it.
 func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 	ctx := context.Background()
 	shell := requireProgram(t, "sh")
@@ -726,8 +738,9 @@ func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 	spec := interruptIgnorer(t, shell, p.RuntimePath)
 	// The grace is shortened because this stop is going to be declined, and the
 	// runtime waits the whole of it before it concludes that.
+	const grace = 2 * time.Second
 	m, runtimes := agentTestManagerOn(t, uniqueSocketDir(t), newFakeStore(),
-		&fakeAgent{spec: spec}, 2*time.Second, p)
+		&fakeAgent{spec: spec}, grace, p)
 
 	if _, err := m.Start(ctx, p.ID); err != nil {
 		t.Fatalf("could not start the runtime: %v", err)
@@ -741,8 +754,8 @@ func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 	}
 
 	declined, err := m.StopAgent(ctx, p.ID)
-	if err != nil {
-		t.Fatalf("StopAgent returned an error rather than an answer: %v", err)
+	if !IsCode(err, CodeAgentStopTimeout) {
+		t.Fatalf("StopAgent returned %v; want a %s error", err, CodeAgentStopTimeout)
 	}
 
 	if !processIsRunning(t, started.PID, spec.Executable) {
@@ -767,6 +780,17 @@ func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 			started.PID, declined.PID)
 	}
 
+	// The error names the process that would not go and the grace it was given,
+	// which are the two facts a caller needs to decide what to do next: send the
+	// same request again, or look at the terminal.
+	details := detailsOfError(t, err)
+	if got, want := details["pid"], started.PID; got != want {
+		t.Errorf("the timeout reports pid %v, want %d", got, want)
+	}
+	if got := details["timeout"]; got != grace.String() {
+		t.Errorf("the timeout reports a grace of %v, want %s", got, grace)
+	}
+
 	// The terminal is untouched, so the scrollback survives a stop that did not
 	// take, which is the whole reason a stop does not destroy it.
 	if found := paneProcesses(t, runtimes, p, spec.Executable); len(found) != 1 {
@@ -784,8 +808,8 @@ func TestAgentThatDeclinesTheInterruptIsReportedAsStillRunning(t *testing.T) {
 	// A second stop is answered the same way rather than differently, so a
 	// client that retries is told the same truth twice.
 	again, err := m.StopAgent(ctx, p.ID)
-	if err != nil {
-		t.Fatalf("the second StopAgent returned an error: %v", err)
+	if !IsCode(err, CodeAgentStopTimeout) {
+		t.Fatalf("the second StopAgent returned %v; want a %s error", err, CodeAgentStopTimeout)
 	}
 	if !again.Running || !again.Requested {
 		t.Errorf("the second stop reports running=%v requested=%v, want both true", again.Running, again.Requested)

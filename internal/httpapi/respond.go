@@ -89,6 +89,20 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 // filesystem path in an error body is noise to a user and can leak more about
 // the host than the client needs.
 func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
+	writeServiceErrorDetailed(w, log, err, nil)
+}
+
+// writeServiceErrorDetailed is writeServiceError with context of the request's
+// own to add.
+//
+// It exists for the one case where a failed request has changed something the
+// error cannot describe: a restart that stopped an agent and could not start a
+// new one has retired an attempt, and a caller told only "the start failed"
+// would not know the project is now running no agent at all. The extra details
+// are merged with whatever the error carries rather than replacing it, and the
+// error's own key wins - the context the failing operation attached is about
+// the failure, and this is context about the request.
+func writeServiceErrorDetailed(w http.ResponseWriter, log *slog.Logger, err error, extra map[string]any) {
 	code := codeOf(err)
 	if code == "" {
 		if log != nil {
@@ -99,11 +113,23 @@ func writeServiceError(w http.ResponseWriter, log *slog.Logger, err error) {
 		return
 	}
 
+	details := detailsOf(err)
+	if len(extra) > 0 {
+		merged := make(map[string]any, len(details)+len(extra))
+		for k, v := range extra {
+			merged[k] = v
+		}
+		for k, v := range details {
+			merged[k] = v
+		}
+		details = merged
+	}
+
 	status := statusForCode(code)
 	if status >= http.StatusInternalServerError && log != nil {
 		log.Error("request failed", "code", code, "error", err)
 	}
-	writeError(w, status, code, messageFor(err, code), detailsOf(err))
+	writeError(w, status, code, messageFor(err, code), details)
 }
 
 // codeOf returns the stable code carried by err, whichever layer produced it.
@@ -315,6 +341,16 @@ func statusForCode(code string) int {
 		// another program. The runtime is fine and the request is fine; the
 		// session is busy, which is a state, and states change.
 		session.CodeAgentTerminalBusy,
+		// The agent was interrupted and did not stop. It is a conflict and not
+		// the server failing: the interrupt was delivered, the process is still
+		// there, and what is standing in the way is the agent's own decision to
+		// keep running. The caller can send the same request again, and the state
+		// it is in - still running - is one that changes.
+		//
+		// It is deliberately not a 500 beside CodeAgentStopFailed. That one is an
+		// interrupt that could not be delivered, which is the server's failure;
+		// this one is an answer.
+		session.CodeAgentStopTimeout,
 		// A status change the lifecycle does not allow. The request is
 		// well-formed and the task exists; the two are simply incompatible
 		// right now, which is what 409 means and what 400 would misreport -

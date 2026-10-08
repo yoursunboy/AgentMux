@@ -174,6 +174,75 @@ types into somebody's terminal. `docs/PERMISSION_MODE.md` §7 is the full list o
 not built, §9 is the rendered launch line, and §10 is why a value that reaches a command line cannot
 be a command.
 
+The lifecycle control, added in Phase 8.1, is what turned the three operations above from things the
+API could do into things a person can ask for and trust. It added no component: `internal/agent`
+gained `Restart`, `session.Manager.StopAgent` gained a wait, `internal/httpapi` gained one route, and
+the console gained three buttons on the card. What it changed is what each of those now *answers*.
+
+**Stop waits, and a stop that did not happen is not reported as one.** `StopAgent` delivers the
+interrupt and then reads the process table until the agent is gone or its ten-second grace expires.
+A stop that returned as soon as the keystroke was sent would report success for an agent that was
+still working, which is the one thing this call must not do. When the grace runs out the process is
+still there, and that comes back as `agent_stop_timeout` — a `409` with the `pid` and the grace in
+its details — rather than as a `200` with a caveat in it. Nothing is escalated to a signal the agent
+cannot handle, and the attempt, the receiver and the runtime are all left exactly as they were found.
+While the wait is running the agent reads `STOPPING`, which is the one state in that vocabulary that
+is about a request rather than about the process: the record's half and the process table's half are
+combined in `agentStatus`, and neither is thrown away. A second `stop` waits on the same mutex and
+then finds the process gone, which is what makes it idempotent — `runtime.opMu`, the runtime's own
+lock that already serialised multi-step operations, is the whole of it.
+
+**Restart is one critical section, and that is the reason it is an endpoint.** A client could call
+`stop` and then `start`; the gap between the two would be a project with no agent in it — a state a
+concurrent reader sees and a concurrent writer can act on, where a `Start` arriving in the gap
+launches an agent the restart then launches over. So `agent.Service.Restart` holds the project's own
+stripe lock across both halves and calls the same private `start` a start uses. The attempt that was
+running is closed as `CANCELLED` and a new one is created for the new process; the old id is never
+reused, because an attempt is the record of one agent's run and a record continued across two
+processes would make the second one's events indistinguishable from the first's. The new attempt is
+not created until the old process is confirmed gone, which is the ordering the whole call exists for:
+two Claudes in one project is the arrangement this design prevents, and a start that ran before the
+stop was confirmed would produce exactly that whenever the interrupt was declined.
+
+**It is not a runtime restart.** The tmux session, its name and its scrollback are untouched — §6 and
+§8 are the two layers, and restart operates on the upper one only. The new agent is launched by the
+same chain, so it re-reads the project's permission mode and regenerates the launch configuration;
+a mode changed since the last launch takes effect here, which is the round trip the permission
+paragraph above describes.
+
+Two hazards the phase had to close are worth recording where the components are, because both were
+the same mistake in different clothes — an event about a process being applied to a different one. A
+binding now records the `PID` its launch reported, and `AgentExited` ignores an exit naming a process
+that is not the bound one; without it the old agent's exit, queued behind the restart's own lock,
+would close the attempt that had only just been opened. And the runtime's watcher clears the
+runtime's watch only when the context it holds is still the live one, because a watcher superseded by
+a restart would otherwise cancel its successor and leave the new agent's exit unnoticed for as long
+as the server ran.
+
+That second guard is only as good as the cancel underneath it, and the cancel was missing. Replacing
+the runtime's agent record — which every start does, before it launches — dropped the previous
+agent's watch instead of cancelling it, so a superseded watcher was left holding a context nothing
+could reach and woke up believing it was still the runtime's. The guard, the successor's watch and
+the new agent's exit are all downstream of that one line. It is why the test that covers this drives
+a real terminal — a replacement, an exit delivered while the project is held, and an assertion that
+the *second* agent's exit is the one reported — and it is why that test exists beside a smaller one
+that asserts the cancel itself. Both of this phase's defects were found on the Linux host rather
+than by the unit suite, which runs them against a fake process table.
+
+**A stop in flight is a state the watcher does not overwrite.** `STOPPING` is the record saying
+somebody has asked, combined with the process table saying the agent is still there. The watcher
+ticks several times a second and observes only the second half; writing `RUNNING` from a tick would
+erase the first, and the state a dashboard drew during a stop would be the one that offers to start
+an agent that is already being stopped. The two things that end a stop in flight write their own
+ending — the process going, or the grace running out — so a tick leaves the state where it is.
+
+**A restart that stopped the agent and could not start a new one is reported as such.** The project
+is left with no agent in it — what a stop leaves — and both attempts are kept: the retired one as
+`CANCELLED`, the new one as `FAILED` by the start chain's own undo. The failing half's code is the
+error, so a caller can tell which half went wrong, and the retired attempt rides in the error's
+`details` because a caller told only "the request failed" would draw a project holding an agent it no
+longer has. `docs/API.md` is the contract for all four endpoints.
+
 ## 2. Project vs Collection
 
 AgentMux distinguishes:

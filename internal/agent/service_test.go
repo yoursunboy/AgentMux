@@ -61,8 +61,12 @@ type fakeRuntimes struct {
 	// STOPPED, which is the state a project is in before anything starts it.
 	states map[string]session.State
 
-	// agents is which projects have a managed agent up.
-	agents map[string]bool
+	// agents is the pid each project's agent is running as, or an absent entry
+	// for a project with no agent. It is a pid rather than a flag because a
+	// restart puts a *second* process into the same runtime, and the only way a
+	// test can tell the two apart - or tell the coordinator which one an exit is
+	// about - is by the number.
+	agents map[string]int
 
 	started       int
 	stopped       int
@@ -70,6 +74,20 @@ type fakeRuntimes struct {
 	agentStops    int
 	launches      []session.AgentLaunch
 	stopAgentKept bool
+
+	// calls is every agent operation in the order it arrived, as "start" or
+	// "stop". The ordering is the thing a restart is about - the old process has
+	// to be confirmed gone before the new one is launched - and it is not
+	// otherwise observable from outside the fake.
+	calls []string
+
+	// pidAsync, when set, makes every launch report a pid that is different from
+	// the last one. It is off by default so that a test naming one agent can
+	// name 4242, and on for the tests about replacing one.
+	pidAsync bool
+
+	// pidCounter is how far pidAsync has got.
+	pidCounter int
 
 	// failStart, when set, makes Start fail. It is how a test reaches "the
 	// runtime could not come up".
@@ -100,10 +118,25 @@ func (f *fakeRuntimes) setAgent(projectID string, running bool) {
 	defer f.mu.Unlock()
 	f.init()
 	if running {
-		f.agents[projectID] = true
+		f.agents[projectID] = defaultPID
 		return
 	}
 	delete(f.agents, projectID)
+}
+
+// setAgentPID puts a project's agent up as a named process.
+func (f *fakeRuntimes) setAgentPID(projectID string, pid int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.init()
+	f.agents[projectID] = pid
+}
+
+// agentPID reports the pid a project's agent is running as, or 0.
+func (f *fakeRuntimes) agentPID(projectID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.agents[projectID]
 }
 
 // init prepares the maps. The caller holds mu.
@@ -112,9 +145,26 @@ func (f *fakeRuntimes) init() {
 		f.states = make(map[string]session.State)
 	}
 	if f.agents == nil {
-		f.agents = make(map[string]bool)
+		f.agents = make(map[string]int)
 	}
 }
+
+// nextPID is the pid the launch about to happen reports.
+//
+// A constant unless the test asked for a sequence, which is what makes "the
+// process that was running" and "the process running now" two different things
+// to assert about.
+func (f *fakeRuntimes) nextPID() int {
+	if !f.pidAsync {
+		return defaultPID
+	}
+	f.pidCounter++
+	return defaultPID + f.pidCounter
+}
+
+// defaultPID is the process every fake agent is unless a test says otherwise.
+// It is not a real pid anywhere and is not meant to be.
+const defaultPID = 4242
 
 func (f *fakeRuntimes) Runtime(_ context.Context, projectID string) (*session.Runtime, error) {
 	f.mu.Lock()
@@ -128,13 +178,13 @@ func (f *fakeRuntimes) Runtime(_ context.Context, projectID string) (*session.Ru
 		Session:   project.SessionNameFor(projectID),
 		State:     state,
 	}
-	if f.agents[projectID] {
+	if pid := f.agents[projectID]; pid != 0 {
 		rt.Agent = &session.AgentStatus{
 			Type:      claude.Type,
 			Available: true,
 			State:     session.AgentRunning,
 			Running:   true,
-			PID:       4242,
+			PID:       pid,
 		}
 	}
 	return rt, nil
@@ -181,13 +231,15 @@ func (f *fakeRuntimes) StartAgent(_ context.Context, projectID string, launch se
 	f.init()
 	f.agentStarts++
 	f.launches = append(f.launches, launch)
-	f.agents[projectID] = true
+	f.calls = append(f.calls, "start")
+	pid := f.nextPID()
+	f.agents[projectID] = pid
 	return session.AgentStatus{
 		Type:      claude.Type,
 		Available: true,
 		State:     session.AgentRunning,
 		Running:   true,
-		PID:       4242,
+		PID:       pid,
 	}, nil
 }
 
@@ -196,17 +248,27 @@ func (f *fakeRuntimes) StopAgent(_ context.Context, projectID string) (session.A
 	defer f.mu.Unlock()
 	f.init()
 	f.agentStops++
+	f.calls = append(f.calls, "stop")
+	pid := f.agents[projectID]
 	if f.stopAgentKept {
 		// The interrupt was declined: the program is still there, which is what
-		// a process that handles Ctrl-C itself looks like.
+		// a process that handles Ctrl-C itself looks like. The real manager
+		// waits for the process to go and reports a timeout when it does not, so
+		// the fake reports the same error rather than a status - a caller that
+		// treated a declined interrupt as success is the failure this stands in
+		// for.
 		return session.AgentStatus{
-			Type:      claude.Type,
-			Available: true,
-			State:     session.AgentRunning,
-			Running:   true,
-			PID:       4242,
-			Message:   "the agent ignored the interrupt",
-		}, nil
+				Type:      claude.Type,
+				Available: true,
+				State:     session.AgentRunning,
+				Running:   true,
+				PID:       pid,
+				Message:   "the agent ignored the interrupt",
+			}, &session.Error{
+				Code:    session.CodeAgentStopTimeout,
+				Message: "claude was interrupted and is still running",
+				Details: map[string]any{"pid": pid, "timeout": "10s"},
+			}
 	}
 	delete(f.agents, projectID)
 	return session.AgentStatus{
@@ -230,6 +292,15 @@ func (f *fakeRuntimes) counts() (started, stopped, agentStarts, agentStops int) 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.started, f.stopped, f.agentStarts, f.agentStops
+}
+
+// sequence is every agent operation the runtime was asked for, in order.
+func (f *fakeRuntimes) sequence() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -1164,13 +1235,17 @@ func TestStopClosesTheAttemptAsCancelledAndDetaches(t *testing.T) {
 	}
 }
 
-// TestADeclinedStopLeavesTheAttemptRunning is the case where Ctrl-C does not
-// work.
+// TestADeclinedStopIsReportedAsAFailure is the case where Ctrl-C does not work.
 //
 // A program that handles the interrupt itself is still running when the runtime
-// says the stop was ignored. Closing the attempt then would record that a
-// session ended while it is still going, and detaching would stop observing it.
-func TestADeclinedStopLeavesTheAttemptRunning(t *testing.T) {
+// says the stop was ignored. Two things have to be true then, and the first is
+// the one this phase changed: the stop is a failure rather than a success, so a
+// caller cannot read "accepted" and go on as though the agent were gone. The
+// second is unchanged and is what the failure protects - the attempt stays
+// RUNNING and the adapter stays attached, because closing the attempt would
+// record that a session ended while it is still going and detaching would stop
+// observing a process that is still there to observe.
+func TestADeclinedStopIsReportedAsAFailure(t *testing.T) {
 	h := newHarness(t, Options{})
 	p := h.registerProject("checkout-service")
 	tk := h.createTask(p.ID, "Fix the viewer")
@@ -1182,8 +1257,11 @@ func TestADeclinedStopLeavesTheAttemptRunning(t *testing.T) {
 	h.runtimes.stopAgentKept = true
 
 	result, err := h.service.Stop(context.Background(), StopInput{ProjectID: p.ID})
-	if err != nil {
-		t.Fatalf("Stop returned an error: %v", err)
+	if err == nil {
+		t.Fatal("Stop reported success for an agent the interrupt did not stop")
+	}
+	if !session.IsCode(err, session.CodeAgentStopTimeout) {
+		t.Errorf("Stop returned %v; want a %s error", err, session.CodeAgentStopTimeout)
 	}
 	if !result.Agent.Running {
 		t.Error("the agent is reported as stopped, but the runtime said the interrupt was ignored")

@@ -1503,10 +1503,19 @@ code {
 
 .project-card__value {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: baseline;
   min-width: 0;
   margin: 0;
+}
+
+/* A lifecycle failure belongs to the card it happened to, so its banner is
+   drawn in the row that failed rather than at the top of the page - a page-level
+   slot would make a second project's failure erase the first. It takes its own
+   line, because a banner squeezed in beside a badge is unreadable. */
+.project-card__value > .error-banner {
+  flex: 1 0 100%;
 }
 
 .project-card__reason {
@@ -1543,6 +1552,44 @@ code {
 .project-card__glyph {
   font-size: 11px;
   line-height: 1;
+}
+
+/* --- the agent's lifecycle controls --------------------------------------- */
+
+/* Start, Stop and Restart, in the Agent row beside the state they are about.
+   They are small and quiet because the card is a status board: the thing a
+   person reads is the badge, and these are what they do about it. */
+
+.agent-controls {
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.agent-control {
+  padding: 1px 8px;
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-muted);
+  cursor: pointer;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.agent-control:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+/* A request in flight is drawn disabled, and it is the only control on the
+   card while it runs - so a greyed button here means "this is happening",
+   never "this cannot be done". */
+.agent-control:disabled {
+  cursor: default;
+  opacity: 0.7;
 }
 
 /* --- a permission menu --------------------------------------------------- */

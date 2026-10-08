@@ -731,12 +731,27 @@ nested under the project: an agent's identity is the runtime it is in, and one p
 | --- | --- |
 | `GET /api/projects/{id}/runtime/agent` | The agent's current state. Never starts anything. |
 | `POST /api/projects/{id}/runtime/agent/start` | Starts it, or adopts the one already in the pane. Idempotent. |
-| `POST /api/projects/{id}/runtime/agent/stop` | Interrupts it and **leaves the runtime alone**. |
+| `POST /api/projects/{id}/runtime/agent/stop` | Interrupts it, waits for the process to go, and **leaves the runtime alone**. |
+| `POST /api/projects/{id}/runtime/agent/restart` | Stops it, confirms it has gone, and starts a new one — as one request, not two. |
 
 **Stop is not Destroy**, and it is also not "the agent is gone". `stop` sends the same interrupt a
 user would send with `Ctrl-C`, and Claude is free to take it or not: a terminal in raw mode delivers
 that keystroke to the program, and the program decides. When it declines, the response says so
 rather than pretending — see `requested` and `message` below and §6 of `docs/CLAUDE_RUNTIME.md`.
+
+**Nor is Stop a keystroke and an answer.** It sends the interrupt and then reads the process table
+until the agent is gone or its grace expires, so the answer it returns is about a process that has
+actually stopped rather than about a key that was delivered. A stop that ran out of grace is an
+error — `agent_stop_timeout`, a `409` — and never a success with a caveat in it. While the wait is
+running, the agent's state is `STOPPING`, which is what a client polling this path sees in the gap;
+a second `stop` arriving then waits behind the first and finds the process already gone.
+
+**Restart is one request and not two.** A client could call `stop` and then `start`, and it must
+not. Between the two the project has no agent, and a third request arriving in that gap — another
+`start`, or another restart — launches an agent the first restart then launches over. Both halves
+run in one critical section, so the project has at most one Claude in it at every moment. It is not
+a runtime restart: the terminal, its session name and its scrollback are untouched, and only the
+Claude process changes.
 
 Starting requires the runtime to be running. An agent with no terminal is a process nobody can see,
 interrupt or read, so `agent/start` on a stopped runtime fails with `runtime_not_running` rather than
@@ -765,7 +780,11 @@ that shows whether Claude is up has one small thing to poll instead of a whole t
 
 What the fields mean, and which of them are evidence rather than assertion:
 
-- `state` is `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `EXITED` or `FAILED`.
+- `state` is `STOPPED`, `STARTING`, `RUNNING`, `STOPPING`, `EXITED` or `FAILED`. `STOPPING` is the
+  one that is about a request rather than about the agent: it says a `stop` is in flight and has
+  not yet either seen the process go or run out of grace. It is not a state a client waits in
+  indefinitely — the stop it describes is bounded by `agent_stop_timeout` — and it is the state a
+  concurrent `GET` sees for the length of that wait.
 - `running` is the boolean a client switches on, and it is read **live from the process table** every
   time it is asked for. Nothing about liveness is stored, because a stored answer to "is it running"
   is a stale answer waiting to happen.
@@ -873,34 +892,95 @@ carries it beside the agent:
 }
 ```
 
-The agent declined the interrupt — a real, observed response, verbatim:
+`STOPPED` here means the process was observed to be gone from the process table, not that the
+interrupt was typed. The request does not return until it is one or the other — gone, or out of
+grace — so the wait is as long as the agent makes it and never longer than the grace.
+
+**The agent declined the interrupt** — `409`, a real response, verbatim:
 
 ```json
 {
-  "agent": {
-    "type": "claude",
-    "available": true,
-    "state": "RUNNING",
-    "running": true,
-    "version": "2.1.274",
-    "executable": "/home/you/.local/share/claude/versions/2.1.274",
-    "pid": 843814,
-    "dir": "/home/you/AgentMux-Projects/checkout-service",
-    "startedAt": "2026-09-18T09:12:44.312+08:00",
-    "requested": true,
-    "message": "the interrupt was delivered and the agent is still running; it may need a second one, or it may be waiting for a decision of its own"
+  "error": {
+    "code": "agent_stop_timeout",
+    "message": "claude in project p_6f1a… was interrupted and is still running after 10s",
+    "details": { "pid": 843814, "timeout": "10s" }
   }
 }
 ```
 
 An honest non-stop, and the shape a client should render as "Claude is still running, and you asked
-it to stop." AgentMux does not escalate to `SIGTERM` or `SIGKILL`: that would destroy the terminal
-and the scrollback that the whole runtime model exists to preserve. A second `stop` is allowed and
-behaves the same way.
+it to stop." Everything is left exactly as it was found: the attempt stays open, the receiver stays
+attached, and nothing is started in the agent's place. The `pid` is the process that would not go
+and the `timeout` is the grace it was given, so the sentence a client shows can be checked against
+what the server measured rather than taken on trust.
+
+AgentMux does not escalate to `SIGTERM` or `SIGKILL`: that would destroy the terminal and the
+scrollback that the whole runtime model exists to preserve. A second `stop` is allowed and behaves
+the same way — it takes the project's own lock, waits behind the first if one is still waiting, and
+then finds the process gone. Stopping an agent that is already stopped, or one that has already
+exited, is a success with nothing changed: the state the caller asked for is the state it is in.
 
 `running`, `requested` and `message` are all in the same response on purpose. A client that reads
 only `running` sees the truth, a client that reads both sees the whole truth, and neither is told a
 stop succeeded when it did not.
+
+### POST /api/projects/{id}/runtime/agent/restart
+
+Stops the agent, waits for its process to go, and starts a new one. The request body is the start's,
+and means the same thing: an optional `taskId` for the **new** attempt.
+
+```json
+{
+  "agent": { "type": "claude", "state": "RUNNING", "running": true, "pid": 851220, "…": "…" },
+  "retired": { "id": "sess_9a27…", "status": "CANCELLED", "endedAt": "2026-09-20T09:31:07Z", "…": "…" },
+  "session": { "id": "sess_c41b…", "status": "RUNNING", "…": "…" }
+}
+```
+
+- `retired` is the attempt that was open when the request arrived, closed as `CANCELLED` — it was
+  asked to stop, which is what cancelled means here. It is absent when there was nothing open to
+  retire, which is the ordinary case for an agent somebody started by hand.
+- A new attempt is always created for the new process when a `taskId` was named, and its id is never
+  the retired one's. An attempt is the record of one agent's run, and a record continued across two
+  processes would make the second one's events indistinguishable from the first's.
+- Nothing about the task the retired attempt belonged to is changed. Restart operates on the agent,
+  and the task is the agent's *work* rather than the agent.
+
+**The old process is gone before the new one exists.** That ordering is the point of the call: two
+Claudes in one project is the arrangement this whole design exists to prevent, and a start that ran
+before the stop had been confirmed would produce exactly that whenever the interrupt was declined.
+So a declined interrupt ends the request with the old agent still running and nothing started — the
+`agent_stop_timeout` above, unchanged from `stop`.
+
+**A restart that stopped the agent and could not start a new one** leaves the project with no agent
+in it, and says so rather than leaving the caller to infer it:
+
+```json
+{
+  "error": {
+    "code": "agent_launch_failed",
+    "message": "…",
+    "details": { "retired": { "agentSessionId": "sess_9a27…", "status": "CANCELLED" } }
+  }
+}
+```
+
+Both attempts are kept: the retired one as `CANCELLED` and, if it was created, the new one as
+`FAILED` by the start chain's own undo. The error code is the failing half's own, so a caller can
+tell which half went wrong from the same code it would have got by asking for that half alone. A
+client that read only "the request failed" would draw a project holding an agent it no longer has,
+which is why `retired` is reported on the failure path as well as the success one.
+
+**A project whose terminal is not running is refused** (`409`, `runtime_not_running`). A restart
+does not bring a terminal up; that is the runtime's own `start`, and a restart that did it would
+make the two the same request with no way to ask for one. The message says which button to press
+instead.
+
+**The runtime is not touched.** The tmux session keeps its name, its scrollback is not lost, and
+every client already attached to it carries on watching the same terminal — only the Claude process
+inside it is a different one. The new agent is launched by exactly the chain `start` uses, which
+means it re-reads the project's permission mode and regenerates the launch configuration, so a mode
+changed since the last launch takes effect on this one.
 
 ## Event timelines
 
@@ -1697,6 +1777,7 @@ Every failure has the same shape:
 | `agent_unavailable` | 503 | No coding agent can be hosted here: none is installed, none could be resolved, or the terminal backend cannot report the process a session runs. |
 | `agent_launch_failed` | 500 | The agent was started and never appeared as a process. |
 | `agent_stop_failed` | 500 | The agent could not be interrupted. |
+| `agent_stop_timeout` | 409 | The agent was interrupted and is still running when the grace ran out. Everything is left as it was found and nothing was started in its place. Details carry `pid` and `timeout`. |
 | `agent_wrong_directory` | 422 | The agent is not where the project is, or started somewhere else. Refused, not warned about. |
 | `agent_terminal_busy` | 409 | The terminal's foreground process is not the shell, so a command typed at it would go to another program. |
 | `invalid_event` | 400 | An event the event model refuses: a malformed source, a type that is not a dotted name, or a payload that is over the bound or names a credential. Nothing writes an event from a request in this build, so it is reachable only through a query parameter. |
@@ -1709,6 +1790,14 @@ the call meaningless. The two are different bugs to a client, and only one of th
 `agent_unavailable` is a `503` for the same reason `runtime_unavailable` is: it is a statement about
 this machine rather than about anything the caller sent, and the message says what to do about it. A
 client that saw `500` there would report a bug where the honest answer is "not on this machine".
+
+`agent_stop_timeout` is a `409` and not a `500` beside `agent_stop_failed`, and the two are worth
+telling apart. `agent_stop_failed` is an interrupt that could not be *delivered* — the server failed
+to do something it said it would do. `agent_stop_timeout` is an interrupt that was delivered and
+declined: the process is still there because the program inside it decided to keep running. That is
+an answer about a state, and it is one that changes, so the caller can ask again. Nothing was
+changed by the attempt and nothing was escalated; a client should render it as "Claude is still
+running", not as a failure to report.
 
 ## Not implemented
 

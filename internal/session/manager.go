@@ -131,10 +131,18 @@ type ManagerOptions struct {
 // The poll is short enough that a click on Stop feels immediate and long enough
 // that watching five projects costs nothing worth measuring: each poll reads
 // the process table, which is one directory listing.
+//
+// The stop grace is ten seconds because it is the whole of what a caller waits
+// before being told the interrupt was declined, and a coding agent being asked
+// to stop is usually mid-turn: it has to finish or abandon what it is doing,
+// flush a transcript, and exit. Five seconds is enough for Claude Code at a
+// prompt and not enough for one that is working. Ten is still well inside the
+// handler's own budget, so a stop that is going to time out is reported as a
+// timeout rather than as a request that ran out of time.
 const (
 	AgentDefaultPoll         = 500 * time.Millisecond
 	AgentDefaultStartTimeout = 15 * time.Second
-	AgentDefaultStopGrace    = 5 * time.Second
+	AgentDefaultStopGrace    = 10 * time.Second
 )
 
 // Manager owns every project's terminal runtime.
@@ -657,10 +665,27 @@ func (r *runtime) setState(state State, message string, at time.Time) {
 
 // setAgentLaunching records that a start was requested and nothing has been
 // observed yet.
+//
+// Replacing the record takes the previous agent's watch with it, so that watch
+// is cancelled here rather than dropped. It is not housekeeping: the watcher it
+// belongs to can still be running, because delivering an exit can block for as
+// long as whoever follows attempts holds the project - and a restart holds it
+// across exactly the stop that produced the exit and the start that is about to
+// run. A watch dropped rather than cancelled is one nobody can reach any more,
+// so nothing can tell that watcher it is no longer the runtime's, and when it
+// wakes up it finds its context alive, concludes it is still the one watching,
+// and untracks - cancelling the watch this start is about to install. The agent
+// that was just started then has nobody watching it, and its exit is never
+// noticed. watchAgent's guard depends on this cancel having happened.
 func (r *runtime) setAgentLaunching(spec AgentSpec, at time.Time) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	cancel := r.agent.watch
 	r.agent = agentState{spec: spec, state: AgentStarting, since: at}
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // failAgent records an agent that could not be started, or that started
@@ -780,10 +805,25 @@ func (r *runtime) noteAgentGone(at time.Time) {
 //
 // It keeps the start time from the first observation, because the process
 // cannot have started later than the moment it was first seen running.
+//
+// A stop in flight stays a stop in flight. This call is the watcher saying the
+// process is still there, and the process still being there is half of what a
+// stop means - the other half is that somebody has asked, which only the record
+// knows. Writing RUNNING over it would make "a stop is under way" and "nothing
+// has asked this agent to stop" the same reading, and the watcher ticks several
+// times a second, so the state a dashboard would almost always draw during a
+// stop is the one that offers a Stop button for a stop already running. §九 of
+// the phase brief is the opposite of that.
+//
+// Nothing is lost by leaving it alone: the two things that end a stop in flight
+// both write their own ending - the process going is noteAgentEnded or
+// noteAgentStopped, and the grace running out is noteAgentInterruptIgnored.
 func (r *runtime) noteAgentSeen(ref processRef) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.agent.state = AgentRunning
+	if r.agent.state != AgentStopping {
+		r.agent.state = AgentRunning
+	}
 	r.agent.pid = ref.PID
 	r.agent.dir = ref.Dir
 	r.agent.reason = ""

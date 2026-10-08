@@ -31,6 +31,7 @@ As of version 0.7.5:
 | Phase 7.5 — Linux server beta deployment | **Done** | Not a capability phase, and it adds no business functionality of any kind. A configuration file probed as YAML first, the systemd unit and installer under `deploy/linux/`, `GET /api/health`, a debug-only `GET /api/debug/runtime`, opt-in beta usage events, and a contract test that keeps the deployment files in agreement with the program. See below. |
 | Phase 7.5.1 — Claude permission mode | **Done** | The first beta-driven capability: a per-project setting for how much Claude asks before it acts, chosen from the console and passed at launch as `--permission-mode`. One table, two endpoints and one menu. It is a startup setting and not a runtime switch — nothing simulates Shift+Tab, nothing reads Claude's screen — and saving one restarts nothing. See below and `docs/PERMISSION_MODE.md`. |
 | Phase 7.5.2 — Beta UX optimization | **Done** | The second beta-driven change, and the smaller one: the same setting now defaults to `bypassPermissions` for a project nobody has configured, the Permission control is a 44px touch target on a tablet, and the whole chain from the default to the launch line is tested. No new table, no new migration, no new endpoint, and no project that had chosen a mode moved. See below. |
+| Phase 8.1 — Agent lifecycle control | **Done** | Stop now waits for the process to actually go and says so when it does not; `POST …/agent/restart` replaces an agent inside the same runtime as one request rather than a stop and a start chained by a client; and the console card carries Start, Stop and Restart drawn from the agent's real state. No new table, no migration, no new component — the runtime is never torn down. See below and `docs/API.md`. |
 | Phase 7.3B — Claude event adapter | **Partial** | The adapter and its wiring are built as 7.3B-1 and 7.3B-2. What remains is the binding's persistence across a restart, and the permission question settled before a Task's status can be derived from what Claude says. See below. |
 
 What this means in practice: `GET /api/server` reports `terminalRuntimeImplemented: true`, and
@@ -907,6 +908,57 @@ Shift+Tab, no TUI parsing, no `statusLine` read, no Claude hook for permission m
 system, no PWA, and no large refactor of the frontend, the backend or the terminal. The one
 information change to the console's server bar that the brief permitted was considered and not made;
 see the phase report for why.
+
+## Phase 8.1 — Agent lifecycle control
+
+**Done.** The first phase to make the agent's three operations something a person can ask for and
+believe. Phase 7.5.1 put a permission mode on the card and told the user to "Restart Agent to apply" —
+and there was no Restart button. This is the phase that built it, and it is also the phase that fixed
+Stop answering before anything had stopped.
+
+| Deliverable | What it is |
+| --- | --- |
+| `StopAgent` waits | `internal/session/agent.go`: the interrupt is delivered and the process table is then read until the agent is gone or the grace expires. `AgentDefaultStopGrace` moved 5s → 10s, because a coding agent being asked to stop is usually mid-turn. |
+| `agent_stop_timeout` | The grace running out is a `409` carrying `pid` and `timeout`, not a `200` with a caveat in it. `statusForCode` lists it beside `session.CodeAgentStopTimeout`'s own comment explaining why it is not a `500` next to `agent_stop_failed`. |
+| `agent.Service.Restart` | A stop, the attempt retired as `CANCELLED`, and the same private `start` a start uses — all under one project stripe lock, so no other operation on the project can see the moment between them. The new attempt's id is never the old one's. |
+| `POST …/runtime/agent/restart` | One route, `agentRestartTimeout = agentStopTimeout + agentStartTimeout`. A failure after a successful stop is reported with `details.retired`, so a caller is not left thinking the project still has an agent. |
+| `AgentControls.tsx` | Start, Stop and Restart on the card's Agent row, drawn from the projection, one button while a request is in flight, and a `ConfirmDialog` before a restart — never `window.confirm()`. Every one of them is an HTTP call; none of them types at the terminal. |
+| Two hazards closed | `Run.PID`, so an exit naming a process that is not the bound one cannot close the attempt a restart just opened; and a watcher that clears the runtime's watch only when its context is still live, so a superseded watcher cannot cancel its successor — which needed the third fix the Linux host found: the start that replaces an agent now cancels the watch it takes the record from, because a watch dropped rather than cancelled is one the guard above can never fire for. |
+
+**Stop is not "the interrupt was sent".** The one thing this call must never do is report success for
+an agent that is still working, and a stop that returned as soon as the keystroke was delivered did
+exactly that. It now returns when the process is observed to be gone, and when it is not, it says so:
+the response is an error, the attempt stays open, the receiver stays attached, and the runtime is left
+exactly as it was found. **Nothing is escalated** — no `SIGKILL`, no `pkill`, no reading the terminal
+— because an agent killed outright is an agent whose work is lost. While the wait runs, the agent
+reads `STOPPING`, which is the first state in that vocabulary to be about a request rather than about
+the process. That state has to survive the watcher: the watcher ticks several times a second, each
+tick observes that the process is still there, and a tick that wrote `RUNNING` over the request would
+leave a dashboard offering to start an agent that is already being stopped. The Linux host found
+that one too.
+
+**Restart is one request because two would not be the same operation.** A client calling `stop` and
+then `start` leaves a window in which the project has no agent, and a concurrent request that acted in
+it would produce the second Claude this design exists to prevent. Both halves therefore run inside
+`agent.Service.Restart`, under the lock the package already serialises a project with, and the new
+attempt is not created until the old process is confirmed gone.
+
+**Runtime and agent stay two layers.** The tmux session, its name and its scrollback are untouched —
+only the Claude process changes — and a project whose terminal is down is refused rather than quietly
+promoted into a start. The new agent goes through the same chain, so it re-reads the permission mode
+and regenerates the launch configuration; this is the round trip Phase 7.5.1's card message was
+promising.
+
+**No table, no migration, no new component.** `internal/agent` gained `Restart`; `internal/session`
+gained a wait and a state; `internal/httpapi` gained a route and `writeServiceErrorDetailed`;
+`web/src/dashboard` gained one component. `docs/ARCHITECTURE.md` §1 and `docs/API.md` carry the detail.
+
+**The version is unchanged at 0.7.5.** The deployment story did not change, so by
+`internal/version/version.go`'s own rule the number does not move.
+
+**What it did not do.** No CC Switch, no provider or model switching, no notification, no runtime
+Shift+Tab, no TUI parsing, no multi-agent, no task scheduling or queue, no PWA, no authentication and
+no multi-user. `docs/API.md`'s "Not implemented" section is the list.
 
 ## Phase 8 — CC Switch integration
 
